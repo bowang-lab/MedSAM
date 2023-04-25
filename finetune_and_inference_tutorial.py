@@ -49,7 +49,7 @@ class NpzDataset(Dataset):
 
 
 # %% test dataset class and dataloader
-npz_tr_path = '/home/jma/Documents/MedSAM/data/Npz_files/CT_Abd-Gallbladder/train'
+npz_tr_path = 'data/Npz_files/CT_Abd-Gallbladder/train'
 demo_dataset = NpzDataset(npz_tr_path)
 demo_dataloader = DataLoader(demo_dataset, batch_size=8, shuffle=True)
 for img_embed, gt2D, bboxes in demo_dataloader:
