@@ -79,3 +79,17 @@ The implementation code of DSC and NSD can be obtained [here](http://medicaldeca
 
 ## To-do-list
 
+- [ ] Train the ViT-H model
+- [ ] Explore other fine-tuning methods, e.g., fine-tune the image encoder as well, lora fine-tuning
+- [ ] Support scribble prompts
+- [ ] Support IoU/DSC regression
+- [ ] Enlarge the dataset
+- [ ] 3D slicer and napari support
+
+We are very excited on this field. However, training such segmentation foundation model requires extensive computing resources. Thus, we have made all the pre-processed training and images publicly availble (research purpose only). To avoid wasting time to conduct the same experiments across different research groups, your are welcome to share your results/trained models on the discussion page. We look forward to working with the community together to advance this exciting research area.
+
+
+## Acknowledgements
+- We highly appreciate all the challenge organizers and dataset owners for providing the public dataset to the community. 
+- We thank Meta AI for making the source code of [segment anything](https://github.com/facebookresearch/segment-anything) publicly available.
+- We also thank Alexandre Bonnet for sharing this great [blog](https://encord.com/blog/learn-how-to-fine-tune-the-segment-anything-model-sam/)
