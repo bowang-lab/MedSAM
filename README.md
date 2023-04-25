@@ -9,8 +9,6 @@ This the official repository for MedSAM: Segment Anything in Medical Images.
 4. Enter the MedSAM folder `cd MedSAM` and run `pip install -e .`
 
 
-
-
 ## Fine-tune SAM on customized dataset
 
 We provide a step-by-step tutorial with a small dataset to help you quickly start the training process.
@@ -59,6 +57,7 @@ Train the model
 python train -i ./data/Tr_emb --task_name SAM-ViT-B --num_epochs 1000 --batch_size 8 --lr 1e-5
 ```
 
+If you find this dataset valuable in your research, kindly acknowledge and credit the original data sources: [AMOS](https://zenodo.org/record/7262581), [BraTS2021](http://braintumorsegmentation.org/), [ACDC](https://www.creatis.insa-lyon.fr/Challenge/acdc/), [M\&Ms](https://www.ub.edu/mnms/), [PROMISE12](https://promise12.grand-challenge.org/) [ABCs](https://abcs.mgh.harvard.edu/), [AbdomenCT-1K](https://ieeexplore.ieee.org/document/9497733), [MSD](http://medicaldecathlon.com/), [KiTS19](https://kits19.grand-challenge.org/), [LiTS](https://competitions.codalab.org/competitions/17094), [COVID-19 CT-Seg](https://github.com/JunMa11/COVID-19-CT-Seg-Benchmark), [HECKTOR](https://www.sciencedirect.com/science/article/pii/S1361841521003819) [DRIVE](https://drive.grand-challenge.org/), [Colon gland](https://www.kaggle.com/datasets/sani84/glasmiccai2015-gland-segmentation), [polyp](https://www.nature.com/articles/s41597-023-01981-y), [instruments](https://www.synapse.org/#!Synapse:syn22427422), [Abdomen Ultrasound](https://www.kaggle.com/datasets/ignaciorlando/ussimandsegm), [Breast Ultrasound](https://www.sciencedirect.com/science/article/pii/S2352340919312181), [JSRT](http://imgcom.jsrt.or.jp/minijsrtdb/)
 
 
 ## Inference
@@ -86,7 +85,7 @@ The implementation code of DSC and NSD can be obtained [here](http://medicaldeca
 - [ ] Enlarge the dataset
 - [ ] 3D slicer and napari support
 
-We are very excited on this field. However, training such segmentation foundation model requires extensive computing resources. Thus, we have made all the pre-processed training and images publicly availble (research purpose only). To avoid wasting time to conduct the same experiments across different research groups, your are welcome to share your results/trained models on the discussion page. We look forward to working with the community together to advance this exciting research area.
+We are excited about the potential of segmentation foundation models in the medical image domain. However, training such models requires extensive computing resources. Therefore, we have made all the pre-processed training and images publicly available for research purposes. To prevent duplication of effort (e.g., conduct the same experiemnts), we encourage sharing of results and trained models on the discussion page. We look forward to working with the community to advance this exciting research area.
 
 
 ## Acknowledgements
