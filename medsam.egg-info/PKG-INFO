@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: medsam
+Version: 0.0.1
+Author: Jun Ma
+Requires-Python: >=3.9
+Provides-Extra: all
+Provides-Extra: dev

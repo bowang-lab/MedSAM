@@ -1,0 +1,80 @@
+# MedSAM
+This the official repository for MedSAM: Segment Anything in Medical Images.
+
+
+## Installation 
+1. Create a virtual environment `conda create -n medsam python=3.10 -y` and activate it `conda activate medsam`
+2. Install [Pytorch 2.0](https://pytorch.org/)
+3. `git clone https://github.com/bowang-lab/MedSAM`
+4. Enter the MedSAM folder `cd MedSAM` and run `pip install -e .`
+
+
+
+
+## Fine-tune SAM on customized dataset
+
+We provide a step-by-step tutorial with a small dataset to help you quickly start the training process.
+
+### Data preparation and preprocessing
+
+Download the demo [dataset](https://zenodo.org/record/7860267)
+
+This dataset contains 50 abdomen CT scans and each scan contain an annotation mask with 13 organs. The names of the organ label are available at [MICCAI FLARE2022](https://flare22.grand-challenge.org/).
+In this tutorial, we will fine-tune SAM for gallbladder segmentation.
+
+Run pre-processing
+
+
+```bash
+python pre_CT.py -i path_to_image_folder -gt path_to_gt_folder -o path_to_output
+```
+
+- split dataset: 80% for training and 20% for testing
+- image normalization
+- pre-compute image embedding
+- save the normalized images, ground truth masks, and image embedding as a `npz` file
+
+
+> Note: Medical images have various data formats. Thus, it's impossible that one script can handle all these different formats. Here, we provide two typical examples for CT and non-CT (e.g., various MR sequences, PET images) image preprocessing. You can adapt the preprocessing code to your own datasets.
+
+
+### Model Training
+
+Please check the step-by-step tutorial: `finetune_and_inference_tutorial.py`.
+
+You can also train the model on the whole dataset. 
+Download the training set ([GoogleDrive](https://drive.google.com/drive/folders/1pwpAkWPe6czxkATG9SmVV0TP62NZiKld?usp=share_link))
+
+> Note: For the convenience of file sharing, we compress each image and mask pair in a `npz` file. The pre-computed image embedding is too large (require ~1 TB space). You can generate it with the following command
+
+
+```bash
+python utils/precompute_img_embed.py -i path_to_train_folder -o ./data/Tr_emb
+```
+
+
+Train the model
+
+```bash
+python train -i ./data/Tr_emb --task_name SAM-ViT-B --num_epochs 1000 --batch_size 8 --lr 1e-5
+```
+
+
+
+## Inference
+
+Download the model checkpoint ([GoogleDrive](https://drive.google.com/drive/folders/1bWv_Zs5oYLpGMAvbotnlNXJPq7ltRUvF?usp=share_link)) and testing data ([GoogleDrive](https://drive.google.com/drive/folders/1Qx-4EM0MoarzAfvSIp9fkpk8UBrWM6EP?usp=share_link)) and put them to `data/Test` and `work_dir/MedSAM` respectively. 
+
+Run
+
+```bash
+python MedSAM_Inference.py -i ./data/Test -o ./ -chk work_dir/MedSAM/medsam_20230423_vit_b_0.0.1.pth
+```
+
+The segmentation results are available at [here](https://drive.google.com/drive/folders/1I8sgCRi30QtMix8DbDBIBTGDM_1FmSaO?usp=sharing).
+
+
+The implementation code of DSC and NSD can be obtained [here](http://medicaldecathlon.com/files/Surface_distance_based_measures.ipynb).
+
+
+## To-do-list

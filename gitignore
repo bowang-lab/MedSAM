@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+.pth
+.nii.gz
+.nii
+.npy
+.npz
+.csv
+.pdf
+.log
+.egg-info
+.png
+data/
+medsam.egg-info/
