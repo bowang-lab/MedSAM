@@ -176,7 +176,7 @@ for img, gt in zip(imgs, gts):
     # predict the segmentation mask using the fine-tuned model
     H, W = img.shape[:2]
     resize_img = sam_trans.apply_image(img)
-    resize_img_tensor = torch.as_tensor(resize_img.transpose(2, 0, 1)).to('cuda:0')
+    resize_img_tensor = torch.as_tensor(resize_img.transpose(2, 0, 1)).to(device)
     input_image = sam_model.preprocess(resize_img_tensor[None,:,:,:]) # (1, 3, 1024, 1024)
     with torch.no_grad():
         image_embedding = sam_model.image_encoder(input_image.to(device)) # (1, 256, 64, 64)
