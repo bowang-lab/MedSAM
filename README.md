@@ -92,3 +92,15 @@ We are excited about the potential of segmentation foundation models in the medi
 - We highly appreciate all the challenge organizers and dataset owners for providing the public dataset to the community. 
 - We thank Meta AI for making the source code of [segment anything](https://github.com/facebookresearch/segment-anything) publicly available.
 - We also thank Alexandre Bonnet for sharing this great [blog](https://encord.com/blog/learn-how-to-fine-tune-the-segment-anything-model-sam/)
+
+
+## Reference
+
+```
+@article{MedSAM,
+  title={Segment Anything in Medical Images},
+  author={Ma, Jun and Wang, Bo},
+  journal={arXiv preprint arXiv:2304.12306},
+  year={2023}
+}
+```
