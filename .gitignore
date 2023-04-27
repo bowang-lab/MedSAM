@@ -1,3 +1,16 @@
+# Project specific
+*.DS_Store
+*.pth
+*.nii.gz
+*.nii
+*.npy
+*.npz
+*.csv
+*.pdf
+*.log
+*.png
+data/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
