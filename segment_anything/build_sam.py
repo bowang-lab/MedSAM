@@ -3,12 +3,18 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+from functools import partial
+from pathlib import Path
 
 import torch
 
-from functools import partial
-
-from .modeling import ImageEncoderViT, MaskDecoder, PromptEncoder, Sam, TwoWayTransformer
+from .modeling import (
+    ImageEncoderViT,
+    MaskDecoder,
+    PromptEncoder,
+    Sam,
+    TwoWayTransformer,
+)
 
 
 def build_sam_vit_h(checkpoint=None):
@@ -100,6 +106,21 @@ def _build_sam(
         pixel_std=[58.395, 57.12, 57.375],
     )
     sam.eval()
+    checkpoint = Path(checkpoint)
+    if checkpoint.name == "sam_vit_b_01ec64.pth" and not checkpoint.exists():
+        cmd = input("Download sam_vit_b_01ec64.pth from facebook AI? [y]/n: ")
+        if len(cmd) == 0 or cmd.lower() == 'y':
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+
+            import urllib.request
+
+            print("Downloading SAM checkpoint.")
+            urllib.request.urlretrieve(
+                "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+                checkpoint,
+            )
+            print("Done")
+
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
             state_dict = torch.load(f)
