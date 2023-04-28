@@ -4,7 +4,7 @@ This the official repository for MedSAM: Segment Anything in Medical Images.
 
 ## Installation 
 1. Create a virtual environment `conda create -n medsam python=3.10 -y` and activate it `conda activate medsam`
-2. Install [Pytorch 2.0](https://pytorch.org/)
+2. Install [Pytorch 2.0](https://pytorch.org/get-started/locally/)
 3. `git clone https://github.com/bowang-lab/MedSAM`
 4. Enter the MedSAM folder `cd MedSAM` and run `pip install -e .`
 
@@ -15,13 +15,14 @@ We provide a step-by-step tutorial with a small dataset to help you quickly star
 
 ### Data preparation and preprocessing
 
-Download the demo [dataset](https://zenodo.org/record/7860267)
+Download [SAM checkpoint](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth) and place it at `work_dir/SAM/sam_vit_b_01ec64.pth` .
+
+Download the demo [dataset](https://zenodo.org/record/7860267) and unzip.
 
 This dataset contains 50 abdomen CT scans and each scan contain an annotation mask with 13 organs. The names of the organ label are available at [MICCAI FLARE2022](https://flare22.grand-challenge.org/).
 In this tutorial, we will fine-tune SAM for gallbladder segmentation.
 
 Run pre-processing
-
 
 ```bash
 python pre_CT.py -i path_to_image_folder -gt path_to_gt_folder -o path_to_output
@@ -32,9 +33,7 @@ python pre_CT.py -i path_to_image_folder -gt path_to_gt_folder -o path_to_output
 - pre-compute image embedding
 - save the normalized images, ground truth masks, and image embedding as a `npz` file
 
-
 > Note: Medical images have various data formats. Thus, it's impossible that one script can handle all these different formats. Here, we provide two typical examples for CT and non-CT (e.g., various MR sequences, PET images) image preprocessing. You can adapt the preprocessing code to your own datasets.
-
 
 ### Model Training
 
