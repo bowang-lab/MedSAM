@@ -13,3 +13,6 @@ RUN source $HOME/miniconda/bin/activate && conda init
 RUN conda create -n medsam python=3.10 -y
 RUN echo "conda activate medsam" >> ~/.bashrc
 RUN conda install -y pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
+
+RUN cd $HOME && pwd && git clone https://github.com/bowang-lab/MedSAM
+RUN cd $HOME/MedSAM && pip install -e .
