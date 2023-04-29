@@ -51,7 +51,7 @@ train_names = sorted(names[:int(len(names)*0.8)])
 test_names = sorted(names[int(len(names)*0.8):])
 
 # def preprocessing function
-def preprocess_ct(gt_path, nii_path, gt_name, image_name, label_id, image_size, sam_model):
+def preprocess_ct(gt_path, nii_path, gt_name, image_name, label_id, image_size, sam_model, device):
     gt_sitk = sitk.ReadImage(join(gt_path, gt_name))
     gt_data = sitk.GetArrayFromImage(gt_sitk)
     gt_data = np.uint8(gt_data==label_id)
@@ -91,7 +91,7 @@ def preprocess_ct(gt_path, nii_path, gt_name, image_name, label_id, image_size, 
                     sam_transform = ResizeLongestSide(sam_model.image_encoder.img_size)
                     resize_img = sam_transform.apply_image(img_slice_i)
                     # resized_shapes.append(resize_img.shape[:2])
-                    resize_img_tensor = torch.as_tensor(resize_img.transpose(2, 0, 1)).to('cuda:0')
+                    resize_img_tensor = torch.as_tensor(resize_img.transpose(2, 0, 1)).to(device)
                     # model input: (1, 3, 1024, 1024)
                     input_image = sam_model.preprocess(resize_img_tensor[None,:,:,:]) # (1, 3, 1024, 1024)
                     assert input_image.shape == (1, 3, sam_model.image_encoder.img_size, sam_model.image_encoder.img_size), 'input image should be resized to 1024*1024'
@@ -118,7 +118,7 @@ sam_model = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(a
 for name in tqdm(train_names):
     image_name = name.split('.nii.gz')[0] + args.img_name_suffix
     gt_name = name 
-    imgs, gts, img_embeddings = preprocess_ct(args.gt_path, args.nii_path, gt_name, image_name, args.label_id, args.image_size, sam_model)
+    imgs, gts, img_embeddings = preprocess_ct(args.gt_path, args.nii_path, gt_name, image_name, args.label_id, args.image_size, sam_model, args.device)
     #%% save to npz file
     # stack the list to array
     if len(imgs)>1:
@@ -138,7 +138,7 @@ for name in tqdm(train_names):
 for name in tqdm(test_names):
     image_name = name.split('.nii.gz')[0] + args.img_name_suffix
     gt_name = name 
-    imgs, gts = preprocess_ct(args.gt_path, args.nii_path, gt_name, image_name, args.label_id, args.image_size, sam_model=None)
+    imgs, gts = preprocess_ct(args.gt_path, args.nii_path, gt_name, image_name, args.label_id, args.image_size, sam_model=None, device=args.device)
     #%% save to npz file
     if len(imgs)>1:
         imgs = np.stack(imgs, axis=0) # (n, 256, 256, 3)
