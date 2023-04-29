@@ -139,7 +139,7 @@ for npz_folder in npz_folders:
                 axes[1].imshow(ori_imgs[img_id])
                 show_box(sam_bboxes[img_id], axes[1])
                 show_mask(sam_segs[img_id], axes[1])
-                axes[1].set_title('MadSAM: DSC={:.3f}'.format(sam_dice_scores[img_id]))
+                axes[1].set_title('MedSAM: DSC={:.3f}'.format(sam_dice_scores[img_id]))
                 axes[1].axis('off')
                 # save figure
                 fig.savefig(join(args.seg_png_path, npz_file.split('.npz')[0]+'.png'))
