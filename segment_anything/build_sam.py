@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 from functools import partial
 from pathlib import Path
-
+import urllib.request
 import torch
 
 from .modeling import (
@@ -111,16 +111,36 @@ def _build_sam(
         cmd = input("Download sam_vit_b_01ec64.pth from facebook AI? [y]/n: ")
         if len(cmd) == 0 or cmd.lower() == 'y':
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
-
-            import urllib.request
-
-            print("Downloading SAM checkpoint.")
+            print("Downloading SAM ViT-B checkpoint...")
             urllib.request.urlretrieve(
                 "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
                 checkpoint,
             )
-            print("Done")
-
+            print(checkpoint.name, " is downloaded!")
+    elif checkpoint.name == "sam_vit_h_4b8939.pth" and not checkpoint.exists():
+        cmd = input("Download sam_vit_h_4b8939.pth from facebook AI? [y]/n: ")
+        if len(cmd) == 0 or cmd.lower() == 'y':
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            print("Downloading SAM ViT-H checkpoint...")
+            urllib.request.urlretrieve(
+                "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+                checkpoint,
+            )
+            print(checkpoint.name, " is downloaded!")
+    elif checkpoint.name == "sam_vit_l_0b3195.pth" and not checkpoint.exists():
+        cmd = input("Download sam_vit_l_0b3195.pth from facebook AI? [y]/n: ")
+        if len(cmd) == 0 or cmd.lower() == 'y':
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            print("Downloading SAM ViT-L checkpoint...")
+            urllib.request.urlretrieve(
+                "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
+                checkpoint,
+            )
+            print(checkpoint.name, " is downloaded!")
+    else:
+        # raise not implementation error
+        raise NotImplementedError('checkpoint not found')
+        
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
             state_dict = torch.load(f)
