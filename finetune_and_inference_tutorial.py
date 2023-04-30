@@ -17,16 +17,15 @@ np.random.seed(2023)
 
 #%% create a dataset class to load npz data and return back image embeddings and ground truth
 class NpzDataset(Dataset): 
-    def __init__(self, data_root, image_size=256):
+    def __init__(self, data_root):
         self.data_root = data_root
-        self.image_size = image_size
         self.npz_files = sorted(os.listdir(self.data_root)) 
         self.npz_data = [np.load(join(data_root, f)) for f in self.npz_files]
         # this implementation is ugly but it works (and is also fast for feeding data to GPU) if your server has enough RAM
         # as an alternative, you can also use a list of npy files and load them one by one
         self.ori_gts = np.vstack([d['gts'] for d in self.npz_data])
         self.img_embeddings = np.vstack([d['img_embeddings'] for d in self.npz_data])
-        print(self.ori_gts.shape, self.img_embeddings.shape)
+        print(f"{self.img_embeddings.shape=}, {self.ori_gts.shape=}")
     
     def __len__(self):
         return self.ori_gts.shape[0]
@@ -54,7 +53,7 @@ demo_dataset = NpzDataset(npz_tr_path)
 demo_dataloader = DataLoader(demo_dataset, batch_size=8, shuffle=True)
 for img_embed, gt2D, bboxes in demo_dataloader:
     # img_embed: (B, 256, 64, 64), gt2D: (B, 1, 256, 256), bboxes: (B, 4)
-    print(img_embed.shape, gt2D.shape, bboxes.shape)
+    print(f"{img_embed.shape=}, {gt2D.shape=}, {bboxes.shape=}")
     break
 
 # %% set up model for fine-tuning 
@@ -68,8 +67,7 @@ checkpoint = 'work_dir/SAM/sam_vit_b_01ec64.pth'
 device = 'cuda:0'
 model_save_path = join(work_dir, task_name)
 os.makedirs(model_save_path, exist_ok=True)
-sam_model = sam_model_registry[model_type](checkpoint=checkpoint)
-sam_model.to(device)
+sam_model = sam_model_registry[model_type](checkpoint=checkpoint).to(device)
 sam_model.train()
 
 # Set up the optimizer, hyperparameter tuning will improve performance here
@@ -87,7 +85,7 @@ train_dataset = NpzDataset(npz_tr_path)
 train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 for epoch in range(num_epochs):
     epoch_loss = 0
-    # Just train on the first 20 examples
+    # train
     for step, (image_embedding, gt2D, boxes) in enumerate(tqdm(train_dataloader)):
         # do not compute gradients for image encoder and prompt encoder
         with torch.no_grad():
@@ -98,13 +96,14 @@ for epoch in range(num_epochs):
             box_torch = torch.as_tensor(box, dtype=torch.float, device=device)
             if len(box_torch.shape) == 2:
                 box_torch = box_torch[:, None, :] # (B, 1, 4)
-            
+            # get prompt embeddings 
             sparse_embeddings, dense_embeddings = sam_model.prompt_encoder(
                 points=None,
                 boxes=box_torch,
                 masks=None,
             )
-        low_res_masks, iou_predictions = sam_model.mask_decoder(
+        # predicted masks
+        mask_predictions, _ = sam_model.mask_decoder(
             image_embeddings=image_embedding.to(device), # (B, 256, 64, 64)
             image_pe=sam_model.prompt_encoder.get_dense_pe(), # (1, 256, 64, 64)
             sparse_prompt_embeddings=sparse_embeddings, # (B, 2, 256)
@@ -112,22 +111,23 @@ for epoch in range(num_epochs):
             multimask_output=False,
           )
 
-        loss = seg_loss(low_res_masks, gt2D.to(device))
+        loss = seg_loss(mask_predictions, gt2D.to(device))
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
+    
     epoch_loss /= step
     losses.append(epoch_loss)
     print(f'EPOCH: {epoch}, Loss: {epoch_loss}')
-    # save the model checkpoint
+    # save the latest model checkpoint
     torch.save(sam_model.state_dict(), join(model_save_path, 'sam_model_latest.pth'))
     # save the best model
     if epoch_loss < best_loss:
         best_loss = epoch_loss
         torch.save(sam_model.state_dict(), join(model_save_path, 'sam_model_best.pth'))
 
-    # %% plot loss
+    # plot loss
     plt.plot(losses)
     plt.title('Dice + Cross Entropy Loss')
     plt.xlabel('Epoch')
@@ -231,7 +231,7 @@ def show_box(box, ax):
     ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='blue', facecolor=(0,0,0,0), lw=2))    
 
 
-img_id = int(imgs.shape[0]/2) # np.random.randint(0, img.shape[0], 1)
+img_id = int(imgs.shape[0]/2)  # np.random.randint(imgs.shape[0])
 _, axs = plt.subplots(1, 3, figsize=(25, 25))
 axs[0].imshow(imgs[img_id])
 show_mask(gts[img_id], axs[0])
@@ -259,4 +259,3 @@ plt.subplots_adjust(wspace=0.01, hspace=0)
 # save plot
 # plt.savefig(join(model_save_path, test_npzs[npz_idx].split('.npz')[0] + str(img_id).zfill(3) + '.png'), bbox_inches='tight', dpi=300)
 plt.close()
-
