@@ -137,9 +137,7 @@ def _build_sam(
                 checkpoint,
             )
             print(checkpoint.name, " is downloaded!")
-    else:
-        # raise not implementation error
-        raise NotImplementedError('checkpoint not found')
+
         
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
