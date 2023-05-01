@@ -35,9 +35,11 @@ python pre_CT.py -i path_to_image_folder -gt path_to_gt_folder -o path_to_output
 
 > Note: Medical images have various data formats. Thus, it's impossible that one script can handle all these different formats. Here, we provide two typical examples for CT and non-CT (e.g., various MR sequences, PET images) image preprocessing. You can adapt the preprocessing code to your own datasets.
 
-### Model Training
+### Model Training ([Video Tutorial](https://drive.google.com/file/d/1EvVBTSa9L7pDTmUOp-MHXxGD1lrU9Txk/view?usp=share_link))
 
-Please check the step-by-step tutorial: `finetune_and_inference_tutorial.py`.
+Please check the step-by-step tutorial: finetune_and_inference_tutorial_3D_dataset.ipynb
+
+We also provide a tutorial on 2D dataset (png format): finetune_and_inference_tutorial_2D_dataset.ipynb 
 
 You can also train the model on the whole dataset. 
 Download the training set ([GoogleDrive](https://drive.google.com/drive/folders/1pwpAkWPe6czxkATG9SmVV0TP62NZiKld?usp=share_link))
