@@ -21,11 +21,12 @@ class NpzDataset(Dataset):
         self.data_root = data_root
         self.image_size = image_size
         self.npz_files = sorted(os.listdir(self.data_root)) 
-        self.npz_data = [np.load(join(data_root, f)) for f in self.npz_files]
-        # this implementation is ugly but it works (and is also fast for feeding data to GPU) if your server has enough RAM
-        # as an alternative, you can also use a list of npy files and load them one by one
-        self.ori_gts = np.stack([d['gt'] for d in self.npz_data], axis=0)
-        self.img_embeddings = np.stack([d['img_embedding'] for d in self.npz_data], axis=0)
+        self.img_embeddings, self.ori_gts = self.load_imgEmbeds_and_gt(data_root)
+        # self.npz_data = [np.load(join(data_root, f)) for f in self.npz_files]
+        # # this implementation is ugly but it works (and is also fast for feeding data to GPU) if your server has enough RAM
+        # # as an alternative, you can also use a list of npy files and load them one by one
+        # self.ori_gts = np.stack([d['gt'] for d in self.npz_data], axis=0)
+        # self.img_embeddings = np.stack([d['img_embedding'] for d in self.npz_data], axis=0)
         print(self.ori_gts.shape, self.img_embeddings.shape)
     
     def __len__(self):
@@ -47,6 +48,23 @@ class NpzDataset(Dataset):
         # convert img embedding, mask, bounding box to torch tensor
         return torch.tensor(img_embed).float(), torch.tensor(gt2D[None, :,:]).long(), torch.tensor(bboxes).float()
 
+    def load_imgEmbeds_and_gt(self, data_root):
+        combined_img_embed_path = join(self.data_root, 'combined_img_embeds.npy')
+        combined_gt_path = join(self.data_root, 'combined_gt.npy')
+        if os.path.exists(combined_img_embed_path) and os.path.exists(combined_gt_path):
+            return np.load(combined_img_embed_path), np.load(combined_gt_path)
+        else:
+            print("Concatenating input volumes into a single stack")
+            orig_gts, img_embeds = [], []
+            for f in tqdm(self.npz_files):
+                with np.load(join(data_root, f)) as file:
+                    img_embeds.append(file['img_embedding'])
+                    orig_gts.append(file['gt'])
+            orig_gts = np.stack(orig_gts, axis=0)
+            img_embeddings = np.stack(img_embeds, axis=0)
+            np.save(join(self.data_root, 'combined_img_embeds'), img_embeddings)
+            np.save(join(self.data_root, 'combined_gt'), orig_gts)
+            return img_embeddings, orig_gts
 
 # %% set up parser
 parser = argparse.ArgumentParser()
