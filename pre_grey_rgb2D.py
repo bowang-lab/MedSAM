@@ -10,7 +10,7 @@ from segment_anything.utils.transforms import ResizeLongestSide
 import argparse
 
 # set up the parser
-parser = argparse.ArgumentParser(description='preprocess CT images')
+parser = argparse.ArgumentParser(description='preprocess grey and RGB images')
 parser.add_argument('-i', '--img_path', type=str, default='data/MedSAMDemo_2D/train/images', help='path to the images')
 parser.add_argument('-gt', '--gt_path', type=str, default='data/MedSAMDemo_2D/train/labels', help='path to the ground truth (gt)')
 parser.add_argument('-o', '--npz_path', type=str, default='data/demo2D', help='path to save the npz files')
@@ -76,6 +76,7 @@ for gt_name in tqdm(names):
         
 # save all 2D images as one npz file: ori_imgs, ori_gts, img_embeddings    
 # stack the list to array
+print('Num. of images:', len(imgs))
 if len(imgs)>1:
     imgs = np.stack(imgs, axis=0) # (n, 256, 256, 3)
     gts = np.stack(gts, axis=0) # (n, 256, 256)
@@ -88,5 +89,6 @@ if len(imgs)>1:
     bd = segmentation.find_boundaries(gt_idx, mode='inner')
     img_idx[bd, :] = [255, 0, 0]
     io.imsave(save_path + '.png', img_idx, check_contrast=False)
-
+else:
+    print('Do not find image and ground-truth pairs. Please check your dataset and argument settings')
 
