@@ -13,15 +13,17 @@ import argparse
 
 #%% parse arguments
 parser = argparse.ArgumentParser()
-parser.add_argument('-i', '--img_path', type=str, default='data/Tr_Release_Part1', help='path to the image npz folder')
-parser.add_argument('-o', '--save_path', type=str, default='data/Tr_emb', help='path to save the image embeddings')
+parser.add_argument('-i', '--img_path', type=str, default='./data/Tr_Release_Part1', help='# and also Tr_Release_Part2 when part1 is done')
+parser.add_argument('-o', '--save_path', type=str, default='./data/Tr_npy', help='path to save the image embeddings')
 parser.add_argument('--model_type', type=str, default='vit_b', help='model type')
 parser.add_argument('--checkpoint', type=str, default='../work_dir/SAM/sam_vit_b_01ec64.pth', help='path to the pre-trained SAM model')
 args = parser.parse_args()
 
-pre_img_path = args.img_path # and also Tr_Release_Part2 when part1 is done
-save_img_emb_path = args.save_path
+pre_img_path = args.img_path 
+save_img_emb_path = join(args.save_path, 'npy_embs')
+save_gt_path = join(args.save_path, 'npy_gts')
 os.makedirs(save_img_emb_path, exist_ok=True)
+os.makedirs(save_gt_path, exist_ok=True)
 npz_files = sorted(os.listdir(pre_img_path))
 #%% set up the model
 sam_model = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to('cuda:0')
@@ -38,8 +40,10 @@ for name in tqdm(npz_files):
     assert input_image.shape == (1, 3, sam_model.image_encoder.img_size, sam_model.image_encoder.img_size), 'input image should be resized to 1024*1024'
     with torch.no_grad():
         embedding = sam_model.image_encoder(input_image)
-    np.savez(join(save_img_emb_path, name), img=img, gt=gt, img_embedding=embedding.cpu().numpy()[0])
-    
+        
+    # save as npy
+    np.save(join(save_img_emb_path, name.split('.npz')[0]+'.npy'), embedding.cpu().numpy()[0])
+    np.save(join(save_gt_path, name.split('.npz')[0]+'.npy'), gt)
     # sanity check
     img_idx = img.copy()
     bd = segmentation.find_boundaries(gt, mode='inner')
