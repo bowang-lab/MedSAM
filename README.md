@@ -42,20 +42,20 @@ Please check the step-by-step tutorial: finetune_and_inference_tutorial_3D_datas
 We also provide a tutorial on 2D dataset (png format): finetune_and_inference_tutorial_2D_dataset.ipynb 
 
 You can also train the model on the whole dataset. 
-Download the training set ([GoogleDrive](https://drive.google.com/drive/folders/1pwpAkWPe6czxkATG9SmVV0TP62NZiKld?usp=share_link))
+1) Download the training set ([GoogleDrive](https://drive.google.com/drive/folders/1pwpAkWPe6czxkATG9SmVV0TP62NZiKld?usp=share_link))
 
 > Note: For the convenience of file sharing, we compress each image and mask pair in a `npz` file. The pre-computed image embedding is too large (require ~1 TB space). You can generate it with the following command
 
+2) Pre-compute the image embedding and save the image embedding and ground truth as `.npy` files. 
 
 ```bash
-python utils/precompute_img_embed.py -i path_to_train_folder -o ./data/Tr_emb
+python utils/precompute_img_embed.py -i path_to_train_folder -o ./data/Tr_npy
 ```
 
-
-Train the model
+3) Train the model
 
 ```bash
-python train -i ./data/Tr_emb --task_name SAM-ViT-B --num_epochs 1000 --batch_size 8 --lr 1e-5
+python train -i ./data/Tr_npy --task_name SAM-ViT-B --num_epochs 1000 --batch_size 8 --lr 1e-5
 ```
 
 If you find this dataset valuable in your research, kindly acknowledge and credit the original data sources: [AMOS](https://zenodo.org/record/7262581), [BraTS2021](http://braintumorsegmentation.org/), [ACDC](https://www.creatis.insa-lyon.fr/Challenge/acdc/), [M\&Ms](https://www.ub.edu/mnms/), [PROMISE12](https://promise12.grand-challenge.org/) [ABCs](https://abcs.mgh.harvard.edu/), [AbdomenCT-1K](https://ieeexplore.ieee.org/document/9497733), [MSD](http://medicaldecathlon.com/), [KiTS19](https://kits19.grand-challenge.org/), [LiTS](https://competitions.codalab.org/competitions/17094), [COVID-19 CT-Seg](https://github.com/JunMa11/COVID-19-CT-Seg-Benchmark), [HECKTOR](https://www.sciencedirect.com/science/article/pii/S1361841521003819) [DRIVE](https://drive.grand-challenge.org/), [Colon gland](https://www.kaggle.com/datasets/sani84/glasmiccai2015-gland-segmentation), [polyp](https://www.nature.com/articles/s41597-023-01981-y), [instruments](https://www.synapse.org/#!Synapse:syn22427422), [Abdomen Ultrasound](https://www.kaggle.com/datasets/ignaciorlando/ussimandsegm), [Breast Ultrasound](https://www.sciencedirect.com/science/article/pii/S2352340919312181), [JSRT](http://imgcom.jsrt.or.jp/minijsrtdb/)
