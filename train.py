@@ -7,7 +7,7 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import Dataset, DataLoader
 import monai
-from segment_anything import SamPredictor, sam_model_registry
+from segment_anything import sam_model_registry
 from segment_anything.utils.transforms import ResizeLongestSide
 import argparse
 # set seeds
@@ -16,24 +16,19 @@ np.random.seed(2023)
 
 
 #%% create a dataset class to load npz data and return back image embeddings and ground truth
-class NpzDataset(Dataset): 
-    def __init__(self, data_root, image_size=256):
+class NpyDataset(Dataset): 
+    def __init__(self, data_root):
         self.data_root = data_root
-        self.image_size = image_size
-        self.npz_files = sorted(os.listdir(self.data_root)) 
-        self.npz_data = [np.load(join(data_root, f)) for f in self.npz_files]
-        # this implementation is ugly but it works (and is also fast for feeding data to GPU) if your server has enough RAM
-        # as an alternative, you can also use a list of npy files and load them one by one
-        self.ori_gts = np.stack([d['gt'] for d in self.npz_data], axis=0)
-        self.img_embeddings = np.stack([d['img_embedding'] for d in self.npz_data], axis=0)
-        print(self.ori_gts.shape, self.img_embeddings.shape)
+        self.gt_path = join(data_root, 'npy_gts')
+        self.embed_path = join(data_root, 'npy_embs')
+        self.npy_files = sorted(os.listdir(self.gt_path))
     
     def __len__(self):
-        return self.ori_gts.shape[0]
+        return len(self.npy_files)
 
     def __getitem__(self, index):
-        img_embed = self.img_embeddings[index]
-        gt2D = self.ori_gts[index]
+        gt2D = np.load(join(self.gt_path, self.npy_files[index]))
+        img_embed = np.load(join(self.embed_path, self.npy_files[index]))
         y_indices, x_indices = np.where(gt2D > 0)
         x_min, x_max = np.min(x_indices), np.max(x_indices)
         y_min, y_max = np.min(y_indices), np.max(y_indices)
@@ -47,10 +42,9 @@ class NpzDataset(Dataset):
         # convert img embedding, mask, bounding box to torch tensor
         return torch.tensor(img_embed).float(), torch.tensor(gt2D[None, :,:]).long(), torch.tensor(bboxes).float()
 
-
 # %% set up parser
 parser = argparse.ArgumentParser()
-parser.add_argument('-i', '--npz_tr_path', type=str, default='data/Tr_emb')
+parser.add_argument('-i', '--tr_npy_path', type=str, default='data/Tr_npy', help='path to training npy files; two subfolders: npy_gts and npy_embs')
 parser.add_argument('--task_name', type=str, default='SAM-ViT-B')
 parser.add_argument('--model_type', type=str, default='vit_b')
 parser.add_argument('--checkpoint', type=str, default='work_dir/SAM/sam_vit_b_01ec64.pth')
@@ -80,7 +74,7 @@ seg_loss = monai.losses.DiceCELoss(sigmoid=True, squared_pred=True, reduction='m
 num_epochs = args.num_epochs
 losses = []
 best_loss = 1e10
-train_dataset = NpzDataset(args.npz_tr_path)
+train_dataset = NpyDataset(args.tr_npy_path)
 train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 for epoch in range(num_epochs):
     epoch_loss = 0
