@@ -2,6 +2,7 @@
 import numpy as np
 import os
 from glob import glob
+import pandas as pd
 
 join = os.path.join
 from skimage import transform, io, segmentation
@@ -19,22 +20,29 @@ parser.add_argument(
     "-i",
     "--img_path",
     type=str,
-    default="data/MedSAMDemo_2D/train/images",
+    default=None,
     help="path to the images",
 )
 parser.add_argument(
     "-gt",
     "--gt_path",
     type=str,
-    default="data/MedSAMDemo_2D/train/labels",
+    default=None,
     help="path to the ground truth (gt)",
+)
+
+parser.add_argument(
+    "--csv",
+    type=str,
+    default=None,
+    help="path to the csv file",
 )
 
 parser.add_argument(
     "-o",
     "--npz_path",
     type=str,
-    default="data/demo2D",
+    default=".",
     help="path to save the npz files",
 )
 parser.add_argument(
@@ -61,18 +69,10 @@ parser.add_argument("--seed", type=int, default=2023, help="random seed")
 # parse the arguments
 args = parser.parse_args()
 
-# get all the names of the images in the ground truth folder
-names = sorted(os.listdir(args.gt_path))
-"""
-names = sorted(glob(args.get_path + "/*png"))
-names += sorted(glob(args.get_path + "/*jpg"))
-"""
-# create a directory to save the npz files
-save_path = args.npz_path + "_" + args.model_type
-os.makedirs(save_path, exist_ok=True)
-
-# print the number of images found in the ground truth folder
-print("image number:", len(names))
+# convert 2d grey or rgb images to npz file
+imgs = []
+gts = []
+img_embeddings = []
 
 # set up the model
 # get the model from sam_model_registry using the model_type argument
@@ -84,14 +84,10 @@ sam_model = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(
     args.device
 )
 
-# convert 2d grey or rgb images to npz file
-imgs = []
-gts = []
-img_embeddings = []
 
-for gt_name in tqdm(names):
-    image_name = gt_name.split(".")[0] + args.img_name_suffix
-    # read ground truth images
+def process(gt_name: str, image_name: str):
+    if image_name == None:
+        image_name = gt_name.split(".")[0] + args.img_name_suffix
     gt_data = io.imread(join(args.gt_path, gt_name))
     # if it is rgb, select the first channel
     if len(gt_data.shape) == 3:
@@ -170,6 +166,34 @@ for gt_name in tqdm(names):
         with torch.no_grad():
             embedding = sam_model.image_encoder(input_image)
             img_embeddings.append(embedding.cpu().numpy()[0])
+
+
+if args.csv != None:
+    # if data is presented in csv format
+    # columns must be named image_filename and mask_filename respectively
+
+    try:
+        os.path.exists(args.csv)
+    except FileNotFoundError as e:
+        print(f"File {args.csv} not found!!")
+
+    df = pd.read_csv(args.csv)
+    bar = tqdm(df.iterrows(), total=len(df))
+    for idx, row in bar:
+        process(row.Tumor_mask_filename, row.Image_filename)
+
+else:
+    # get all the names of the images in the ground truth folder
+    names = sorted(os.listdir(args.gt_path))
+    # print the number of images found in the ground truth folder
+    print("image number:", len(names))
+    for gt_name in tqdm(names):
+        process(gt_name)
+
+# create a directory to save the npz files
+save_path = args.npz_path + "_" + args.model_type
+os.makedirs(save_path, exist_ok=True)
+
 
 # save all 2D images as one npz file: ori_imgs, ori_gts, img_embeddings
 # stack the list to array
