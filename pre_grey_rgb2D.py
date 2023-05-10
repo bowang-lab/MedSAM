@@ -179,7 +179,7 @@ if args.csv != None:
     df = pd.read_csv(args.csv)
     bar = tqdm(df.iterrows(), total=len(df))
     for idx, row in bar:
-        process(row.Tumor_mask_filename, row.Image_filename)
+        process(row.mask_filename, row.image_filename)
 
 else:
     # get all the names of the images in the ground truth folder
