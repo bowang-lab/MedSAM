@@ -20,14 +20,14 @@ parser.add_argument(
     "-i",
     "--img_path",
     type=str,
-    default=None,
+    default="data/MedSAMDemo_2D/train/images",
     help="path to the images",
 )
 parser.add_argument(
     "-gt",
     "--gt_path",
     type=str,
-    default=None,
+    default="data/MedSAMDemo_2D/train/labels",
     help="path to the ground truth (gt)",
 )
 
@@ -42,7 +42,7 @@ parser.add_argument(
     "-o",
     "--npz_path",
     type=str,
-    default=".",
+    default="data/demo2D",
     help="path to save the npz files",
 )
 parser.add_argument(
@@ -171,7 +171,6 @@ def process(gt_name: str, image_name: str):
 if args.csv != None:
     # if data is presented in csv format
     # columns must be named image_filename and mask_filename respectively
-
     try:
         os.path.exists(args.csv)
     except FileNotFoundError as e:
