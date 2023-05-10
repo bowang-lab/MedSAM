@@ -1,4 +1,4 @@
-# MedSAM
+# MedSAM 
 This is the official repository for MedSAM: Segment Anything in Medical Images.
 
 
