@@ -187,7 +187,7 @@ else:
     # print the number of images found in the ground truth folder
     print("image number:", len(names))
     for gt_name in tqdm(names):
-        process(gt_name)
+        process(gt_name, None)
 
 # create a directory to save the npz files
 save_path = args.npz_path + "_" + args.model_type
