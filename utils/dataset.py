@@ -42,7 +42,7 @@ class MedSamDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx) -> Tuple(torch.Tensor, torch.Tensor, torch.Tensor):
+    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # read dataframe row
         row = self.df.iloc[idx]
         # If the `image_dir` attribute is set, the path will be relative to that directory.
@@ -66,7 +66,7 @@ class MedSamDataset(Dataset):
 
     def _preprocess(
         self, image: np.ndarray, mask: np.ndarray
-    ) -> Tuple(torch.Tensor, torch.Tensor, torch.Tensor):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Threshold mask to binary
         mask = cv2.threshold(mask, 127.0, 255.0, cv2.THRESH_BINARY)[1]
         # convert to tensor
