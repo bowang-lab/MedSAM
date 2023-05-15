@@ -57,6 +57,12 @@ class MedSamDataset(Dataset):
             if self.mask_dir
             else row[self.mask_col]
         )
+
+        if not os.path.exists(image_file):
+            raise FileNotFoundError(f"Couldn't find image {image_file}")
+        if not os.path.exists(mask_file):
+            raise FileNotFoundError(f"Couldn't find image {mask_file}")
+
         # read image and mask files
         image_data = cv2.imread(image_file)
         # read mask as gray scale
