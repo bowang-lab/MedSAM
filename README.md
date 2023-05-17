@@ -60,6 +60,17 @@ python train -i ./data/Tr_npy --task_name SAM-ViT-B --num_epochs 1000 --batch_si
 
 If you find this dataset valuable in your research, kindly acknowledge and credit the original data sources: [AMOS](https://zenodo.org/record/7262581), [BraTS2021](http://braintumorsegmentation.org/), [ACDC](https://www.creatis.insa-lyon.fr/Challenge/acdc/), [M\&Ms](https://www.ub.edu/mnms/), [PROMISE12](https://promise12.grand-challenge.org/) [ABCs](https://abcs.mgh.harvard.edu/), [AbdomenCT-1K](https://ieeexplore.ieee.org/document/9497733), [MSD](http://medicaldecathlon.com/), [KiTS19](https://kits19.grand-challenge.org/), [LiTS](https://competitions.codalab.org/competitions/17094), [COVID-19 CT-Seg](https://github.com/JunMa11/COVID-19-CT-Seg-Benchmark), [HECKTOR](https://www.sciencedirect.com/science/article/pii/S1361841521003819) [DRIVE](https://drive.grand-challenge.org/), [Colon gland](https://www.kaggle.com/datasets/sani84/glasmiccai2015-gland-segmentation), [polyp](https://www.nature.com/articles/s41597-023-01981-y), [instruments](https://www.synapse.org/#!Synapse:syn22427422), [Abdomen Ultrasound](https://www.kaggle.com/datasets/ignaciorlando/ussimandsegm), [Breast Ultrasound](https://www.sciencedirect.com/science/article/pii/S2352340919312181), [JSRT](http://imgcom.jsrt.or.jp/minijsrtdb/)
 
+4) Train the model without pre-computed embeddings, run the following command:
+``` bash
+python train_no_npz.py --csv <path-to-csv-file>  --image_col <csv-image-column-name> --mask_col <csv-mask-column-name> --model_type vit_b --checkpoint ../SAM_weights/sam_vit_b_01ec64.pth [--image <image-file-dir-path>] [--mask <mask-file-dir-path>]--num_epochs 100 --batch_size 4 --lr 1e-4
+```
+The `--image` and `--mask` arguments can be used to specify the paths to the input and mask images, respectively. If these arguments are not specified, the paths to the images will be taken from the CSV file.
+
+The `--image_col` and `--mask_col` arguments can be used to specify the names of the columns in the CSV file that contain the paths to the input and mask images
+
+The `-k` argument can be used to specify the number of folds for cross-validation. If this argument is not specified, the model will be trained on the entire dataset.
+
+>Note: This method is slower and requires more memory than training the model using pre-computed embeddings.
 
 ## Inference
 

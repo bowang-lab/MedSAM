@@ -482,7 +482,6 @@ def main():
 
     try:
         df = pd.read_csv(args.csv)
-        df = df.sample(frac=0.3)
     except FileNotFoundError:
         print(f"{args.csv} does not exist")
 
