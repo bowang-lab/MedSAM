@@ -85,7 +85,7 @@ python MedSAM_Inference.py -i ./data/Test -o ./ -chk work_dir/MedSAM/medsam_2023
 The segmentation results are available at [here](https://drive.google.com/drive/folders/1I8sgCRi30QtMix8DbDBIBTGDM_1FmSaO?usp=sharing).
 
 
-The implementation code of DSC and NSD can be obtained [here](http://medicaldecathlon.com/files/Surface_distance_based_measures.ipynb).
+The implementation code of DSC and NSD can be obtained at http://medicaldecathlon.com/files/Surface_distance_based_measures.ipynb.
 
 
 ## To-do-list
