@@ -78,7 +78,6 @@ def preprocess_ct(gt_path, nii_path, gt_name, image_name, label_id, image_size, 
             gt_slice_i = gt_data[i,:,:]
             gt_slice_i = transform.resize(gt_slice_i, (image_size, image_size), order=0, preserve_range=True, mode='constant', anti_aliasing=False)
             if np.sum(gt_slice_i)>100:
-                # resize img_slice_i to 256x256
                 img_slice_i = image_data_pre[i,:,:]
                 # convert to three channels
                 img_slice_i = np.uint8(np.repeat(img_slice_i[:,:,None], 3, axis=-1))
