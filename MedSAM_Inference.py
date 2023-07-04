@@ -5,10 +5,9 @@ import os
 join = os.path.join
 import torch
 from segment_anything import sam_model_registry
-from segment_anything.utils.transforms import ResizeLongestSide
-from tqdm import tqdm
+from skimage import io, transform
+import torch.nn.functional as F
 import argparse
-import traceback
 
 # visualization functions
 # source: https://github.com/facebookresearch/segment-anything/blob/main/notebooks/predictor_example.ipynb
@@ -25,126 +24,83 @@ def show_mask(mask, ax, random_color=False):
 def show_box(box, ax):
     x0, y0 = box[0], box[1]
     w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='blue', facecolor=(0,0,0,0), lw=2))    
+    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='blue', facecolor=(0,0,0,0), lw=2))
 
-
-def compute_dice(mask_gt, mask_pred):
-    """Compute soerensen-dice coefficient.
-    Returns:
-    the dice coeffcient as float. If both masks are empty, the result is NaN
-    """
-    volume_sum = mask_gt.sum() + mask_pred.sum()
-    if volume_sum == 0:
-        return np.NaN
-    volume_intersect = (mask_gt & mask_pred).sum()
-    return 2*volume_intersect / volume_sum
-
-def finetune_model_predict(img_np, box_np, sam_trans, sam_model_tune, device='cuda:0'):
-    H, W = img_np.shape[:2]
-    resize_img = sam_trans.apply_image(img_np)
-    resize_img_tensor = torch.as_tensor(resize_img.transpose(2, 0, 1)).to(device)
-    input_image = sam_model_tune.preprocess(resize_img_tensor[None,:,:,:]) # (1, 3, 1024, 1024)
-    with torch.no_grad():
-        image_embedding = sam_model_tune.image_encoder(input_image.to(device)) # (1, 256, 64, 64)
-        # convert box to 1024x1024 grid
-        box = sam_trans.apply_boxes(box_np, (H, W))
-        box_torch = torch.as_tensor(box, dtype=torch.float, device=device)
-        if len(box_torch.shape) == 2:
-            box_torch = box_torch[:, None, :] # (B, 1, 4)
-        
-        sparse_embeddings, dense_embeddings = sam_model_tune.prompt_encoder(
-            points=None,
-            boxes=box_torch,
-            masks=None,
+@torch.no_grad()
+def medsam_inference(medsam_model, img_embed, box_1024, H, W):
+    box_torch = torch.as_tensor(box_1024, dtype=torch.float, device=img_embed.device)
+    if len(box_torch.shape) == 2:
+        box_torch = box_torch[:, None, :] # (B, 1, 4)
+    
+    sparse_embeddings, dense_embeddings = medsam_model.prompt_encoder(
+        points=None,
+        boxes=box_torch,
+        masks=None,
+    )
+    low_res_logits, _ = medsam_model.mask_decoder(
+        image_embeddings=img_embed, # (B, 256, 64, 64)
+        image_pe=medsam_model.prompt_encoder.get_dense_pe(), # (1, 256, 64, 64)
+        sparse_prompt_embeddings=sparse_embeddings, # (B, 2, 256)
+        dense_prompt_embeddings=dense_embeddings, # (B, 256, 64, 64)
+        multimask_output=False,
         )
-        medsam_seg_prob, _ = sam_model_tune.mask_decoder(
-            image_embeddings=image_embedding.to(device), # (B, 256, 64, 64)
-            image_pe=sam_model_tune.prompt_encoder.get_dense_pe(), # (1, 256, 64, 64)
-            sparse_prompt_embeddings=sparse_embeddings, # (B, 2, 256)
-            dense_prompt_embeddings=dense_embeddings, # (B, 256, 64, 64)
-            multimask_output=False,
-            )
-        medsam_seg_prob = torch.sigmoid(medsam_seg_prob)
-        # convert soft mask to hard mask
-        medsam_seg_prob = medsam_seg_prob.cpu().numpy().squeeze()
-        medsam_seg = (medsam_seg_prob > 0.5).astype(np.uint8)
+
+    low_res_pred = torch.sigmoid(low_res_logits)  # (1, 1, 256, 256)
+
+    low_res_pred = F.interpolate(
+        low_res_pred,
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False,
+    )  # (1, 1, gt.shape)
+    low_res_pred = low_res_pred.squeeze().cpu().numpy()  # (256, 256)
+    medsam_seg = (low_res_pred > 0.5).astype(np.uint8)
     return medsam_seg
 
-#%% run inference
-# set up the parser
+#%% load model and image
 parser = argparse.ArgumentParser(description='run inference on testing set based on MedSAM')
-parser.add_argument('-i', '--data_path', type=str, default='data/Test', help='path to the data folder')
-parser.add_argument('-o', '--seg_path_root', type=str, default='data/Test_MedSAMBaseSeg', help='path to the segmentation folder')
-parser.add_argument('--seg_png_path', type=str, default='data/sanity_test/Test_MedSAMBase_png', help='path to the segmentation folder')
-parser.add_argument('--model_type', type=str, default='vit_b', help='model type')
+parser.add_argument('-i', '--data_path', type=str, default='assets/img_demo.png', help='path to the data folder')
+parser.add_argument('-o', '--seg_path', type=str, default='assets/', help='path to the segmentation folder')
+parser.add_argument('--box', type=list, default=[95,255, 190, 350], help='bounding box of the segmentation target')
 parser.add_argument('--device', type=str, default='cuda:0', help='device')
-parser.add_argument('-chk', '--checkpoint', type=str, default='work_dir/MedSAM/medsam_20230423_vit_b_0.0.1.pth', help='path to the trained model')
+parser.add_argument('-chk', '--checkpoint', type=str, default='work_dir/MedSAM/medsam_vit_b.pth', help='path to the trained model')
 args = parser.parse_args()
 
-#% load MedSAM model
 device = args.device
-sam_model_tune = sam_model_registry[args.model_type](checkpoint=args.checkpoint).to(device)
-sam_trans = ResizeLongestSide(sam_model_tune.image_encoder.img_size)
+medsam_model = sam_model_registry['vit_b'](checkpoint=args.checkpoint)
+medsam_model = medsam_model.to(device)
+medsam_model.eval()
 
-npz_folders = sorted(os.listdir(args.data_path))
-os.makedirs(args.seg_png_path, exist_ok=True)
-for npz_folder in npz_folders:
-    npz_data_path = join(args.data_path, npz_folder)
-    save_path = join(args.seg_path_root, npz_folder)
-    if not os.path.exists(save_path):
-        os.makedirs(save_path, exist_ok=True)
-        npz_files = sorted(os.listdir(npz_data_path))
-        for npz_file in tqdm(npz_files):
-            try:
-                npz = np.load(join(npz_data_path, npz_file))
-                ori_imgs = npz['imgs']
-                ori_gts = npz['gts']
+img_np = io.imread(args.data_path)
+if len(img_np.shape) == 2:
+    img_3c = np.repeat(img_np[:, :, None], 3, axis=-1)
+else:
+    img_3c = img_np
+H, W, _ = img_3c.shape
+#%% image preprocessing
+img_1024 = transform.resize(img_3c, (1024, 1024), order=3, preserve_range=True, anti_aliasing=True).astype(np.uint8)
+img_1024 = (img_1024 - img_1024.min()) / np.clip(
+    img_1024.max() - img_1024.min(), a_min=1e-8, a_max=None
+)  # normalize to [0, 1], (H, W, 3)
+# convert the shape to (3, H, W)
+img_1024_tensor = torch.tensor(img_1024).float().permute(2, 0, 1).unsqueeze(0).to(device)
 
-                sam_segs = []
-                sam_bboxes = []
-                sam_dice_scores = []
-                for img_id, ori_img in enumerate(ori_imgs):
-                    # get bounding box from mask
-                    gt2D = ori_gts[img_id]
-                    y_indices, x_indices = np.where(gt2D > 0)
-                    x_min, x_max = np.min(x_indices), np.max(x_indices)
-                    y_min, y_max = np.min(y_indices), np.max(y_indices)
-                    # add perturbation to bounding box coordinates
-                    H, W = gt2D.shape
-                    x_min = max(0, x_min - np.random.randint(0, 20))
-                    x_max = min(W, x_max + np.random.randint(0, 20))
-                    y_min = max(0, y_min - np.random.randint(0, 20))
-                    y_max = min(H, y_max + np.random.randint(0, 20))
-                    bbox = np.array([x_min, y_min, x_max, y_max])
-                    seg_mask = finetune_model_predict(ori_img, bbox, sam_trans, sam_model_tune, device=device)
-                    sam_segs.append(seg_mask)
-                    sam_bboxes.append(bbox)
-                    # these 2D dice scores are for debugging purpose. 
-                    # 3D dice scores should be computed for 3D images
-                    sam_dice_scores.append(compute_dice(seg_mask>0, gt2D>0))
-                
-                # save npz, including sam_segs, sam_bboxes, sam_dice_scores
-                np.savez_compressed(join(save_path, npz_file), medsam_segs=sam_segs, gts=ori_gts, sam_bboxes=sam_bboxes)
+box_np = np.array([args.box])
+# transfer box_np t0 1024x1024 scale
+box_1024 = box_np / np.array([W, H, W, H]) * 1024
+with torch.no_grad():
+    image_embedding = medsam_model.image_encoder(img_1024_tensor) # (1, 256, 64, 64)
 
-                # visualize segmentation results
-                img_id = np.random.randint(0, len(ori_imgs))
-                # show ground truth and segmentation results in two subplots
-                fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-                axes[0].imshow(ori_imgs[img_id])
-                show_box(sam_bboxes[img_id], axes[0])
-                show_mask(ori_gts[img_id], axes[0])
-                axes[0].set_title('Ground Truth')
-                axes[0].axis('off')
+medsam_seg = medsam_inference(medsam_model, image_embedding, box_1024, H, W)
+io.imsave(join(args.seg_path, 'seg_' + os.path.basename(args.data_path)), medsam_seg, check_contrast=False)
 
-                axes[1].imshow(ori_imgs[img_id])
-                show_box(sam_bboxes[img_id], axes[1])
-                show_mask(sam_segs[img_id], axes[1])
-                axes[1].set_title('MedSAM: DSC={:.3f}'.format(sam_dice_scores[img_id]))
-                axes[1].axis('off')
-                # save figure
-                fig.savefig(join(args.seg_png_path, npz_file.split('.npz')[0]+'.png'))
-                # close figure
-                plt.close(fig)
-            except Exception:
-                traceback.print_exc()
-                print('error in {}'.format(npz_file))
+#%% visualize results
+fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+ax[0].imshow(img_3c)
+show_box(box_np[0], ax[0])
+ax[0].set_title("Input Image and Bounding Box")
+ax[1].imshow(img_3c)
+show_mask(medsam_seg, ax[1])
+show_box(box_np[0], ax[1])
+ax[1].set_title("MedSAM Segmentation")
+plt.show()

@@ -80,7 +80,7 @@ def medsam_inference(medsam_model, img_embed, box_1024, height, width):
     return medsam_seg
 
 
-print("Loading MedSam model, a sec")
+print("Loading MedSAM model, a sec")
 tic = time.perf_counter()
 
 # %% set up model
