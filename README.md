@@ -28,7 +28,9 @@ You can also segment other images with the following flags
 ```
 
 2. Jupyter-notebook
-We provide a step-by-step tutorial based on [CoLab](https://colab.research.google.com/drive/19WNtRMbpsxeqimBlmJwtd1dzpaIvK2FZ?usp=sharing) 
+
+We provide a step-by-step tutorial based on [CoLab](https://colab.research.google.com/drive/19WNtRMbpsxeqimBlmJwtd1dzpaIvK2FZ?usp=sharing)
+
 You can also run it locally with `MedSAM_Inference.ipynb`.
 
 3. GUI
@@ -38,7 +40,7 @@ python gui.py
 ```
 
 Your can load the image to the GUI and specify segmentation targets by drawing bounding boxes
-[seg_demo](assets/seg_demo.gif) 
+![seg_demo](assets/seg_demo.gif) 
 
 
 > Training tutorial will be available soon
