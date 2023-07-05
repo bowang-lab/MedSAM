@@ -1,5 +1,6 @@
-# MedSAM 
-This is the official repository for MedSAM: Segment Anything in Medical Images.
+# MedSAM (v0)
+
+In this version, we only fine-tuned the mask decoder. Please check the main branch for a more powerful model where the image encoder was fine-tuned as well. 
 
 
 ## Installation 
@@ -9,7 +10,7 @@ This is the official repository for MedSAM: Segment Anything in Medical Images.
 4. Enter the MedSAM folder `cd MedSAM` and run `pip install -e .`
 
 
-## Fine-tune SAM on customized dataset
+## Fine-tune SAM on customized datasets
 
 We provide a step-by-step tutorial with a small dataset to help you quickly start the training process.
 
@@ -74,7 +75,7 @@ The `-k` argument can be used to specify the number of folds for cross-validatio
 
 ## Inference
 
-Download the model checkpoint ([GoogleDrive](https://drive.google.com/drive/folders/1bWv_Zs5oYLpGMAvbotnlNXJPq7ltRUvF?usp=share_link)) and testing data ([GoogleDrive](https://drive.google.com/drive/folders/1Qx-4EM0MoarzAfvSIp9fkpk8UBrWM6EP?usp=share_link)) and put them to `data/Test` and `work_dir/MedSAM` respectively. 
+Download the model checkpoint ([GoogleDrive](https://drive.google.com/drive/folders/1rwtYGXbvFppR7HjM2y88Koiev3tV45aQ?usp=sharing)) and testing data ([GoogleDrive](https://drive.google.com/drive/folders/1Qx-4EM0MoarzAfvSIp9fkpk8UBrWM6EP?usp=share_link)) and put them to `data/Test` and `work_dir/MedSAM` respectively. 
 
 Run
 
@@ -82,20 +83,12 @@ Run
 python MedSAM_Inference.py -i ./data/Test -o ./ -chk work_dir/MedSAM/medsam_20230423_vit_b_0.0.1.pth
 ```
 
-The segmentation results are available at [here](https://drive.google.com/drive/folders/1I8sgCRi30QtMix8DbDBIBTGDM_1FmSaO?usp=sharing).
+The segmentation results are available [here](https://drive.google.com/drive/folders/1I8sgCRi30QtMix8DbDBIBTGDM_1FmSaO?usp=sharing).
 
 
 The implementation code of DSC and NSD can be obtained at http://medicaldecathlon.com/files/Surface_distance_based_measures.ipynb.
 
 
-## To-do-list
-
-- [ ] Train the ViT-H model
-- [ ] Explore other fine-tuning methods, e.g., fine-tune the image encoder as well, lora fine-tuning
-- [ ] Support scribble prompts
-- [ ] Support IoU/DSC regression
-- [ ] Enlarge the dataset
-- [ ] 3D slicer and napari support
 
 We are excited about the potential of segmentation foundation models in the medical image domain. However, training such models requires extensive computing resources. Therefore, we have made all the pre-processed training and images publicly available for research purposes. To prevent duplication of effort (e.g., conduct the same experiemnts), we encourage sharing of results and trained models on the discussion page. We look forward to working with the community to advance this exciting research area.
 
