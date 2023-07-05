@@ -35,6 +35,8 @@ You can also run it locally with `MedSAM_Inference.ipynb`.
 
 3. GUI
 
+Install `PyQt5`: `pip install PyQt5 `
+
 ```bash
 python gui.py
 ```
@@ -50,20 +52,22 @@ Load the image to the GUI and specify segmentation targets by drawing bounding b
 
 Download [SAM checkpoint](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth) and place it at `work_dir/SAM/sam_vit_b_01ec64.pth` .
 
-Download the demo [dataset](https://zenodo.org/record/7860267) and unzip.
+Download the demo [dataset](https://zenodo.org/record/7860267) and unzip it to `data/FLARE22Train/`.
 
-This dataset contains 50 abdomen CT scans and each scan contain an annotation mask with 13 organs. The names of the organ label are available at [MICCAI FLARE2022](https://flare22.grand-challenge.org/).
+This dataset contains 50 abdomen CT scans and each scan contains an annotation mask with 13 organs. The names of the organ label are available at [MICCAI FLARE2022](https://flare22.grand-challenge.org/).
 
 Run pre-processing
 
+Install `cc3d`: `pip install connected-components-3d`
+
 ```bash
-pre_CT_MR.py
+python pre_CT_MR.py
 ```
 
 - split dataset: 80% for training and 20% for testing
 - adjust CT scans to [soft tissue](https://radiopaedia.org/articles/windowing-ct) window level (40) and width (400)
 - max-min normalization
-- resample image size to to `1024x2014`
+- resample image size to `1024x2014`
 - save the pre-processed images and labels as `npy` files
 
 
@@ -75,11 +79,16 @@ The model was trained on five A100 nodes and each node has four GPUs (80G) (20 A
 sbatch train_multi_gpus.sh
 ``` 
 
+When the training process is done, please convert the checkpoint to SAM's format for convenient inference. 
+
+```bash
+python utils/ckpt_convert.py # Please set the corresponding checkpoint path first
+```
+
 ### Training on one GPU
 
 ```bash
 python train_one_gpu.py
-
 ```
 
 If you only want to train the mask decoder, please check the tutorial on the [0.1 branch](https://github.com/bowang-lab/MedSAM/tree/0.1). 
