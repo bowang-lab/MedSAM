@@ -20,7 +20,7 @@ We provide three ways to quickly test the model on your images
 python MedSAM_Inference.py # segment the demo image
 ```
 
-You can also segment other images with the following flags
+Segment other images with the following flags
 ```bash
 -i input_img
 -o output path
@@ -29,7 +29,7 @@ You can also segment other images with the following flags
 
 2. Jupyter-notebook
 
-We provide a step-by-step tutorial based on [CoLab](https://colab.research.google.com/drive/19WNtRMbpsxeqimBlmJwtd1dzpaIvK2FZ?usp=sharing)
+We provide a step-by-step tutorial on [CoLab](https://colab.research.google.com/drive/19WNtRMbpsxeqimBlmJwtd1dzpaIvK2FZ?usp=sharing)
 
 You can also run it locally with `MedSAM_Inference.ipynb`.
 
@@ -39,13 +39,50 @@ You can also run it locally with `MedSAM_Inference.ipynb`.
 python gui.py
 ```
 
-Your can load the image to the GUI and specify segmentation targets by drawing bounding boxes
+Load the image to the GUI and specify segmentation targets by drawing bounding boxes.
+
 ![seg_demo](assets/seg_demo.gif) 
 
 
-> Training tutorial will be available soon
+## Model Training
+
+### Data preprocessing
+
+Download [SAM checkpoint](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth) and place it at `work_dir/SAM/sam_vit_b_01ec64.pth` .
+
+Download the demo [dataset](https://zenodo.org/record/7860267) and unzip.
+
+This dataset contains 50 abdomen CT scans and each scan contain an annotation mask with 13 organs. The names of the organ label are available at [MICCAI FLARE2022](https://flare22.grand-challenge.org/).
+
+Run pre-processing
+
+```bash
+pre_CT_MR.py
+```
+
+- split dataset: 80% for training and 20% for testing
+- adjust CT scans to [soft tissue](https://radiopaedia.org/articles/windowing-ct) window level (40) and width (400)
+- max-min normalization
+- resample image size to to `1024x2014`
+- save the pre-processed images and labels as `npy` files
 
 
+### Training on multiple GPUs (Recommend)
+
+The model was trained on five A100 nodes and each node has four GPUs (80G) (20 A100 GPUs in total). Please use the slurm script to start the training process.
+
+```bash
+sbatch train_multi_gpus.sh
+``` 
+
+### Training on one GPU
+
+```bash
+python train_one_gpu.py
+
+```
+
+If you only want to train the mask decoder, please check the tutorial on the [0.1 branch](https://github.com/bowang-lab/MedSAM/tree/0.1). 
 
 
 ## Acknowledgements
