@@ -336,15 +336,11 @@ def main_worker(gpu, ngpus_per_node, args):
                     if (step + 1) % args.grad_acc_steps == 0:
                         ## Perform gradient sync
                         loss.backward()
-                        # scaler.scale(loss).backward()
                         optimizer.step()
-                        #scaler.step(optimizer)
-                        #scaler.update()
                         optimizer.zero_grad()
                     else:
                         ## Accumulate gradient on current node without backproping
                         with medsam_model.no_sync():
-                            #scaler.scale(loss).backward()
                             loss.backward() ## calculate the gradient only
                 else:
                     loss.backward()

@@ -61,7 +61,6 @@ echo "SLURM_GPUS_ON_NODE"=$SLURM_GPUS_ON_NODE
 echo "SLURM_SUBMIT_DIR"=$SLURM_SUBMIT_DIR
 echo SLURM_NTASKS=$SLURM_NTASKS
 
-## Change grad_acc_steps to 1 if no improvement in training speed -- Feifei
 
 for (( i=0; i < $SLURM_NTASKS; ++i ))
 do
