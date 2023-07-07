@@ -126,7 +126,7 @@ parser.add_argument('-num_workers', type=int, default=8)
 # Optimizer parameters
 parser.add_argument('-weight_decay', type=float, default=0.01,
                     help='weight decay (default: 0.01)')
-parser.add_argument('-lr', type=float, default=0.0008, metavar='LR',
+parser.add_argument('-lr', type=float, default=0.0001, metavar='LR',
                     help='learning rate (absolute lr)')
 parser.add_argument('-use_wandb', type=bool, default=False, 
                     help='use wandb to monitor training')        
