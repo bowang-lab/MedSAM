@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import sys
 import time
+import random
+
 from PyQt5.QtGui import (
     QBrush,
     QPainter,
@@ -34,8 +36,13 @@ from skimage import transform, io
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-from segment_anything import sam_model_registry
+
+import matplotlib.pyplot as plt
+
+from segment_anything import sam_model_registry, SamPredictor
+from segment_anything.utils.transforms import ResizeLongestSide
 
 # freeze seeds
 torch.manual_seed(2023)
@@ -44,9 +51,10 @@ torch.cuda.manual_seed(2023)
 np.random.seed(2023)
 
 SAM_MODEL_TYPE = "vit_b"
-MedSAM_CKPT_PATH = "work_dir/MedSAM/medsam_vit_b.pth"
+MedSAM_CKPT_PATH = "./work_dir/sam_vit_b_medsam.pth"
 MEDSAM_IMG_INPUT_SIZE = 1024
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 
 @torch.no_grad()
 def medsam_inference(medsam_model, img_embed, box_1024, height, width):
@@ -80,7 +88,7 @@ def medsam_inference(medsam_model, img_embed, box_1024, height, width):
     return medsam_seg
 
 
-print("Loading MedSAM model, a sec")
+print("Loading MedSam model, a sec")
 tic = time.perf_counter()
 
 # %% set up model
@@ -88,6 +96,7 @@ medsam_model = sam_model_registry["vit_b"](checkpoint=MedSAM_CKPT_PATH).to(devic
 medsam_model.eval()
 
 print(f"MedSam loaded, took {time.perf_counter() - tic}")
+
 
 def np2pixmap(np_img):
     height, width, channel = np_img.shape
@@ -139,6 +148,7 @@ class Window(QWidget):
         self.start_pos = (None, None)
         self.embedding = None
         self.prev_mask = None
+        self.sam_model = None
 
         self.scene = QGraphicsScene(0, 0, 800, 800)
 
@@ -152,10 +162,15 @@ class Window(QWidget):
 
         load_button = QPushButton("Load Image")
         save_button = QPushButton("Save Mask")
+        compare_button = QPushButton("Compare with SAM")
+        compare_button.setCheckable(True)
+        compare_button.setChecked(False)
 
         hbox = QHBoxLayout(self)
         hbox.addWidget(load_button)
         hbox.addWidget(save_button)
+        hbox.addWidget(compare_button)
+        self.compare_button = compare_button
 
         vbox.addLayout(hbox)
 
@@ -170,11 +185,21 @@ class Window(QWidget):
 
         load_button.clicked.connect(self.load_image)
         save_button.clicked.connect(self.save_mask)
+        compare_button.clicked.connect(self.toggle_sam)
 
         # events
         self.scene.mousePressEvent = self.mouse_press
         self.scene.mouseMoveEvent = self.mouse_move
         self.scene.mouseReleaseEvent = self.mouse_release
+
+    def toggle_sam(self):
+        if self.sam_model is None:
+            print("Loading FAIR origional SAM model, a sec.", end=" ")
+            sam = sam_model_registry["vit_b"](
+                checkpoint="work_dir/SAM/sam_vit_b_01ec64.pth"
+            ).to(device)
+            self.sam_model = SamPredictor(sam)
+            print("Done")
 
     def undo(self):
         if self.prev_mask is None:
@@ -190,7 +215,7 @@ class Window(QWidget):
         self.scene.removeItem(self.bg_img)
         self.bg_img = self.scene.addPixmap(np2pixmap(np.array(img)))
 
-        self.mask_c = self.prev_mask
+        self.medsam_mask_c = self.prev_mask
         self.prev_mask = None
 
     def load_image(self):
@@ -219,7 +244,8 @@ class Window(QWidget):
         self.rect = None
         self.bg_img = self.scene.addPixmap(pixmap)
         self.bg_img.setPos(0, 0)
-        self.mask_c = np.zeros((*self.img_3c.shape[:2], 3), dtype="uint8")
+        self.medsam_mask_c = np.zeros((*self.img_3c.shape[:2], 3), dtype="uint8")
+        self.sam_mask_c = np.zeros((*self.img_3c.shape[:2], 3), dtype="uint8")
 
     def mouse_press(self, ev):
         x, y = ev.scenePos().x(), ev.scenePos().y()
@@ -274,7 +300,6 @@ class Window(QWidget):
 
         H, W, _ = self.img_3c.shape
         box_np = np.array([[xmin, ymin, xmax, ymax]])
-        print('bounding box:', box_np)
         box_1024 = box_np / np.array([W, H, W, H]) * 1024
 
         img_1024 = transform.resize(
@@ -294,22 +319,42 @@ class Window(QWidget):
                     img_1024_tensor
                 )  # (1, 256, 64, 64)
 
-        sam_mask = medsam_inference(medsam_model, self.embedding, box_1024, H, W)
+        medsam_mask = medsam_inference(medsam_model, self.embedding, box_1024, H, W)
 
-        self.prev_mask = self.mask_c.copy()
-        self.mask_c[sam_mask != 0] = colors[self.color_idx % len(colors)]
-        self.color_idx += 1
+        self.prev_mask = self.medsam_mask_c.copy()
+        self.medsam_mask_c[medsam_mask != 0] = colors[self.color_idx % len(colors)]
 
         bg = Image.fromarray(self.img_3c.astype("uint8"), "RGB")
-        mask = Image.fromarray(self.mask_c.astype("uint8"), "RGB")
-        img = Image.blend(bg, mask, 0.2)
+        mask = Image.fromarray(self.medsam_mask_c.astype("uint8"), "RGB")
+        medsam_blend = Image.blend(bg, mask, 0.2)
 
         self.scene.removeItem(self.bg_img)
-        self.bg_img = self.scene.addPixmap(np2pixmap(np.array(img)))
+        self.bg_img = self.scene.addPixmap(np2pixmap(np.array(medsam_blend)))
+
+        if self.compare_button.isChecked():
+            self.sam_model.set_image(self.img_3c)
+            sam_seg, _, _ = self.sam_model.predict(
+                point_coords=None, point_labels=None, box=box_np, multimask_output=False
+            )
+            sam_seg = sam_seg[0]
+            self.sam_mask_c[sam_seg != 0] = colors[self.color_idx % len(colors)]
+            mask = Image.fromarray(self.sam_mask_c.astype("uint8"), "RGB")
+            sam_blend = Image.blend(bg, mask, 0.2)
+
+            plt.subplot(1, 2, 1)
+            plt.title("MedSAM Result")
+            plt.imshow(medsam_blend)
+            plt.subplot(1, 2, 2)
+            plt.title("SAM Result")
+            plt.imshow(sam_blend)
+            plt.show()
+
+        self.color_idx += 1
+
 
     def save_mask(self):
         out_path = f"{self.image_path.split('.')[0]}_mask.png"
-        io.imsave(out_path, self.mask_c)
+        io.imsave(out_path, self.medsam_mask_c)
 
 
 app = QApplication(sys.argv)
