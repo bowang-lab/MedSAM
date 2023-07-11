@@ -341,16 +341,17 @@ class Window(QWidget):
             mask = Image.fromarray(self.sam_mask_c.astype("uint8"), "RGB")
             sam_blend = Image.blend(bg, mask, 0.2)
 
-            plt.subplot(1, 2, 1)
+            plt.suptitle("Comparing MedSAM vs SAM results. Zoom by pressing the magnifying glass button then select a region. Quit by pressing Q")
+            ax_medsam = plt.subplot(1, 2, 1)
             plt.title("MedSAM Result")
             plt.imshow(medsam_blend)
-            plt.subplot(1, 2, 2)
+            plt.subplot(1, 2, 2, sharex=ax_medsam, sharey=ax_medsam)
             plt.title("SAM Result")
             plt.imshow(sam_blend)
+            plt.get_current_fig_manager().full_screen_toggle()
             plt.show()
 
         self.color_idx += 1
-
 
     def save_mask(self):
         out_path = f"{self.image_path.split('.')[0]}_mask.png"
