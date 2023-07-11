@@ -48,6 +48,7 @@ MedSAM_CKPT_PATH = "work_dir/MedSAM/medsam_vit_b.pth"
 MEDSAM_IMG_INPUT_SIZE = 1024
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+
 @torch.no_grad()
 def medsam_inference(medsam_model, img_embed, box_1024, height, width):
     box_torch = torch.as_tensor(box_1024, dtype=torch.float, device=img_embed.device)
@@ -88,6 +89,7 @@ medsam_model = sam_model_registry["vit_b"](checkpoint=MedSAM_CKPT_PATH).to(devic
 medsam_model.eval()
 
 print(f"MedSam loaded, took {time.perf_counter() - tic}")
+
 
 def np2pixmap(np_img):
     height, width, channel = np_img.shape
@@ -274,7 +276,7 @@ class Window(QWidget):
 
         H, W, _ = self.img_3c.shape
         box_np = np.array([[xmin, ymin, xmax, ymax]])
-        print('bounding box:', box_np)
+        print("bounding box:", box_np)
         box_1024 = box_np / np.array([W, H, W, H]) * 1024
 
         img_1024 = transform.resize(

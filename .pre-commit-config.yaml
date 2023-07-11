@@ -1,0 +1,29 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      # - id: no-commit-to-branch
+      #   args: [--pattern, ^v]
+      # - id: check-added-large-files
+      #   args: [--maxkb=64]
+      - id: check-case-conflict
+      - id: check-yaml
+      - id: check-xml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-json
+      - id: pretty-format-json
+        args: [--autofix, --indent=4, --no-ensure-ascii]
+      - id: detect-private-key
+      - id: fix-encoding-pragma
+
+  - repo: https://github.com/psf/black
+    rev: 23.3.0
+    hooks:
+      - id: black
