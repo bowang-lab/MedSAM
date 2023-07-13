@@ -35,7 +35,7 @@ You can also run it locally with `MedSAM_Inference.ipynb`.
 
 3. GUI
 
-Install `PyQt5`: `pip install PyQt5 `
+Install `PyQt5` with [pip](https://pypi.org/project/PyQt5/): `pip install PyQt5 ` or [conda](https://anaconda.org/anaconda/pyqt): `conda install -c anaconda pyqt` 
 
 ```bash
 python gui.py
