@@ -48,7 +48,6 @@ MedSAM_CKPT_PATH = "work_dir/MedSAM/medsam_vit_b.pth"
 MEDSAM_IMG_INPUT_SIZE = 1024
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-
 @torch.no_grad()
 def medsam_inference(medsam_model, img_embed, box_1024, height, width):
     box_torch = torch.as_tensor(box_1024, dtype=torch.float, device=img_embed.device)
@@ -89,7 +88,6 @@ medsam_model = sam_model_registry["vit_b"](checkpoint=MedSAM_CKPT_PATH).to(devic
 medsam_model.eval()
 
 print(f"MedSam loaded, took {time.perf_counter() - tic}")
-
 
 def np2pixmap(np_img):
     height, width, channel = np_img.shape
@@ -213,6 +211,7 @@ class Window(QWidget):
 
         self.img_3c = img_3c
         self.image_path = file_path
+        self.get_embeddings()
 
         pixmap = np2pixmap(self.img_3c)
 
@@ -276,25 +275,8 @@ class Window(QWidget):
 
         H, W, _ = self.img_3c.shape
         box_np = np.array([[xmin, ymin, xmax, ymax]])
-        print("bounding box:", box_np)
+        print('bounding box:', box_np)
         box_1024 = box_np / np.array([W, H, W, H]) * 1024
-
-        img_1024 = transform.resize(
-            self.img_3c, (1024, 1024), order=3, preserve_range=True, anti_aliasing=True
-        ).astype(np.uint8)
-        img_1024 = (img_1024 - img_1024.min()) / np.clip(
-            img_1024.max() - img_1024.min(), a_min=1e-8, a_max=None
-        )  # normalize to [0, 1], (H, W, 3)rr
-        # convert the shape to (3, H, W)
-        img_1024_tensor = (
-            torch.tensor(img_1024).float().permute(2, 0, 1).unsqueeze(0).to(device)
-        )
-
-        if self.embedding is None:
-            with torch.no_grad():
-                self.embedding = medsam_model.image_encoder(
-                    img_1024_tensor
-                )  # (1, 256, 64, 64)
 
         sam_mask = medsam_inference(medsam_model, self.embedding, box_1024, H, W)
 
@@ -313,6 +295,24 @@ class Window(QWidget):
         out_path = f"{self.image_path.split('.')[0]}_mask.png"
         io.imsave(out_path, self.mask_c)
 
+    @torch.no_grad()
+    def get_embeddings(self):
+        img_1024 = transform.resize(
+            self.img_3c, (1024, 1024), order=3, preserve_range=True, anti_aliasing=True
+        ).astype(np.uint8)
+        img_1024 = (img_1024 - img_1024.min()) / np.clip(
+            img_1024.max() - img_1024.min(), a_min=1e-8, a_max=None
+        )  # normalize to [0, 1], (H, W, 3)
+        # convert the shape to (3, H, W)
+        img_1024_tensor = (
+            torch.tensor(img_1024).float().permute(2, 0, 1).unsqueeze(0).to(device)
+        )
+
+        #if self.embedding is None:
+        with torch.no_grad():
+            self.embedding = medsam_model.image_encoder(
+                img_1024_tensor
+            )  # (1, 256, 64, 64)
 
 app = QApplication(sys.argv)
 
