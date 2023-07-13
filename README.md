@@ -46,6 +46,10 @@ Load the image to the GUI and specify segmentation targets by drawing bounding b
 ![seg_demo](assets/seg_demo.gif)
 
 
+https://github.com/bowang-lab/MedSAM/assets/19947331/42db8cae-6ad1-41d3-8db7-013ccf8b28b1
+
+
+
 ## Model Training
 
 ### Data preprocessing
