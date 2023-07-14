@@ -1,1 +1,1 @@
-Note: put the MedSAM model checkpoint in this folder. 
+Note: put the MedSAM model checkpoint in this folder.

@@ -48,6 +48,7 @@ MedSAM_CKPT_PATH = "work_dir/MedSAM/medsam_vit_b.pth"
 MEDSAM_IMG_INPUT_SIZE = 1024
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+
 @torch.no_grad()
 def medsam_inference(medsam_model, img_embed, box_1024, height, width):
     box_torch = torch.as_tensor(box_1024, dtype=torch.float, device=img_embed.device)
@@ -80,14 +81,15 @@ def medsam_inference(medsam_model, img_embed, box_1024, height, width):
     return medsam_seg
 
 
-print("Loading MedSAM model, a sec")
+print("Loading MedSAM model, a sec.")
 tic = time.perf_counter()
 
-# %% set up model
+# set up model
 medsam_model = sam_model_registry["vit_b"](checkpoint=MedSAM_CKPT_PATH).to(device)
 medsam_model.eval()
 
-print(f"MedSam loaded, took {time.perf_counter() - tic}")
+print(f"Done, took {time.perf_counter() - tic}")
+
 
 def np2pixmap(np_img):
     height, width, channel = np_img.shape
@@ -140,15 +142,13 @@ class Window(QWidget):
         self.embedding = None
         self.prev_mask = None
 
-        self.scene = QGraphicsScene(0, 0, 800, 800)
+        self.view = QGraphicsView()
+        self.view.setRenderHint(QPainter.Antialiasing)
 
-        self.load_image()
-
-        view = QGraphicsView(self.scene)
-        view.setRenderHint(QPainter.Antialiasing)
+        pixmap = self.load_image()
 
         vbox = QVBoxLayout(self)
-        vbox.addWidget(view)
+        vbox.addWidget(self.view)
 
         load_button = QPushButton("Load Image")
         save_button = QPushButton("Save Mask")
@@ -170,11 +170,6 @@ class Window(QWidget):
 
         load_button.clicked.connect(self.load_image)
         save_button.clicked.connect(self.save_mask)
-
-        # events
-        self.scene.mousePressEvent = self.mouse_press
-        self.scene.mouseMoveEvent = self.mouse_move
-        self.scene.mouseReleaseEvent = self.mouse_release
 
     def undo(self):
         if self.prev_mask is None:
@@ -207,20 +202,26 @@ class Window(QWidget):
             img_3c = np.repeat(img_np[:, :, None], 3, axis=-1)
         else:
             img_3c = img_np
-        H, W, _ = img_3c.shape
 
         self.img_3c = img_3c
         self.image_path = file_path
         self.get_embeddings()
-
         pixmap = np2pixmap(self.img_3c)
 
-        self.scene.clear()
+        H, W, _ = self.img_3c.shape
+
+        self.scene = QGraphicsScene(0, 0, W, H)
         self.end_point = None
         self.rect = None
         self.bg_img = self.scene.addPixmap(pixmap)
         self.bg_img.setPos(0, 0)
         self.mask_c = np.zeros((*self.img_3c.shape[:2], 3), dtype="uint8")
+        self.view.setScene(self.scene)
+
+        # events
+        self.scene.mousePressEvent = self.mouse_press
+        self.scene.mouseMoveEvent = self.mouse_move
+        self.scene.mouseReleaseEvent = self.mouse_release
 
     def mouse_press(self, ev):
         x, y = ev.scenePos().x(), ev.scenePos().y()
@@ -275,7 +276,7 @@ class Window(QWidget):
 
         H, W, _ = self.img_3c.shape
         box_np = np.array([[xmin, ymin, xmax, ymax]])
-        print('bounding box:', box_np)
+        # print("bounding box:", box_np)
         box_1024 = box_np / np.array([W, H, W, H]) * 1024
 
         sam_mask = medsam_inference(medsam_model, self.embedding, box_1024, H, W)
@@ -297,6 +298,7 @@ class Window(QWidget):
 
     @torch.no_grad()
     def get_embeddings(self):
+        print("Calculating embedding, gui may be unresponsive.")
         img_1024 = transform.resize(
             self.img_3c, (1024, 1024), order=3, preserve_range=True, anti_aliasing=True
         ).astype(np.uint8)
@@ -308,11 +310,13 @@ class Window(QWidget):
             torch.tensor(img_1024).float().permute(2, 0, 1).unsqueeze(0).to(device)
         )
 
-        #if self.embedding is None:
+        # if self.embedding is None:
         with torch.no_grad():
             self.embedding = medsam_model.image_encoder(
                 img_1024_tensor
             )  # (1, 256, 64, 64)
+        print("Done.")
+
 
 app = QApplication(sys.argv)
 
