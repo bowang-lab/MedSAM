@@ -81,14 +81,14 @@ def medsam_inference(medsam_model, img_embed, box_1024, height, width):
     return medsam_seg
 
 
-print("Loading MedSAM model, a sec")
+print("Loading MedSAM model, a sec.")
 tic = time.perf_counter()
 
-# %% set up model
+# set up model
 medsam_model = sam_model_registry["vit_b"](checkpoint=MedSAM_CKPT_PATH).to(device)
 medsam_model.eval()
 
-print(f"MedSam loaded, took {time.perf_counter() - tic}")
+print(f"Done, took {time.perf_counter() - tic}")
 
 
 def np2pixmap(np_img):
@@ -146,7 +146,6 @@ class Window(QWidget):
         self.view.setRenderHint(QPainter.Antialiasing)
 
         pixmap = self.load_image()
-        self.init_ui(pixmap)
 
         vbox = QVBoxLayout(self)
         vbox.addWidget(self.view)
@@ -171,11 +170,6 @@ class Window(QWidget):
 
         load_button.clicked.connect(self.load_image)
         save_button.clicked.connect(self.save_mask)
-
-        # events
-        self.scene.mousePressEvent = self.mouse_press
-        self.scene.mouseMoveEvent = self.mouse_move
-        self.scene.mouseReleaseEvent = self.mouse_release
 
     def undo(self):
         if self.prev_mask is None:
@@ -212,11 +206,10 @@ class Window(QWidget):
         self.img_3c = img_3c
         self.image_path = file_path
         self.get_embeddings()
+        pixmap = np2pixmap(self.img_3c)
 
-        return np2pixmap(self.img_3c)
-
-    def init_ui(self, pixmap):
         H, W, _ = self.img_3c.shape
+
         self.scene = QGraphicsScene(0, 0, W, H)
         self.end_point = None
         self.rect = None
@@ -224,6 +217,11 @@ class Window(QWidget):
         self.bg_img.setPos(0, 0)
         self.mask_c = np.zeros((*self.img_3c.shape[:2], 3), dtype="uint8")
         self.view.setScene(self.scene)
+
+        # events
+        self.scene.mousePressEvent = self.mouse_press
+        self.scene.mouseMoveEvent = self.mouse_move
+        self.scene.mouseReleaseEvent = self.mouse_release
 
     def mouse_press(self, ev):
         x, y = ev.scenePos().x(), ev.scenePos().y()
@@ -278,7 +276,7 @@ class Window(QWidget):
 
         H, W, _ = self.img_3c.shape
         box_np = np.array([[xmin, ymin, xmax, ymax]])
-        print("bounding box:", box_np)
+        # print("bounding box:", box_np)
         box_1024 = box_np / np.array([W, H, W, H]) * 1024
 
         sam_mask = medsam_inference(medsam_model, self.embedding, box_1024, H, W)
@@ -300,6 +298,7 @@ class Window(QWidget):
 
     @torch.no_grad()
     def get_embeddings(self):
+        print("Calculating embedding, gui may be unresponsive.")
         img_1024 = transform.resize(
             self.img_3c, (1024, 1024), order=3, preserve_range=True, anti_aliasing=True
         ).astype(np.uint8)
@@ -316,6 +315,7 @@ class Window(QWidget):
             self.embedding = medsam_model.image_encoder(
                 img_1024_tensor
             )  # (1, 256, 64, 64)
+        print("Done.")
 
 
 app = QApplication(sys.argv)
