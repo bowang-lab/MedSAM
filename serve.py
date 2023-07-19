@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import sys
 import time
+import json
 
 from tqdm import tqdm
 from fastapi import FastAPI, BackgroundTasks
@@ -81,7 +82,7 @@ app = FastAPI()
 # receive number of slices, for each slice, receive the slice then calc embedding
 
 
-def get_image():
+def get_image(wmin: int, wmax: int):
     global image
     global H
     global W
@@ -92,7 +93,15 @@ def get_image():
 
         with conn:
             arr = conn.recv()
-        print(arr.shape)
+
+        # windowlization
+        arr = np.clip(arr, wmin, wmax)
+        arr = (arr - wmin) / (wmax - wmin) * 255
+
+        # arr = np.rot90(arr, k=3, axes=(1, 2))
+        arr = np.transpose(arr, (0, 2, 1))
+
+        # print(arr.shape)
         # TODO: add restrictions on image dimension
         # assert (
         #     len(arr.shape) == 2 or arr.shape[-1] == 3
@@ -103,8 +112,10 @@ def get_image():
     # for slice_idx in tqdm(range(image.shape[0])):
     for slice_idx in tqdm(range(1)):
         slc = image[slice_idx]
+
         # plt.imshow(slc)
-        # plt.show()
+        # plt.savefig("out.png")
+
         print(slc.min(), slc.max())
         if len(slc.shape) == 2:
             img_3c = np.repeat(slc[:, :, None], 3, axis=-1)
@@ -129,16 +140,22 @@ def get_image():
             embedding = medsam_model.image_encoder(img_1024_tensor)  # (1, 256, 64, 64)
 
         embeddings.append(embedding)
-    print(len(embeddings))
+    # print(len(embeddings))
+
+
+class ImageParams(BaseModel):
+    wmin: int
+    wmax: int
 
 
 @app.post("/setImage")
-def set_image(background_tasks: BackgroundTasks):
+def set_image(params: ImageParams, background_tasks: BackgroundTasks):
     global image
     global embeddings
     image = None
     embeddings = []
-    background_tasks.add_task(get_image)
+    print(params.wmin, params.wmax)
+    background_tasks.add_task(get_image, wmin=params.wmin, wmax=params.wmax)
     return
 
 
@@ -150,9 +167,18 @@ class InferenceParams(BaseModel):
 @app.post("/infer")
 def infer(params: InferenceParams):
     print(params.slice_idx, params.bbox)
-    box_1024 = np.array(params.bbox) / np.array([W, H, W, H]) * 1024
+    box_1024 = np.array([params.bbox]) / np.array([W, H, W, H]) * 1024
     print(box_1024)
-    return
+    res = medsam_inference(medsam_model, embeddings[params.slice_idx], box_1024, H, W)
+    print(res.shape)
+    plt.imshow(res)
+    plt.savefig("out.png")
+
+    # with NumpySocket() as s:
+    #     s.connect(("localhost", 5557))
+    #     s.sendall(res)
+
+    return json.dumps(res.tolist())
 
 
 if __name__ == "__main__":
