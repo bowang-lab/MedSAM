@@ -284,7 +284,7 @@ def main_worker(gpu, ngpus_per_node, args):
     medsam_model = MedSAM(
         image_encoder=sam_model.image_encoder,
         mask_decoder=sam_model.mask_decoder,
-        prompt_encoder=sam_model.prompt_encoder
+        prompt_encoder=sam_model.prompt_encoder,
     ).cuda()
     cuda_mem_info = torch.cuda.mem_get_info(gpu)
     free_cuda_mem, total_cuda_mem = cuda_mem_info[0] / (1024**3), cuda_mem_info[1] / (
@@ -414,9 +414,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 optimizer.zero_grad()
             else:
                 medsam_pred = medsam_model(image, boxes_np)
-                loss = seg_loss(medsam_pred, gt2D) + ce_loss(
-                    medsam_pred, gt2D.float()
-                )
+                loss = seg_loss(medsam_pred, gt2D) + ce_loss(medsam_pred, gt2D.float())
                 # Gradient accumulation
                 if args.grad_acc_steps > 1:
                     loss = (
