@@ -146,7 +146,6 @@ def _build_sam(
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
             if device is not None:
-                # state_dict = torch.load(f, device=device)
                 state_dict = torch.load(f, map_location=device)
             else:
                 state_dict = torch.load(f)
