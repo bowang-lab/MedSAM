@@ -31,7 +31,7 @@ Segment other images with the following flags
 
 We provide a step-by-step tutorial on [CoLab](https://colab.research.google.com/drive/19WNtRMbpsxeqimBlmJwtd1dzpaIvK2FZ?usp=sharing)
 
-You can also run it locally with `MedSAM_Inference.ipynb`.
+You can also run it locally with `tutorial_quickstart.ipynb`.
 
 3. GUI
 
@@ -109,7 +109,7 @@ If you only want to train the mask decoder, please check the tutorial on the [0.
 ```
 @article{MedSAM,
   title={Segment Anything in Medical Images},
-  author={Ma, Jun and He, Yuting and Li, Feifei and Han, Lin and You, Chenyu and and Wang, Bo},
+  author={Ma, Jun and He, Yuting and Li, Feifei and Han, Lin and You, Chenyu and Wang, Bo},
   journal={arXiv preprint arXiv:2304.12306},
   year={2023}
 }

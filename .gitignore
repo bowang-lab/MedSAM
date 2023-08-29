@@ -7,7 +7,6 @@
 *.npy
 *.npz
 *.csv
-*.pdf
 *.log
 *.png
 data/

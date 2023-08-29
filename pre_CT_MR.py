@@ -117,6 +117,7 @@ for name in tqdm(names[:40]):  # use the remaining 10 cases for validation
 
         image_data_pre = np.uint8(image_data_pre)
         img_roi = image_data_pre[z_index, :, :]
+        np.savez_compressed(join(npy_path, prefix + gt_name.split(gt_name_suffix)[0]+'.npz'), imgs=img_roi, gts=gt_roi, spacing=img_sitk.GetSpacing())
         # save the image and ground truth as nii files for sanity check;
         # they can be removed
         img_roi_sitk = sitk.GetImageFromArray(img_roi)
