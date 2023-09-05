@@ -1,8 +1,12 @@
-# Training MedSAM with point prompts [(colab)](https://colab.research.google.com/drive/1wexPLewVMI-9EMiplfyoEtGGayYDH3tt?usp=sharing)
+# MedSAM with point prompts 
 
-This training script shows how to train MedSAM with point prompts on the [MICCAI FLARE 2022](https://flare22.grand-challenge.org/) dataset, and assume that the dataset has been preprocessed into the format used by MedSAM as described [here](https://github.com/bowang-lab/MedSAM#data-preprocessing).
+## Inference
+
+Please try this out-of-the-box demo: [(colab)](https://colab.research.google.com/drive/1cCBw_IhdPiWE4sN7QwqKJPgAFlWsKgkm?usp=sharing)
 
 ## Training
+
+This training script shows how to train MedSAM with point prompts on the [MICCAI FLARE 2022](https://flare22.grand-challenge.org/) dataset, and assume that the dataset has been preprocessed into the format used by MedSAM as described [here](https://github.com/bowang-lab/MedSAM#data-preprocessing).
 
 The training script `train_point_prompt.py` takes the following arguments:
 * `-i`, `--tr_npy_path`: Path to the preprocessed npy data in MedSAM's format
