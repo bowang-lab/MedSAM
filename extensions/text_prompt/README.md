@@ -1,6 +1,5 @@
-# Training MedSAM with text prompts [(colab)](https://colab.research.google.com/drive/1cCBw_IhdPiWE4sN7QwqKJPgAFlWsKgkm?usp=sharing)
+# MedSAM with text prompts 
 
-This training script demonstrates how to train MedSAM with text prompts on the [MICCAI FLARE 2022](https://flare22.grand-challenge.org/) dataset, and assume that the dataset has been preprocessed into the format used by MedSAM as described [here](https://github.com/bowang-lab/MedSAM#data-preprocessing).
 
 ## Requirements
 The text prompt training uses the CLIP model from [Huggingface transformers](https://huggingface.co/docs/transformers/index). To install Huggingface transformers:
@@ -8,7 +7,13 @@ The text prompt training uses the CLIP model from [Huggingface transformers](htt
 pip install transformers
 ```
 
+## Inference
+
+Please try this out-of-the-box demo: [colab](https://colab.research.google.com/drive/1wexPLewVMI-9EMiplfyoEtGGayYDH3tt?usp=sharing)
+
 ## Training
+
+This training script demonstrates how to train MedSAM with text prompts on the [MICCAI FLARE 2022](https://flare22.grand-challenge.org/) dataset, and assume that the dataset has been preprocessed into the format used by MedSAM as described [here](https://github.com/bowang-lab/MedSAM#data-preprocessing).
 
 The training script `train_text_prompt.py` takes the following arguments:
 * `-i`, `--tr_npy_path`: Path to the preprocessed npy data in MedSAM's format
