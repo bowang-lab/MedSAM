@@ -18,7 +18,7 @@ from .common import LayerNorm2d, MLPBlock
 class ImageEncoderViT(nn.Module):
     def __init__(
         self,
-        img_size: int = 384,
+        img_size: int = 1024,
         patch_size: int = 16,
         in_chans: int = 3,
         embed_dim: int = 768,
@@ -54,7 +54,7 @@ class ImageEncoderViT(nn.Module):
             global_attn_indexes (list): Indexes for blocks using global attention.
         """
         super().__init__()
-        self.img_size = 384
+        self.img_size = img_size
 
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
