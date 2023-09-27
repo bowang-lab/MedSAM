@@ -79,9 +79,9 @@ Please set the proper data path in the script. The expected folder structures (e
 ----------------xxxx.nii.gz
 ```
 
-## Data Preprocessing
+## Data Preprocessing and Ensembling
 
-All the images will be preprocessed as `npy` files. There are two main reasons for choosing this format. First, it allows fast data loading (main reason). We learned this point from [nnU-Net](https://github.com/MIC-DKFZ/nnUNet). Second, numpy file is a universal data interface to unify all the different data formats. For the conveniced of debug and inference, we also saved the original images and labels as `npz` files. Spacing information is also saved for CT and MR images. 
+All the images will be preprocessed as `npy` files. There are two main reasons for choosing this format. First, it allows fast data loading (main reason). We learned this point from [nnU-Net](https://github.com/MIC-DKFZ/nnUNet). Second, numpy file is a universal data interface to unify all the different data formats. For the convenience of debugging and inference, we also saved the original images and labels as `npz` files. Spacing information is also saved for CT and MR images. 
 
 The following steps are applied to all images
 - max-min normalization
@@ -109,5 +109,15 @@ python pre_grey_rgb.py
 
 Note: Please set the corresponding folder path and molidaty information. We provided an example in the script. 
 
+Data ensembling of different training datasets is very simple. Since all the training data are converted into `npy` files during preprocessing, you just need to merge them into one folder. 
+
+
 ## Checkpoint Converting
-If the model is trained with multi-gpu, please use the script `ckpt_convert.py` to convert the format since users only use one GPU for model inference in real practice. 
+If the model is trained with multiple GPUs, please use the script `ckpt_convert.py` to convert the format since users only use one GPU for model inference in real practice. 
+
+Set the path to `sam_ckpt_path`, `medsam_ckpt_path`, and `save_path` and run 
+
+```bash
+python ckpt_convert.py
+```
+
