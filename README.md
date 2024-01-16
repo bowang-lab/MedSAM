@@ -153,7 +153,7 @@ python inference_3D.py \
     -num_workers 4 \
     --save_overlay \ ## save segmentation overlay on the input image
     -png_save_dir ./preds/CT_Abd_overlay \ ## only used when --save_overlay is set
-    --overwrite \ ## overwrite existing predictions, default continue from existing predictions
+    --overwrite ## overwrite existing predictions, default continue from existing predictions
 ```
 
 For additional command line arguments, see `python inference_3D.py -h`.
@@ -177,7 +177,7 @@ python extract_weights.py \
     -from_pth <YOUR_CHECKPOINT_PATH> \
     -to_pth <NEW_CHECKPOINT_PATH>
 ```
-Replace <YOUR_CHECKPOINT_PATH> with the path to your saved trained model checkpoint, and <NEW_CHECKPOINT_PATH> with the desired path for the new checkpoint file. Once you have executed this command and created the new checkpoint, it should be ready for use in inference tasks.
+Replace `<YOUR_CHECKPOINT_PATH>` with the path to your saved trained model checkpoint, and `<NEW_CHECKPOINT_PATH>` with the desired path for the new checkpoint file. Once you have executed this command and created the new checkpoint, it should be ready for use in inference tasks.
 
 ## Acknowledgements
 We thank the authors of [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) and [TinyViT](https://github.com/microsoft/Cream/tree/main/TinyViT) for making their source code publicly available.
