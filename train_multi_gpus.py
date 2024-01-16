@@ -37,10 +37,10 @@ os.environ["NUMEXPR_NUM_THREADS"] = "6" # export NUMEXPR_NUM_THREADS=6
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--tr_npy_path', type=str,
-                        default='data/MedSAM_train/CT_Abd',
+                        default='data/npy',
                         help='Path to training npy files; two subfolders: gts and imgs')
     parser.add_argument('-task_name', type=str, default='MedSAM-Lite')
-    parser.add_argument('-pretrained_checkpoint', type=str, default='medsam_lite.pth',
+    parser.add_argument('-pretrained_checkpoint', type=str, default='lite_medsam.pth',
                         help='Path to pretrained MedSAM-Lite checkpoint')
     parser.add_argument('-work_dir', type=str, default='./work_dir')
     parser.add_argument('--data_aug', action='store_true', default=False,
@@ -394,7 +394,9 @@ def main_worker(gpu, ngpus_per_node, args):
         prompt_encoder = medsam_lite_prompt_encoder
     )
     
-    if not os.path.exists(args.resume):
+    if (not os.path.exists(args.resume)) and isfile(args.pretrained_checkpoint):
+        ## Load pretrained checkpoint if there's no checkpoint to resume from and there's a pretrained checkpoint
+        print(f"Loading pretrained checkpoint from {args.pretrained_checkpoint}")
         medsam_lite_checkpoint = torch.load(args.pretrained_checkpoint, map_location="cpu")
         medsam_lite_model.load_state_dict(medsam_lite_checkpoint, strict=True)
 

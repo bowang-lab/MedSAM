@@ -12,7 +12,6 @@ import torch.nn.functional as F
 
 from tiny_vit_sam import TinyViT
 from segment_anything.modeling import MaskDecoder, PromptEncoder, TwoWayTransformer
-from datetime import datetime
 from matplotlib import pyplot as plt
 import cv2
 import torch.multiprocessing as mp
@@ -31,21 +30,21 @@ parser.add_argument(
     type=str,
     default=None,
     help='root directory of the data',
-    #required=True
+    required=True
 )
 parser.add_argument(
     '-pred_save_dir',
     type=str,
     default=None,
     help='directory to save the prediction',
-    #required=True
+    required=True
 )
 parser.add_argument(
     '-medsam_lite_checkpoint_path',
     type=str,
-    default="medsam_lite.pth",
+    default="lite_medsam.pth",
     help='path to the checkpoint of MedSAM-Lite',
-    #required=True
+    required=True
 )
 parser.add_argument(
     '-device',
@@ -70,6 +69,11 @@ parser.add_argument(
     default='./overlay',
     help='directory to save the overlay image'
 )
+parser.add_argument(
+    '--overwrite',
+    action='store_true',
+    help='whether to overwrite the existing prediction'
+)
 
 args = parser.parse_args()
 
@@ -77,6 +81,7 @@ data_root = args.data_root
 pred_save_dir = args.pred_save_dir
 save_overlay = args.save_overlay
 num_workers = args.num_workers
+overwrite = args.overwrite
 medsam_lite_checkpoint_path = args.medsam_lite_checkpoint_path
 if save_overlay:
     assert args.png_save_dir is not None, "Please specify the directory to save the overlay image"
@@ -156,6 +161,20 @@ class MedSAM_Lite(nn.Module):
     def postprocess_masks(self, masks, new_size, original_size):
         """
         Do cropping and resizing
+
+        Parameters
+        ----------
+        masks : torch.Tensor
+            masks predicted by the model
+        new_size : tuple
+            the shape of the image after resizing to the longest side of 256
+        original_size : tuple
+            the original shape of the image
+
+        Returns
+        -------
+        torch.Tensor
+            the upsampled mask to the original size
         """
         # Crop
         masks = masks[..., :new_size[0], :new_size[1]]
@@ -187,12 +206,29 @@ def show_box(box, ax, edgecolor='blue'):
 
 
 def revert_box(box, new_size, original_size):
-    box = deepcopy(box).astype(float)
+    """
+    Revert box coordinates from scale at 256 to original scale
+
+    Parameters
+    ----------
+    box : np.ndarray
+        box coordinates at 256 scale
+    new_size : tuple
+        Image shape with the longest edge resized to 256
+    original_size : tuple
+        Original image shape
+
+    Returns
+    -------
+    np.ndarray
+        box coordinates at original scale
+    """
+    new_box = np.zeros_like(box)
     ratio = max(original_size) / max(new_size)
     for i in range(len(box)):
-        box[i] = box[i] * ratio
+        new_box[i] = int(box[i] * ratio)
     
-    return box
+    return new_box
 
 
 @torch.no_grad()
@@ -215,8 +251,8 @@ def medsam_inference(medsam_model, img_embed, box_256, new_size, original_size):
     )
 
     low_res_pred = medsam_model.postprocess_masks(low_res_logits, new_size, original_size)
-    low_res_pred = torch.sigmoid(low_res_pred)  # (1, 1, 256, 256)
-    low_res_pred = low_res_pred.squeeze().cpu().numpy()  # (256, 256)
+    low_res_pred = torch.sigmoid(low_res_pred)
+    low_res_pred = low_res_pred.squeeze().cpu().numpy()
     medsam_seg = (low_res_pred > 0.5).astype(np.uint8)
 
     return medsam_seg
@@ -252,7 +288,7 @@ medsam_lite_image_encoder = TinyViT(
     mlp_ratio=4.,
     drop_rate=0.,
     drop_path_rate=0.0,
-    use_checkpoint=False, ## TODO: try MobileSAM's checkpoint next time
+    use_checkpoint=False,
     mbconv_expand_ratio=4.0,
     local_conv_size=3,
     layer_lr_decay=0.8
@@ -284,8 +320,8 @@ medsam_lite_model = MedSAM_Lite(
     mask_decoder = medsam_lite_mask_decoder,
     prompt_encoder = medsam_lite_prompt_encoder
 )
-medsam_lite_checkpoint = torch.load(medsam_lite_checkpoint_path)
-medsam_lite_model.load_state_dict(medsam_lite_checkpoint['model'])
+medsam_lite_checkpoint = torch.load(medsam_lite_checkpoint_path, map_location='cpu')
+medsam_lite_model.load_state_dict(medsam_lite_checkpoint)
 medsam_lite_model.to(device)
 medsam_lite_model.eval()
 
@@ -294,7 +330,7 @@ def MedSAM_infer_npz(gt_path_file):
     npz_name = basename(gt_path_file)
     task_folder = gt_path_file.split('/')[-2]
     makedirs(join(pred_save_dir, task_folder), exist_ok=True)
-    if not isfile(join(pred_save_dir, task_folder, npz_name)):
+    if (not isfile(join(pred_save_dir, task_folder, npz_name))) or overwrite:
         npz_data = np.load(gt_path_file, 'r', allow_pickle=True) # (H, W, 3)
         img_3c = npz_data['imgs'] # (H, W, 3)
         H, W = img_3c.shape[:2]

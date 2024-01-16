@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Training setup
-GPUS_PER_NODE=1
+
+GPUS_PER_NODE=2 # <- Specify the number of GPUs per machine here
 
 ## Master node setup
 MAIN_HOST=`hostname -s`
@@ -29,14 +29,14 @@ export OMP_NUM_THREADS=1
 
 export NCCL_DEBUG=INFO
 
-dataroot="./data/MedSAM_train/CT_Abd"
-pretrained_checkpoint="medsam_lite.pth"
+dataroot="./data/npy"
+pretrained_checkpoint="lite_medsam.pth"
 
 python train_multi_gpus.py \
     -i ${dataroot} \
     -task_name MedSAM-Lite-Box \
     -pretrained_checkpoint ${pretrained_checkpoint} \
-    -work_dir ./work_dir_medsam_lite \
+    -work_dir ./work_dir_lite_medsam \
     -batch_size 16 \
     -num_workers 8 \
     -lr 0.0005 \

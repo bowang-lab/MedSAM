@@ -25,11 +25,11 @@ import argparse
 # %%
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "-data_root", type=str, default="./data/MedSAM_train/CT_Abd",
+    "-data_root", type=str, default="./data/npy",
     help="Path to the npy data root."
 )
 parser.add_argument(
-    "-pretrained_checkpoint", type=str, default="medsam_lite.pth",
+    "-pretrained_checkpoint", type=str, default="lite_medsam.pth",
     help="Path to the pretrained Lite-MedSAM checkpoint."
 )
 parser.add_argument(
@@ -45,7 +45,7 @@ parser.add_argument(
     help="Number of epochs to train."
 )
 parser.add_argument(
-    "-batch_size", type=int, default=16,
+    "-batch_size", type=int, default=4,
     help="Batch size."
 )
 parser.add_argument(
@@ -147,7 +147,6 @@ class NpyDataset(Dataset):
             file for file in self.gt_path_files
             if isfile(join(self.img_path, basename(file)))
         ]
-        ## print(f'self.gt_path_files: {self.gt_path_files}')
         self.image_size = image_size
         self.target_length = image_size
         self.bbox_shift = bbox_shift
@@ -244,7 +243,6 @@ if do_sancheck:
     tr_dataset = NpyDataset(data_root, data_aug=True)
     tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
     for step, batch in enumerate(tr_dataloader):
-        # print(image.shape, gt.shape, bboxes.shape)
         # show the example
         _, axs = plt.subplots(1, 2, figsize=(10, 10))
         idx = random.randint(0, 4)
@@ -267,7 +265,6 @@ if do_sancheck:
         axs[1].axis('off')
         # set title
         axs[1].set_title(names_temp[idx])
-        # plt.show()  
         plt.subplots_adjust(wspace=0.01, hspace=0)
         plt.savefig(
             join(work_dir, 'medsam_lite-train_bbox_prompt_sanitycheck_DA.png'),
@@ -373,11 +370,15 @@ medsam_lite_model = MedSAM_Lite(
 )
 
 if medsam_lite_checkpoint is not None:
-    medsam_lite_ckpt = torch.load(
-        medsam_lite_checkpoint,
-        map_location="cpu"
-    )
-    medsam_lite_model.load_state_dict(medsam_lite_ckpt, strict=True)
+    if isfile(medsam_lite_checkpoint):
+        print(f"Finetuning with pretrained weights {medsam_lite_checkpoint}")
+        medsam_lite_ckpt = torch.load(
+            medsam_lite_checkpoint,
+            map_location="cpu"
+        )
+        medsam_lite_model.load_state_dict(medsam_lite_ckpt, strict=True)
+    else:
+        print(f"Pretained weights {medsam_lite_checkpoint} not found, training from scratch")
 
 medsam_lite_model = medsam_lite_model.to(device)
 medsam_lite_model.train()
@@ -406,9 +407,10 @@ iou_loss = nn.MSELoss(reduction='mean')
 train_dataset = NpyDataset(data_root=data_root, data_aug=True)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
 
-if checkpoint:
+if checkpoint and isfile(checkpoint):
+    print(f"Resuming from checkpoint {checkpoint}")
     checkpoint = torch.load(checkpoint)
-    medsam_lite_model.load_state_dict(checkpoint["model"])
+    medsam_lite_model.load_state_dict(checkpoint["model"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
     start_epoch = checkpoint["epoch"]
     best_loss = checkpoint["loss"]

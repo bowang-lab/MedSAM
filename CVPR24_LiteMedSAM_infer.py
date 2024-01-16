@@ -89,7 +89,7 @@ image_size = 256
 
 def resize_longest_side(image, target_length=256):
     """
-    resize image to target_length while keeping the aspect ratio
+    Resize image to target_length while keeping the aspect ratio
     Expects a numpy array with shape HxWxC in uint8 format.
     """
     oldh, oldw = image.shape[0], image.shape[1]
@@ -155,6 +155,20 @@ class MedSAM_Lite(nn.Module):
     def postprocess_masks(self, masks, new_size, original_size):
         """
         Do cropping and resizing
+
+        Parameters
+        ----------
+        masks : torch.Tensor
+            masks predicted by the model
+        new_size : tuple
+            the shape of the image after resizing to the longest side of 256
+        original_size : tuple
+            the original shape of the image
+
+        Returns
+        -------
+        torch.Tensor
+            the upsampled mask to the original size
         """
         # Crop
         masks = masks[..., :new_size[0], :new_size[1]]
@@ -172,6 +186,17 @@ class MedSAM_Lite(nn.Module):
 def show_mask(mask, ax, mask_color=None, alpha=0.5):
     """
     show mask on the image
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        mask of the image
+    ax : matplotlib.axes.Axes
+        axes to plot the mask
+    mask_color : numpy.ndarray
+        color of the mask
+    alpha : float
+        transparency of the mask
     """
     if mask_color is not None:
         color = np.concatenate([mask_color, np.array([alpha])], axis=0)
@@ -185,6 +210,15 @@ def show_mask(mask, ax, mask_color=None, alpha=0.5):
 def show_box(box, ax, edgecolor='blue'):
     """
     show bounding box on the image
+
+    Parameters
+    ----------
+    box : numpy.ndarray
+        bounding box coordinates in the original image
+    ax : matplotlib.axes.Axes
+        axes to plot the bounding box
+    edgecolor : str
+        color of the bounding box
     """
     x0, y0 = box[0], box[1]
     w, h = box[2] - box[0], box[3] - box[1]
@@ -193,7 +227,20 @@ def show_box(box, ax, edgecolor='blue'):
 
 def get_bbox256(mask_256, bbox_shift=3):
     """
-    get the bounding box coordinates from the mask (256x256)
+    Get the bounding box coordinates from the mask (256x256)
+
+    Parameters
+    ----------
+    mask_256 : numpy.ndarray
+        the mask of the resized image
+
+    bbox_shift : int
+        Add perturbation to the bounding box coordinates
+    
+    Returns
+    -------
+    numpy.ndarray
+        bounding box coordinates in the resized image
     """
     y_indices, x_indices = np.where(mask_256 > 0)
     x_min, x_max = np.min(x_indices), np.max(x_indices)
@@ -213,7 +260,19 @@ def get_bbox256(mask_256, bbox_shift=3):
 def resize_box_to_256(box, original_size):
     """
     the input bounding box is obtained from the original image
-    here, we resize it to the size of the resized image
+    here, we rescale it to the coordinates of the resized image
+
+    Parameters
+    ----------
+    box : numpy.ndarray
+        bounding box coordinates in the original image
+    original_size : tuple
+        the original size of the image
+
+    Returns
+    -------
+    numpy.ndarray
+        bounding box coordinates in the resized image
     """
     new_box = np.zeros_like(box)
     ratio = 256 / max(original_size)
@@ -274,7 +333,7 @@ medsam_lite_image_encoder = TinyViT(
     mlp_ratio=4.,
     drop_rate=0.,
     drop_path_rate=0.0,
-    use_checkpoint=False, ## TODO: try MobileSAM's checkpoint next time
+    use_checkpoint=False,
     mbconv_expand_ratio=4.0,
     local_conv_size=3,
     layer_lr_decay=0.8
@@ -306,7 +365,7 @@ medsam_lite_model = MedSAM_Lite(
     prompt_encoder = medsam_lite_prompt_encoder
 )
 
-lite_medsam_checkpoint = torch.load(lite_medsam_checkpoint_path)
+lite_medsam_checkpoint = torch.load(lite_medsam_checkpoint_path, map_location='cpu')
 medsam_lite_model.load_state_dict(lite_medsam_checkpoint)
 medsam_lite_model.to(device)
 medsam_lite_model.eval()

@@ -12,7 +12,7 @@ from tqdm import tqdm
 import cc3d
 
 import multiprocessing as mp
-import re
+from functools import partial
 
 import argparse
 
@@ -30,14 +30,16 @@ parser.add_argument("-img_path", type=str, default="data/FLARE22Train/images",
                     help="Path to the nii images, [default: data/FLARE22Train/images]")
 parser.add_argument("-gt_path", type=str, default="data/FLARE22Train/labels",
                     help="Path to the ground truth, [default: data/FLARE22Train/labels]")
-parser.add_argument("-output_path", type=str, default="data",
-                    help="Path to save the npy files, [default: ./data]")
+parser.add_argument("-output_path", type=str, default="data/npz",
+                    help="Path to save the npy files, [default: ./data/npz]")
 parser.add_argument("-num_workers", type=int, default=4,
                     help="Number of workers, [default: 4]")
 parser.add_argument("-window_level", type=int, default=40,
                     help="CT window level, [default: 40]")
 parser.add_argument("-window_width", type=int, default=400,
                     help="CT window width, [default: 400]")
+parser.add_argument("--save_nii", action="store_true",
+                    help="Save the image and ground truth as nii files for sanity check; they can be removed")
 
 args = parser.parse_args()
 
@@ -51,12 +53,10 @@ prefix = modality + "_" + anatomy + "_"
 nii_path = args.img_path  # path to the nii images
 gt_path = args.gt_path  # path to the ground truth
 output_path = args.output_path  # path to save the preprocessed files
-npy_tr_path = join(output_path, "MedSAM_train", prefix[:-1])
-os.makedirs(join(npy_tr_path, "gts"), exist_ok=True)
-os.makedirs(join(npy_tr_path, "imgs"), exist_ok=True)
-npy_ts_path = join(output_path, "MedSAM_test", prefix[:-1])
-os.makedirs(join(npy_ts_path, "gts"), exist_ok=True)
-os.makedirs(join(npy_ts_path, "imgs"), exist_ok=True)
+npz_tr_path = join(output_path, "MedSAM_train", prefix[:-1])
+os.makedirs(npz_tr_path, exist_ok=True)
+npz_ts_path = join(output_path, "MedSAM_test", prefix[:-1])
+os.makedirs(npz_ts_path, exist_ok=True)
 
 num_workers = args.num_workers
 
@@ -82,14 +82,19 @@ tumor_id = None  # only set this when there are multiple tumors; convert semanti
 WINDOW_LEVEL = args.window_level # only for CT images
 WINDOW_WIDTH = args.window_width # only for CT images
 
+save_nii = args.save_nii
 # %% save preprocessed images and masks as npz files
-def preprocess(name):
-    re_case = re.compile(r"FLARE22_Tr_(\d+)")
-    case_num = int(re_case.findall(name)[0])
-    if case_num > 40:
-        npy_path = npy_ts_path ## Last 10 cases are used for testing
-    else:
-        npy_path = npy_tr_path ## First 40 cases are used for fine-tuning
+def preprocess(name, npz_path):
+    """
+    Preprocess the image and ground truth, and save them as npz files
+
+    Parameters
+    ----------
+    name : str
+        name of the ground truth file
+    npz_path : str
+        path to save the npz files
+    """
     image_name = name.split(gt_name_suffix)[0] + img_name_suffix
     gt_name = name
     gt_sitk = sitk.ReadImage(join(gt_path, gt_name))
@@ -157,59 +162,37 @@ def preprocess(name):
 
         image_data_pre = np.uint8(image_data_pre)
         img_roi = image_data_pre[z_index, :, :]
-        np.savez_compressed(join(npy_path, prefix + gt_name.split(gt_name_suffix)[0]+'.npz'), imgs=img_roi, gts=gt_roi, spacing=img_sitk.GetSpacing())
+        np.savez_compressed(join(npz_path, prefix + gt_name.split(gt_name_suffix)[0]+'.npz'), imgs=img_roi, gts=gt_roi, spacing=img_sitk.GetSpacing())
+
         # save the image and ground truth as nii files for sanity check;
         # they can be removed
-        img_roi_sitk = sitk.GetImageFromArray(img_roi)
-        gt_roi_sitk = sitk.GetImageFromArray(gt_roi)
-        sitk.WriteImage(
-            img_roi_sitk,
-            join(npy_path, prefix + gt_name.split(gt_name_suffix)[0] + "_img.nii.gz"),
-        )
-        sitk.WriteImage(
-            gt_roi_sitk,
-            join(npy_path, prefix + gt_name.split(gt_name_suffix)[0] + "_gt.nii.gz"),
-        )
-        # save the each CT image as npy file
-        for i in range(img_roi.shape[0]):
-            img_i = img_roi[i, :, :]
-            img_3c = np.repeat(img_i[:, :, None], 3, axis=-1)
-
-            img_01 = (img_3c - img_3c.min()) / np.clip(
-                img_3c.max() - img_3c.min(), a_min=1e-8, a_max=None
-            )  # normalize to [0, 1], (H, W, 3)
-
-            gt_i = gt_roi[i, :, :]
-
-            gt_i = np.uint8(gt_i)
-            assert img_01.shape[:2] == gt_i.shape
-            np.save(
-                join(
-                    npy_path,
-                    "imgs",
-                    prefix
-                    + gt_name.split(gt_name_suffix)[0]
-                    + "-"
-                    + str(i).zfill(3)
-                    + ".npy",
-                ),
-                img_01,
+        if save_nii:
+            img_roi_sitk = sitk.GetImageFromArray(img_roi)
+            img_roi_sitk.SetSpacing(img_sitk.GetSpacing())
+            sitk.WriteImage(
+                img_roi_sitk,
+                join(npz_path, prefix + gt_name.split(gt_name_suffix)[0] + "_img.nii.gz"),
             )
-            np.save(
-                join(
-                    npy_path,
-                    "gts",
-                    prefix
-                    + gt_name.split(gt_name_suffix)[0]
-                    + "-"
-                    + str(i).zfill(3)
-                    + ".npy",
-                ),
-                gt_i,
+            gt_roi_sitk = sitk.GetImageFromArray(gt_roi)
+            gt_roi_sitk.SetSpacing(img_sitk.GetSpacing())
+            sitk.WriteImage(
+                gt_roi_sitk,
+                join(npz_path, prefix + gt_name.split(gt_name_suffix)[0] + "_gt.nii.gz"),
             )
 
 if __name__ == "__main__":
+    tr_names = names[:40]
+    ts_names = names[40:]
+
+    preprocess_tr = partial(preprocess, npz_path=npz_tr_path)
+    preprocess_ts = partial(preprocess, npz_path=npz_ts_path)
+
     with mp.Pool(num_workers) as p:
-        with tqdm(total=len(names)) as pbar:
-            for i, _ in tqdm(enumerate(p.imap_unordered(preprocess, names))):
+        with tqdm(total=len(tr_names)) as pbar:
+            pbar.set_description("Preprocessing training data")
+            for i, _ in tqdm(enumerate(p.imap_unordered(preprocess_tr, tr_names))):
+                pbar.update()
+        with tqdm(total=len(ts_names)) as pbar:
+            pbar.set_description("Preprocessing testing data")
+            for i, _ in tqdm(enumerate(p.imap_unordered(preprocess_ts, ts_names))):
                 pbar.update()

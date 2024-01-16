@@ -12,13 +12,11 @@ import torch.nn.functional as F
 
 from segment_anything.modeling import MaskDecoder, PromptEncoder, TwoWayTransformer
 from tiny_vit_sam import TinyViT
-from datetime import datetime
 from matplotlib import pyplot as plt
 import cv2
 import torch.multiprocessing as mp
 
 import argparse
-import re
 
 #%% set seeds
 torch.set_float32_matmul_precision('high')
@@ -43,7 +41,7 @@ parser.add_argument(
 parser.add_argument(
     '-medsam_lite_checkpoint_path',
     type=str,
-    default="workdir/medsam_lite.pth",
+    default="workdir/lite_medsam.pth",
     help='path to the checkpoint of MedSAM-Lite',
 )
 parser.add_argument(
@@ -69,6 +67,11 @@ parser.add_argument(
     default='./overlay/CT_Abd',
     help='directory to save the overlay image'
 )
+parser.add_argument(
+    '--overwrite',
+    action='store_true',
+    help='whether to overwrite the existing prediction'
+)
 
 args = parser.parse_args()
 
@@ -76,6 +79,7 @@ data_root = args.data_root
 pred_save_dir = args.pred_save_dir
 save_overlay = args.save_overlay
 num_workers = args.num_workers
+overwrite = args.overwrite
 if save_overlay:
     assert args.png_save_dir is not None, "Please specify the directory to save the overlay image"
     png_save_dir = args.png_save_dir
@@ -154,6 +158,20 @@ class MedSAM_Lite(nn.Module):
     def postprocess_masks(self, masks, new_size, original_size):
         """
         Do cropping and resizing
+
+        Parameters
+        ----------
+        masks : torch.Tensor
+            masks predicted by the model
+        new_size : tuple
+            the shape of the image after resizing to the longest side of 256
+        original_size : tuple
+            the original shape of the image
+
+        Returns
+        -------
+        torch.Tensor
+            the upsampled mask to the original size
         """
         # Crop
         masks = masks[..., :new_size[0], :new_size[1]]
@@ -185,12 +203,29 @@ def show_box(box, ax, edgecolor='blue'):
 
 
 def resize_box(box, new_size, original_size):
-    box = deepcopy(box).astype(float)
+    """
+    Revert box coordinates from scale at 256 to original scale
+
+    Parameters
+    ----------
+    box : np.ndarray
+        box coordinates at 256 scale
+    new_size : tuple
+        Image shape with the longest edge resized to 256
+    original_size : tuple
+        Original image shape
+
+    Returns
+    -------
+    np.ndarray
+        box coordinates at original scale
+    """
+    new_box = np.zeros_like(box)
     ratio = max(original_size) / max(new_size)
     for i in range(len(box)):
-        box[i] = box[i] * ratio
+       new_box[i] = int(box[i] * ratio)
 
-    return box
+    return new_box
 
 
 @torch.no_grad()
@@ -211,8 +246,8 @@ def medsam_inference(medsam_model, img_embed, box_256, new_size, original_size):
     )
 
     low_res_pred = medsam_model.postprocess_masks(low_res_logits, new_size, original_size)
-    low_res_pred = torch.sigmoid(low_res_pred)  # (1, 1, 256, 256)
-    low_res_pred = low_res_pred.squeeze().cpu().numpy()  # (256, 256)
+    low_res_pred = torch.sigmoid(low_res_pred)
+    low_res_pred = low_res_pred.squeeze().cpu().numpy()
     medsam_seg = (low_res_pred > 0.5).astype(np.uint8)
 
     return medsam_seg
@@ -248,7 +283,7 @@ medsam_lite_image_encoder = TinyViT(
     mlp_ratio=4.,
     drop_rate=0.,
     drop_path_rate=0.0,
-    use_checkpoint=False, ## TODO: try MobileSAM's checkpoint next time
+    use_checkpoint=False,
     mbconv_expand_ratio=4.0,
     local_conv_size=3,
     layer_lr_decay=0.8
@@ -280,8 +315,8 @@ medsam_lite_model = MedSAM_Lite(
     prompt_encoder = medsam_lite_prompt_encoder
 )
 
-medsam_lite_checkpoint = torch.load(medsam_lite_checkpoint_path)
-medsam_lite_model.load_state_dict(medsam_lite_checkpoint['model'])
+medsam_lite_checkpoint = torch.load(medsam_lite_checkpoint_path, map_location='cpu')
+medsam_lite_model.load_state_dict(medsam_lite_checkpoint)
 medsam_lite_model.to(device)
 medsam_lite_model.eval()
 
@@ -290,19 +325,18 @@ def MedSAM_infer_npz(gt_path_file):
     npz_name = basename(gt_path_file)
     task_folder = gt_path_file.split('/')[-2]
     makedirs(join(pred_save_dir, task_folder), exist_ok=True)
-    if True: # not isfile(join(pred_save_dir, task_folder, npz_name)):
+    if (not isfile(join(pred_save_dir, task_folder, npz_name))) or overwrite:
         npz_data = np.load(gt_path_file, 'r', allow_pickle=True) # (H, W, 3)
         img_3D = npz_data['imgs'] # (Num, H, W)
-        gt_3D = npz_data['gts'] # (Num, 256, 256)
+        gt_3D = npz_data['gts'] # (Num, H, W)
         spacing = npz_data['spacing']
-        seg_3D = np.zeros_like(gt_3D, dtype=np.uint8) # (Num, 256, 256)
+        seg_3D = np.zeros_like(gt_3D, dtype=np.uint8) # (Num, H, W)
         box_list = [dict() for _ in range(img_3D.shape[0])]
 
         for i in range(img_3D.shape[0]):
             img_2d = img_3D[i,:,:] # (H, W)
             H, W = img_2d.shape[:2]
             img_3c = np.repeat(img_2d[:,:, None], 3, axis=-1) # (H, W, 3)
-            #print(f"img_3c.shape: {img_3c.shape}")
 
             ## MedSAM Lite preprocessing
             img_256 = resize_longest_side(img_3c, 256)
@@ -318,7 +352,7 @@ def MedSAM_infer_npz(gt_path_file):
             gt = gt_3D[i,:,:] # (H, W)
             label_ids = np.unique(gt)[1:]
             for label_id in label_ids:
-                gt2D = np.uint8(gt == label_id) # only one label, (256, 256)
+                gt2D = np.uint8(gt == label_id) # only one label, (H, W)
                 if gt2D.shape != (newh, neww):
                     gt2D_resize = cv2.resize(
                         gt2D.astype(np.uint8), (neww, newh),
@@ -326,7 +360,7 @@ def MedSAM_infer_npz(gt_path_file):
                     ).astype(np.uint8)
                 else:
                     gt2D_resize = gt2D.astype(np.uint8)
-                gt2D_padded = pad_image(gt2D_resize, 256)
+                gt2D_padded = pad_image(gt2D_resize, 256) ## (256, 256)
                 if np.sum(gt2D_padded) > 0:
                     box = get_bbox(gt2D_padded, bbox_shift) # (4,)
                     sam_mask = medsam_inference(medsam_lite_model, image_embedding, box, (newh, neww), (H, W))
