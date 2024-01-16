@@ -1,95 +1,176 @@
-# -*- coding: utf-8 -*-
-"""
-train the image encoder and mask decoder
-freeze prompt image encoder
-"""
-
-# %% setup environment
-import numpy as np
-import matplotlib.pyplot as plt
+# %%
 import os
-
-join = os.path.join
+import random
+import monai
+from os import listdir, makedirs
+from os.path import join, isfile, basename
+from glob import glob
 from tqdm import tqdm
-from skimage import transform
+from copy import deepcopy
+from time import time
+from shutil import copyfile
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import torch.multiprocessing as mp
-import monai
-from segment_anything import sam_model_registry
-import torch.nn.functional as F
-import argparse
-import random
+from torch import multiprocessing as mp
+from torch import distributed as dist
 from datetime import datetime
-import shutil
-import glob
 
-# set seeds
-torch.manual_seed(2023)
+from segment_anything.modeling import MaskDecoder, PromptEncoder, TwoWayTransformer
+from tiny_vit_sam import TinyViT
+import cv2
+import torch.nn.functional as F
+
+from matplotlib import pyplot as plt
+import argparse
+
 torch.cuda.empty_cache()
+os.environ["OMP_NUM_THREADS"] = "4" # export OMP_NUM_THREADS=4
+os.environ["OPENBLAS_NUM_THREADS"] = "4" # export OPENBLAS_NUM_THREADS=4 
+os.environ["MKL_NUM_THREADS"] = "6" # export MKL_NUM_THREADS=6
+os.environ["VECLIB_MAXIMUM_THREADS"] = "4" # export VECLIB_MAXIMUM_THREADS=4
+os.environ["NUMEXPR_NUM_THREADS"] = "6" # export NUMEXPR_NUM_THREADS=6
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--tr_npy_path', type=str,
+                        default='data/MedSAM_train/CT_Abd',
+                        help='Path to training npy files; two subfolders: gts and imgs')
+    parser.add_argument('-task_name', type=str, default='MedSAM-Lite')
+    parser.add_argument('-pretrained_checkpoint', type=str, default='medsam_lite.pth',
+                        help='Path to pretrained MedSAM-Lite checkpoint')
+    parser.add_argument('-work_dir', type=str, default='./work_dir')
+    parser.add_argument('--data_aug', action='store_true', default=False,
+                        help='use data augmentation during training')
+    # train
+    parser.add_argument('-num_epochs', type=int, default=1000)
+    parser.add_argument('-batch_size', type=int, default=8)
+    parser.add_argument('-num_workers', type=int, default=8)
+    # Optimizer parameters
+    parser.add_argument('-weight_decay', type=float, default=0.01,
+                        help='weight decay (default: 0.01)')
+    parser.add_argument('-lr', type=float, default=0.0001, metavar='LR',
+                        help='learning rate (absolute lr)')
+    ## Distributed training args
+    parser.add_argument('-world_size', type=int, help='world size')
+    parser.add_argument('-node_rank', type=int, help='Node rank')
+    parser.add_argument('-bucket_cap_mb', type = int, default = 25,
+                        help='The amount of memory in Mb that DDP will accumulate before firing off gradient communication for the bucket (need to tune)')
+    parser.add_argument('-resume', type = str, default = '', required=False,
+                        help="Resuming training from a work_dir")
+    parser.add_argument('-init_method', type = str, default = "env://")
+    args = parser.parse_args()
+
+    return args
 
 
 def show_mask(mask, ax, random_color=False):
     if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+        color = np.concatenate([np.random.random(3), np.array([0.45])], axis=0)
     else:
-        color = np.array([251 / 255, 252 / 255, 30 / 255, 0.6])
+        color = np.array([251/255, 252/255, 30/255, 0.45])
     h, w = mask.shape[-2:]
     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
     ax.imshow(mask_image)
-
+    
 
 def show_box(box, ax):
     x0, y0 = box[0], box[1]
     w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(
-        plt.Rectangle((x0, y0), w, h, edgecolor="blue", facecolor=(0, 0, 0, 0), lw=2)
-    )
+    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='blue', facecolor=(0,0,0,0), lw=2))
 
 
-class NpyDataset(Dataset):
-    def __init__(self, data_root, bbox_shift=20):
-        self.data_root = data_root
-        self.gt_path = join(data_root, "gts")
-        self.img_path = join(data_root, "imgs")
-        self.gt_path_files = sorted(
-            glob.glob(join(self.gt_path, "**/*.npy"), recursive=True)
+@torch.no_grad()
+def cal_iou(result, reference):
+    
+    intersection = torch.count_nonzero(torch.logical_and(result, reference), dim=[i for i in range(1, result.ndim)])
+    union = torch.count_nonzero(torch.logical_or(result, reference), dim=[i for i in range(1, result.ndim)])
+    
+    iou = intersection.float() / union.float()
+    
+    return iou.unsqueeze(1)
+
+
+def revert_sync_batchnorm(module: torch.nn.Module) -> torch.nn.Module:
+    # Code adapted from https://github.com/pytorch/pytorch/issues/41081#issuecomment-783961547
+    # Original author: Kapil Yedidi (@kapily)
+    converted_module = module
+    if isinstance(module, torch.nn.modules.batchnorm.SyncBatchNorm):
+        # Unfortunately, SyncBatchNorm does not store the original class - if it did
+        # we could return the one that was originally created.
+        converted_module = nn.BatchNorm2d(
+            module.num_features, module.eps, module.momentum, module.affine, module.track_running_stats
         )
-        self.gt_path_files = [
-            file
-            for file in self.gt_path_files
-            if os.path.isfile(join(self.img_path, os.path.basename(file)))
-        ]
-        self.bbox_shift = bbox_shift
-        print(f"number of images: {len(self.gt_path_files)}")
+        if module.affine:
+            with torch.no_grad():
+                converted_module.weight = module.weight
+                converted_module.bias = module.bias
+        converted_module.running_mean = module.running_mean
+        converted_module.running_var = module.running_var
+        converted_module.num_batches_tracked = module.num_batches_tracked
+        if hasattr(module, "qconfig"):
+            converted_module.qconfig = module.qconfig
+    for name, child in module.named_children():
+        converted_module.add_module(name, revert_sync_batchnorm(child))
+    del module
 
+    return converted_module
+
+
+class NpyDataset(Dataset): 
+    def __init__(self, data_root, image_size=256, bbox_shift=10, data_aug=True):
+        self.data_root = data_root
+        self.gt_path = join(data_root, 'gts')
+        self.img_path = join(data_root, 'imgs')
+        self.gt_path_files = sorted(glob(join(self.gt_path, '*.npy'), recursive=True))
+        self.gt_path_files = [file for file in self.gt_path_files if isfile(join(self.img_path, basename(file)))]
+        self.image_size = image_size
+        self.target_length = image_size
+        self.bbox_shift = bbox_shift
+        self.data_aug = data_aug
+    
     def __len__(self):
         return len(self.gt_path_files)
 
     def __getitem__(self, index):
-        # load npy image (1024, 1024, 3), [0,1]
-        img_name = os.path.basename(self.gt_path_files[index])
-        img_1024 = np.load(
-            join(self.img_path, img_name), "r", allow_pickle=True
-        )  # (1024, 1024, 3)
+        img_name = basename(self.gt_path_files[index])
+        assert img_name == basename(self.gt_path_files[index]), 'img gt name error' + self.gt_path_files[index] + self.npy_files[index]
+        img_3c = np.load(join(self.img_path, img_name), 'r', allow_pickle=True) # (H, W, 3)
+        # Resizing and normalization
+        img_resize = self.resize_longest_side(img_3c)
+        img_resize = (img_resize - img_resize.min()) / np.clip(img_resize.max() - img_resize.min(), a_min=1e-8, a_max=None) # normalize to [0, 1], (H, W, 3
+        img_padded = self.pad_image(img_resize) # (256, 256, 3)
         # convert the shape to (3, H, W)
-        img_1024 = np.transpose(img_1024, (2, 0, 1))
-        assert (
-            np.max(img_1024) <= 1.0 and np.min(img_1024) >= 0.0
-        ), "image should be normalized to [0, 1]"
-        gt = np.load(
-            self.gt_path_files[index], "r", allow_pickle=True
-        )  # multiple labels [0, 1,4,5...], (256,256)
-        assert img_name == os.path.basename(self.gt_path_files[index]), (
-            "img gt name error" + self.gt_path_files[index] + self.npy_files[index]
-        )
+        img_padded = np.transpose(img_padded, (2, 0, 1)) # (3, 256, 256)
+        assert np.max(img_padded)<=1.0 and np.min(img_padded)>=0.0, 'image should be normalized to [0, 1]'
+        gt = np.load(self.gt_path_files[index], 'r', allow_pickle=True) # multiple labels [0, 1,4,5...], (256,256)
+        assert gt.max() >= 1, 'gt should have at least one label'
+        gt = cv2.resize(
+            gt,
+            (img_resize.shape[1], img_resize.shape[0]),
+            interpolation=cv2.INTER_NEAREST
+        ).astype(np.uint8)
+        gt = self.pad_image(gt) # (256, 256)
         label_ids = np.unique(gt)[1:]
-        gt2D = np.uint8(
-            gt == random.choice(label_ids.tolist())
-        )  # only one label, (256, 256)
-
-        assert np.max(gt2D) == 1 and np.min(gt2D) == 0.0, "ground truth should be 0, 1"
+        try:
+            gt2D = np.uint8(gt == random.choice(label_ids.tolist())) # only one label, (256, 256)
+        except:
+            print(img_name, 'label_ids.tolist()', label_ids.tolist())
+            gt2D = np.uint8(gt == np.max(gt)) # only one label, (256, 256)
+        # add data augmentation: random fliplr and random flipud
+        if self.data_aug:
+            if random.random() > 0.5:
+                img_padded = np.ascontiguousarray(np.flip(img_padded, axis=-1))
+                gt2D = np.ascontiguousarray(np.flip(gt2D, axis=-1))
+                # print('DA with flip left right')
+            if random.random() > 0.5:
+                img_padded = np.ascontiguousarray(np.flip(img_padded, axis=-2))
+                gt2D = np.ascontiguousarray(np.flip(gt2D, axis=-2))
+                # print('DA with flip upside down')
+        gt2D = np.uint8(gt2D > 0)
         y_indices, x_indices = np.where(gt2D > 0)
         x_min, x_max = np.min(x_indices), np.max(x_indices)
         y_min, y_max = np.min(y_indices), np.max(y_indices)
@@ -100,164 +181,145 @@ class NpyDataset(Dataset):
         y_min = max(0, y_min - random.randint(0, self.bbox_shift))
         y_max = min(H, y_max + random.randint(0, self.bbox_shift))
         bboxes = np.array([x_min, y_min, x_max, y_max])
-        return (
-            torch.tensor(img_1024).float(),
-            torch.tensor(gt2D[None, :, :]).long(),
-            torch.tensor(bboxes).float(),
-            img_name,
+        return {
+            "image": torch.tensor(img_padded).float(),
+            "gt2D": torch.tensor(gt2D[None, :,:]).long(),
+            "bboxes": torch.tensor(bboxes[None, None, ...]).float(), # (B, 1, 4)
+            "image_name": img_name,
+            "new_size": torch.tensor(np.array([img_resize.shape[0], img_resize.shape[1]])).long(),
+            "original_size": torch.tensor(np.array([img_3c.shape[0], img_3c.shape[1]])).long()
+        }
+
+    def resize_longest_side(self, image):
+        """
+        Expects a numpy array with shape HxWxC in uint8 format.
+        """
+        long_side_length = self.target_length
+        oldh, oldw = image.shape[0], image.shape[1]
+        scale = long_side_length * 1.0 / max(oldh, oldw)
+        newh, neww = oldh * scale, oldw * scale
+        neww, newh = int(neww + 0.5), int(newh + 0.5)
+        target_size = (neww, newh)
+
+        return cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+
+    def pad_image(self, image):
+        """
+        Expects a numpy array with shape HxWxC in uint8 format.
+        """
+        # Pad
+        h, w = image.shape[0], image.shape[1]
+        padh = self.image_size - h
+        padw = self.image_size - w
+        if len(image.shape) == 3: ## Pad image
+            image_padded = np.pad(image, ((0, padh), (0, padw), (0, 0)))
+        else: ## Pad gt mask
+            image_padded = np.pad(image, ((0, padh), (0, padw)))
+
+        return image_padded
+
+def collate_fn(batch):
+    """
+    Collate function for PyTorch DataLoader.
+    """
+    batch_dict = {}
+    for key in batch[0].keys():
+        if key == "image_name":
+            batch_dict[key] = [sample[key] for sample in batch]
+        else:
+            batch_dict[key] = torch.stack([sample[key] for sample in batch], dim=0)
+
+    return batch_dict
+
+#%% sanity test of dataset class
+def sanity_check_dataset(args):
+    print('tr_npy_path', args.tr_npy_path)
+    tr_dataset = NpyDataset(args.tr_npy_path, data_aug=args.data_aug)
+    print('len(tr_dataset)', len(tr_dataset))
+    tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
+    makedirs(args.work_dir, exist_ok=True)
+    for step, batch in enumerate(tr_dataloader):
+        # print(image.shape, gt.shape, bboxes.shape)
+        # show the example
+        _, axs = plt.subplots(1, 2, figsize=(10, 10))
+        idx = random.randint(0, 4)
+
+        image = batch["image"]
+        gt = batch["gt2D"]
+        bboxes = batch["bboxes"]
+        names_temp = batch["image_name"]
+
+        axs[0].imshow(image[idx].cpu().permute(1,2,0).numpy())
+        show_mask(gt[idx].cpu().squeeze().numpy(), axs[0])
+        show_box(bboxes[idx].numpy().squeeze(), axs[0])
+        axs[0].axis('off')
+        # set title
+        axs[0].set_title(names_temp[idx])
+        idx = random.randint(4, 7)
+        axs[1].imshow(image[idx].cpu().permute(1,2,0).numpy())
+        show_mask(gt[idx].cpu().squeeze().numpy(), axs[1])
+        show_box(bboxes[idx].numpy().squeeze(), axs[1])
+        axs[1].axis('off')
+        # set title
+        axs[1].set_title(names_temp[idx])
+        # plt.show()  
+        plt.subplots_adjust(wspace=0.01, hspace=0)
+        plt.savefig(
+            join(args.work_dir, 'medsam_lite-train_bbox_prompt_sanitycheck_DA.png'),
+            bbox_inches='tight',
+            dpi=300
         )
+        plt.close()
+        break
 
-
-# %% sanity test of dataset class
-tr_dataset = NpyDataset("data/npy/CT_Abd")
-tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
-for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):
-    print(image.shape, gt.shape, bboxes.shape)
-    # show the example
-    _, axs = plt.subplots(1, 2, figsize=(25, 25))
-    idx = random.randint(0, 7)
-    axs[0].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
-    show_mask(gt[idx].cpu().numpy(), axs[0])
-    show_box(bboxes[idx].numpy(), axs[0])
-    axs[0].axis("off")
-    # set title
-    axs[0].set_title(names_temp[idx])
-    idx = random.randint(0, 7)
-    axs[1].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
-    show_mask(gt[idx].cpu().numpy(), axs[1])
-    show_box(bboxes[idx].numpy(), axs[1])
-    axs[1].axis("off")
-    # set title
-    axs[1].set_title(names_temp[idx])
-    # plt.show()
-    plt.subplots_adjust(wspace=0.01, hspace=0)
-    plt.savefig("./data_sanitycheck.png", bbox_inches="tight", dpi=300)
-    plt.close()
-    break
-
-# %% set up parser
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "-i",
-    "--tr_npy_path",
-    type=str,
-    default="data/npy/CT_Abd",
-    help="path to training npy files; two subfolders: gts and imgs",
-)
-parser.add_argument("-task_name", type=str, default="MedSAM-ViT-B")
-parser.add_argument("-model_type", type=str, default="vit_b")
-parser.add_argument(
-    "-checkpoint", type=str, default="work_dir/SAM/sam_vit_b_01ec64.pth"
-)
-# parser.add_argument('-device', type=str, default='cuda:0')
-parser.add_argument(
-    "--load_pretrain", type=bool, default=True, help="use wandb to monitor training"
-)
-parser.add_argument("-pretrain_model_path", type=str, default="")
-parser.add_argument("-work_dir", type=str, default="./work_dir")
-# train
-parser.add_argument("-num_epochs", type=int, default=1000)
-parser.add_argument("-batch_size", type=int, default=8)
-parser.add_argument("-num_workers", type=int, default=8)
-# Optimizer parameters
-parser.add_argument(
-    "-weight_decay", type=float, default=0.01, help="weight decay (default: 0.01)"
-)
-parser.add_argument(
-    "-lr", type=float, default=0.0001, metavar="LR", help="learning rate (absolute lr)"
-)
-parser.add_argument(
-    "-use_wandb", type=bool, default=False, help="use wandb to monitor training"
-)
-parser.add_argument("-use_amp", action="store_true", default=False, help="use amp")
-## Distributed training args
-parser.add_argument("--world_size", type=int, help="world size")
-parser.add_argument("--node_rank", type=int, default=0, help="Node rank")
-parser.add_argument(
-    "--bucket_cap_mb",
-    type=int,
-    default=25,
-    help="The amount of memory in Mb that DDP will accumulate before firing off gradient communication for the bucket (need to tune)",
-)
-parser.add_argument(
-    "--grad_acc_steps",
-    type=int,
-    default=1,
-    help="Gradient accumulation steps before syncing gradients for backprop",
-)
-parser.add_argument(
-    "--resume", type=str, default="", help="Resuming training from checkpoint"
-)
-parser.add_argument("--init_method", type=str, default="env://")
-
-args = parser.parse_args()
-
-if args.use_wandb:
-    import wandb
-
-    wandb.login()
-    wandb.init(
-        project=args.task_name,
-        config={
-            "lr": args.lr,
-            "batch_size": args.batch_size,
-            "data_path": args.tr_npy_path,
-            "model_type": args.model_type,
-        },
-    )
-
-# %% set up model for fine-tuning
-# device = args.device
-run_id = datetime.now().strftime("%Y%m%d-%H%M")
-model_save_path = join(args.work_dir, args.task_name + "-" + run_id)
-
-
-# %% set up model
-class MedSAM(nn.Module):
-    def __init__(
-        self,
-        image_encoder,
-        mask_decoder,
-        prompt_encoder,
-    ):
+# %%
+class MedSAM_Lite(nn.Module):
+    def __init__(self, 
+                image_encoder, 
+                mask_decoder,
+                prompt_encoder
+        ):
         super().__init__()
         self.image_encoder = image_encoder
         self.mask_decoder = mask_decoder
         self.prompt_encoder = prompt_encoder
-        # freeze prompt encoder
-        for param in self.prompt_encoder.parameters():
-            param.requires_grad = False
 
-    def forward(self, image, box):
-        image_embedding = self.image_encoder(image)  # (B, 256, 64, 64)
-        # do not compute gradients for prompt encoder
-        with torch.no_grad():
-            box_torch = torch.as_tensor(box, dtype=torch.float32, device=image.device)
-            if len(box_torch.shape) == 2:
-                box_torch = box_torch[:, None, :]  # (B, 1, 4)
+    def forward(self, image, boxes):
+        image_embedding = self.image_encoder(image) # (B, 256, 64, 64)
 
-            sparse_embeddings, dense_embeddings = self.prompt_encoder(
-                points=None,
-                boxes=box_torch,
-                masks=None,
-            )
-        low_res_masks, _ = self.mask_decoder(
-            image_embeddings=image_embedding,  # (B, 256, 64, 64)
-            image_pe=self.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
-            sparse_prompt_embeddings=sparse_embeddings,  # (B, 2, 256)
-            dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
-            multimask_output=False,
+        sparse_embeddings, dense_embeddings = self.prompt_encoder(
+            points=None,
+            boxes=boxes,
+            masks=None,
         )
-        ori_res_masks = F.interpolate(
-            low_res_masks,
-            size=(image.shape[2], image.shape[3]),
+        low_res_logits, iou_predictions = self.mask_decoder(
+            image_embeddings=image_embedding, # (B, 256, 64, 64)
+            image_pe=self.prompt_encoder.get_dense_pe(), # (1, 256, 64, 64)
+            sparse_prompt_embeddings=sparse_embeddings, # (B, 2, 256)
+            dense_prompt_embeddings=dense_embeddings, # (B, 256, 64, 64)
+            multimask_output=False,
+          ) # (B, 1, 256, 256)
+
+        return low_res_logits, iou_predictions
+
+    @torch.no_grad()
+    def postprocess_masks(self, masks, new_size, original_size):
+        """
+        Do cropping and resizing
+        """
+        # Crop
+        masks = masks[:, :, :new_size[0], :new_size[1]]
+        # Resize
+        masks = F.interpolate(
+            masks,
+            size=(original_size[0], original_size[1]),
             mode="bilinear",
             align_corners=False,
         )
-        return ori_res_masks
 
+        return masks
 
-def main():
+def main(args):
     ngpus_per_node = torch.cuda.device_count()
     print("Spwaning processces")
     mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
@@ -270,236 +332,217 @@ def main_worker(gpu, ngpus_per_node, args):
     print(f"[Rank {rank}]: Use GPU: {gpu} for training")
     is_main_host = rank == 0
     if is_main_host:
-        os.makedirs(model_save_path, exist_ok=True)
-        shutil.copyfile(
+        run_id = datetime.now().strftime("%Y%m%d-%H%M")
+        model_save_path = join(args.work_dir, args.task_name + "-" + run_id)
+        makedirs(model_save_path, exist_ok=True)
+        copyfile(
             __file__, join(model_save_path, run_id + "_" + os.path.basename(__file__))
         )
     torch.cuda.set_device(gpu)
-    # device = torch.device("cuda:{}".format(gpu))
-    torch.distributed.init_process_group(
+    device = torch.device("cuda:{}".format(gpu))
+    dist.init_process_group(
         backend="nccl", init_method=args.init_method, rank=rank, world_size=world_size
     )
 
-    sam_model = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
-    medsam_model = MedSAM(
-        image_encoder=sam_model.image_encoder,
-        mask_decoder=sam_model.mask_decoder,
-        prompt_encoder=sam_model.prompt_encoder
-    ).cuda()
-    cuda_mem_info = torch.cuda.mem_get_info(gpu)
-    free_cuda_mem, total_cuda_mem = cuda_mem_info[0] / (1024**3), cuda_mem_info[1] / (
-        1024**3
+    num_epochs = args.num_epochs
+    batch_size = args.batch_size
+    num_workers = args.num_workers
+    medsam_lite_image_encoder = TinyViT(
+        img_size=256,
+        in_chans=3,
+        embed_dims=[
+            64, ## (64, 256, 256)
+            128, ## (128, 128, 128)
+            160, ## (160, 64, 64)
+            320 ## (320, 64, 64) 
+        ],
+        depths=[2, 2, 6, 2],
+        num_heads=[2, 4, 5, 10],
+        window_sizes=[7, 7, 14, 7],
+        mlp_ratio=4.,
+        drop_rate=0.,
+        drop_path_rate=0.0,
+        use_checkpoint=False,
+        mbconv_expand_ratio=4.0,
+        local_conv_size=3,
+        layer_lr_decay=0.8
     )
-    print(
-        f"[RANK {rank}: GPU {gpu}] Total CUDA memory before DDP initialised: {total_cuda_mem} Gb"
-    )
-    print(
-        f"[RANK {rank}: GPU {gpu}] Free CUDA memory before DDP initialised: {free_cuda_mem} Gb"
-    )
-    if rank % ngpus_per_node == 0:
-        print("Before DDP initialization:")
-        os.system("nvidia-smi")
 
-    medsam_model = nn.parallel.DistributedDataParallel(
-        medsam_model,
+    medsam_lite_prompt_encoder = PromptEncoder(
+        embed_dim=256,
+        image_embedding_size=(64, 64),
+        input_image_size=(256, 256),
+        mask_in_chans=16
+    )
+
+    medsam_lite_mask_decoder = MaskDecoder(
+        num_multimask_outputs=3,
+            transformer=TwoWayTransformer(
+                depth=2,
+                embedding_dim=256,
+                mlp_dim=2048,
+                num_heads=8,
+            ),
+            transformer_dim=256,
+            iou_head_depth=3,
+            iou_head_hidden_dim=256,
+    )
+    
+    medsam_lite_model = MedSAM_Lite(
+        image_encoder = medsam_lite_image_encoder,
+        mask_decoder = medsam_lite_mask_decoder,
+        prompt_encoder = medsam_lite_prompt_encoder
+    )
+    
+    if not os.path.exists(args.resume):
+        medsam_lite_checkpoint = torch.load(args.pretrained_checkpoint, map_location="cpu")
+        medsam_lite_model.load_state_dict(medsam_lite_checkpoint, strict=True)
+
+    medsam_lite_model = medsam_lite_model.to(device)
+
+    ## Make sure there's only 2d BN layers, so that I can revert them properly
+    for module in medsam_lite_model.modules():
+        cls_name = module.__class__.__name__
+        if "BatchNorm" in cls_name:
+            assert cls_name == "BatchNorm2d" 
+    medsam_lite_model = nn.SyncBatchNorm.convert_sync_batchnorm(medsam_lite_model)
+
+    medsam_lite_model = nn.parallel.DistributedDataParallel(
+        medsam_lite_model,
         device_ids=[gpu],
         output_device=gpu,
-        gradient_as_bucket_view=True,
         find_unused_parameters=True,
-        bucket_cap_mb=args.bucket_cap_mb,  ## Too large -> comminitation overlap, too small -> unable to overlap with computation
+        bucket_cap_mb=args.bucket_cap_mb
     )
-
-    cuda_mem_info = torch.cuda.mem_get_info(gpu)
-    free_cuda_mem, total_cuda_mem = cuda_mem_info[0] / (1024**3), cuda_mem_info[1] / (
-        1024**3
+    medsam_lite_model.train()
+    # %%
+    print(f"MedSAM Lite size: {sum(p.numel() for p in medsam_lite_model.parameters())}")
+    # %%
+    optimizer = optim.AdamW(
+        medsam_lite_model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.999),
+        eps=1e-08,
+        weight_decay=args.weight_decay,
     )
-    print(
-        f"[RANK {rank}: GPU {gpu}] Total CUDA memory after DDP initialised: {total_cuda_mem} Gb"
+    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.9,
+        patience=5,
+        cooldown=0
     )
-    print(
-        f"[RANK {rank}: GPU {gpu}] Free CUDA memory after DDP initialised: {free_cuda_mem} Gb"
-    )
-    if rank % ngpus_per_node == 0:
-        print("After DDP initialization:")
-        os.system("nvidia-smi")
-
-    medsam_model.train()
-
-    print(
-        "Number of total parameters: ",
-        sum(p.numel() for p in medsam_model.parameters()),
-    )  # 93735472
-    print(
-        "Number of trainable parameters: ",
-        sum(p.numel() for p in medsam_model.parameters() if p.requires_grad),
-    )  # 93729252
-
-    ## Setting up optimiser and loss func
-    # only optimize the parameters of image encodder, mask decoder, do not update prompt encoder
-    # img_mask_encdec_params = list(medsam_model.image_encoder.parameters()) + list(medsam_model.mask_decoder.parameters())
-    img_mask_encdec_params = list(
-        medsam_model.module.image_encoder.parameters()
-    ) + list(medsam_model.module.mask_decoder.parameters())
-    optimizer = torch.optim.AdamW(
-        img_mask_encdec_params, lr=args.lr, weight_decay=args.weight_decay
-    )
-    print(
-        "Number of image encoder and mask decoder parameters: ",
-        sum(p.numel() for p in img_mask_encdec_params if p.requires_grad),
-    )  # 93729252
-    seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
-    ce_loss = nn.BCEWithLogitsLoss(reduction="mean")
-    # %% train
-    num_epochs = args.num_epochs
-    iter_num = 0
-    losses = []
-    best_loss = 1e10
-    train_dataset = NpyDataset(args.tr_npy_path)
+    seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction='mean')
+    ce_loss = nn.BCEWithLogitsLoss(reduction='mean')
+    iou_loss = nn.MSELoss(reduction='mean')
+    # %%
+    data_root = args.tr_npy_path
+    train_dataset = NpyDataset(data_root=data_root, data_aug=True)
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    ## Distributed sampler has done the shuffling for you,
-    ## So no need to shuffle in dataloader
-
-    print("Number of training samples: ", len(train_dataset))
-    train_dataloader = DataLoader(
+    train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
-        num_workers=args.num_workers,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
         pin_memory=True,
         sampler=train_sampler,
+        collate_fn=collate_fn
     )
+    # %%
 
-    start_epoch = 0
-    if args.resume is not None:
-        if os.path.isfile(args.resume):
-            print(rank, "=> loading checkpoint '{}'".format(args.resume))
-            ## Map model to be loaded to specified single GPU
-            loc = "cuda:{}".format(gpu)
-            checkpoint = torch.load(args.resume, map_location=loc)
-            start_epoch = checkpoint["epoch"] + 1
-            medsam_model.load_state_dict(checkpoint["model"])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            print(
-                rank,
-                "=> loaded checkpoint '{}' (epoch {})".format(
-                    args.resume, checkpoint["epoch"]
-                ),
-            )
-        torch.distributed.barrier()
+    if os.path.exists(args.resume):
+        ckpt_folders = sorted(listdir(args.resume))
+        ckpt_folders = [f for f in ckpt_folders if (f.startswith(args.task_name) and isfile(join(args.resume, f, 'medsam_lite_latest.pth')))]
+        print('*'*20)
+        print('existing ckpts in', args.resume, ckpt_folders)
+        # find the latest ckpt folders
+        time_strings = [f.split(args.task_name + '-')[-1] for f in ckpt_folders]
+        dates = [datetime.strptime(f, '%Y%m%d-%H%M') for f in time_strings]
+        latest_date = max(dates)
+        latest_ckpt = join(args.work_dir, args.task_name + '-' + latest_date.strftime('%Y%m%d-%H%M'), 'medsam_lite_latest.pth')
+        print('Loading from', latest_ckpt)
+        checkpoint = torch.load(latest_ckpt, map_location=device)
+        medsam_lite_model.module.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_loss = checkpoint["loss"]
+        print(f"Loaded checkpoint from epoch {start_epoch}")
+    else:
+        start_epoch = 0
+        best_loss = 1e10
 
-    if args.use_amp:
-        scaler = torch.cuda.amp.GradScaler()
-        print(f"[RANK {rank}: GPU {gpu}] Using AMP for training")
-
+    train_losses = []
+    epoch_times = []
     for epoch in range(start_epoch, num_epochs):
-        epoch_loss = 0
-        train_dataloader.sampler.set_epoch(epoch)
-        for step, (image, gt2D, boxes, _) in enumerate(
-            tqdm(train_dataloader, desc=f"[RANK {rank}: GPU {gpu}]")
-        ):
+        epoch_loss = [1e10 for _ in range(len(train_loader))]
+        epoch_start_time = time()
+        pbar = tqdm(train_loader)
+        for step, batch in enumerate(pbar):
+            image = batch["image"]
+            gt2D = batch["gt2D"]
+            boxes = batch["bboxes"]
             optimizer.zero_grad()
-            boxes_np = boxes.detach().cpu().numpy()
-            # image, gt2D = image.to(device), gt2D.to(device)
-            image, gt2D = image.cuda(), gt2D.cuda()
-            if args.use_amp:
-                ## AMP
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    medsam_pred = medsam_model(image, boxes_np)
-                    loss = seg_loss(medsam_pred, gt2D) + ce_loss(
-                        medsam_pred, gt2D.float()
-                    )
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-            else:
-                medsam_pred = medsam_model(image, boxes_np)
-                loss = seg_loss(medsam_pred, gt2D) + ce_loss(
-                    medsam_pred, gt2D.float()
-                )
-                # Gradient accumulation
-                if args.grad_acc_steps > 1:
-                    loss = (
-                        loss / args.grad_acc_steps
-                    )  # normalize the loss because it is accumulated
-                    if (step + 1) % args.grad_acc_steps == 0:
-                        ## Perform gradient sync
-                        loss.backward()
-                        optimizer.step()
-                        optimizer.zero_grad()
-                    else:
-                        ## Accumulate gradient on current node without backproping
-                        with medsam_model.no_sync():
-                            loss.backward()  ## calculate the gradient only
-                else:
-                    loss.backward()
-                    optimizer.step()
-                    optimizer.zero_grad()
+            image, gt2D, boxes = image.to(device), gt2D.to(device), boxes.to(device)
+            logits_pred, iou_pred = medsam_lite_model(image, boxes)
+            l_seg = seg_loss(logits_pred, gt2D)
+            l_ce = ce_loss(logits_pred, gt2D.float())
+            mask_loss = l_seg + l_ce
+            with torch.no_grad():
+                iou_gt = cal_iou(torch.sigmoid(logits_pred) > 0.5, gt2D.bool())
+            l_iou = iou_loss(iou_pred, iou_gt)
+            loss = mask_loss + l_iou
+            epoch_loss[step] = loss.item()
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            pbar.set_description(f"[RANK {rank}] Epoch {epoch} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, loss: {loss.item():.4f}")
 
-            if step > 10 and step % 100 == 0:
-                if is_main_host:
-                    checkpoint = {
-                        "model": medsam_model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "epoch": epoch,
-                    }
-                    torch.save(
-                        checkpoint,
-                        join(model_save_path, "medsam_model_latest_step.pth"),
-                    )
+        epoch_end_time = time()
+        epoch_duration = epoch_end_time - epoch_start_time
+        epoch_times.append(epoch_duration)
+        epoch_loss_world = [None for _ in range(world_size)]
+        dist.all_gather_object(epoch_loss_world, epoch_loss)
+        epoch_loss_reduced = np.vstack(epoch_loss_world).mean()
+        train_losses.append(epoch_loss_reduced)
+        lr_scheduler.step(epoch_loss_reduced)
 
-            epoch_loss += loss.item()
-            iter_num += 1
-
-            # if rank % ngpus_per_node == 0:
-            #     print('\n')
-            #     os.system('nvidia-smi')
-            #     print('\n')
-
-        # Check CUDA memory usage
-        cuda_mem_info = torch.cuda.mem_get_info(gpu)
-        free_cuda_mem, total_cuda_mem = cuda_mem_info[0] / (1024**3), cuda_mem_info[
-            1
-        ] / (1024**3)
-        print("\n")
-        print(f"[RANK {rank}: GPU {gpu}] Total CUDA memory: {total_cuda_mem} Gb")
-        print(f"[RANK {rank}: GPU {gpu}] Free CUDA memory: {free_cuda_mem} Gb")
-        print(
-            f"[RANK {rank}: GPU {gpu}] Used CUDA memory: {total_cuda_mem - free_cuda_mem} Gb"
-        )
-        print("\n")
-
-        epoch_loss /= step
-        losses.append(epoch_loss)
-        if args.use_wandb:
-            wandb.log({"epoch_loss": epoch_loss})
-        print(
-            f'Time: {datetime.now().strftime("%Y%m%d-%H%M")}, Epoch: {epoch}, Loss: {epoch_loss}'
-        )
-        # save the model checkpoint
         if is_main_host:
+            module_revert_sync_BN = revert_sync_batchnorm(deepcopy(medsam_lite_model.module))
+            weights = module_revert_sync_BN.state_dict()
             checkpoint = {
-                "model": medsam_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
+                "model": weights,
                 "epoch": epoch,
+                "optimizer": optimizer.state_dict(),
+                "loss": epoch_loss_reduced,
+                "best_loss": best_loss,
             }
-            torch.save(checkpoint, join(model_save_path, "medsam_model_latest.pth"))
-
-            ## save the best model
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                torch.save(checkpoint, join(model_save_path, "medsam_model_best.pth"))
-        torch.distributed.barrier()
-
+            torch.save(checkpoint, join(model_save_path, "medsam_lite_latest.pth"))
+        if epoch_loss_reduced < best_loss:
+            print(f"New best loss: {best_loss:.4f} -> {epoch_loss_reduced:.4f}")
+            best_loss = epoch_loss_reduced
+            if is_main_host:
+                checkpoint["best_loss"] = best_loss
+                torch.save(checkpoint, join(model_save_path, "medsam_lite_best.pth"))
+        dist.barrier()
+        epoch_loss_reduced = 1e10
         # %% plot loss
-        plt.plot(losses)
-        plt.title("Dice + Cross Entropy Loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        # plt.show() # comment this line if you are running on a server
-        plt.savefig(join(model_save_path, args.task_name + "train_loss.png"))
-        plt.close()
+        if is_main_host:
+            fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+            axes[0].title.set_text("Dice + Binary Cross Entropy + IoU Loss")
+            axes[0].plot(train_losses)
+            axes[0].set_ylabel("Loss")
+            axes[1].plot(epoch_times)
+            axes[1].title.set_text("Epoch Duration")
+            axes[1].set_ylabel("Duration (s)")
+            axes[1].set_xlabel("Epoch")
+            plt.tight_layout()
+            plt.savefig(join(model_save_path, "log.png"))
+            plt.close()
+        dist.barrier()
 
-
+        
+# %%
 if __name__ == "__main__":
-    main()
+    args = get_args()
+    sanity_check_dataset(args)
+    main(args)

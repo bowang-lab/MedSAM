@@ -8,24 +8,58 @@ import SimpleITK as sitk
 import os
 
 join = os.path.join
-from skimage import transform
 from tqdm import tqdm
 import cc3d
 
+import multiprocessing as mp
+import re
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-modality", type=str, default="CT", help="CT or MR, [default: CT]")
+parser.add_argument("-anatomy", type=str, default="Abd",
+                    help="Anaotmy name, [default: Abd]")
+parser.add_argument("-img_name_suffix", type=str, default="_0000.nii.gz",
+                    help="Suffix of the image name, [default: _0000.nii.gz]")
+parser.add_argument("-gt_name_suffix", type=str, default=".nii.gz",
+                    help="Suffix of the ground truth name, [default: .nii.gz]")
+parser.add_argument("-prefix", type=str, default="CT_Abd_",
+                    help="Prefix of the npz file name, [default: CT_Abd_]")
+parser.add_argument("-img_path", type=str, default="data/FLARE22Train/images",
+                    help="Path to the nii images, [default: data/FLARE22Train/images]")
+parser.add_argument("-gt_path", type=str, default="data/FLARE22Train/labels",
+                    help="Path to the ground truth, [default: data/FLARE22Train/labels]")
+parser.add_argument("-output_path", type=str, default="data",
+                    help="Path to save the npy files, [default: ./data]")
+parser.add_argument("-num_workers", type=int, default=4,
+                    help="Number of workers, [default: 4]")
+parser.add_argument("-window_level", type=int, default=40,
+                    help="CT window level, [default: 40]")
+parser.add_argument("-window_width", type=int, default=400,
+                    help="CT window width, [default: 400]")
+
+args = parser.parse_args()
+
 # convert nii image to npz files, including original image and corresponding masks
-modality = "CT"
-anatomy = "Abd"  # anantomy + dataset name
-img_name_suffix = "_0000.nii.gz"
-gt_name_suffix = ".nii.gz"
+modality = args.modality  # CT or MR
+anatomy = args.anatomy  # anantomy + dataset name
+img_name_suffix = args.img_name_suffix  # "_0000.nii.gz"
+gt_name_suffix = args.gt_name_suffix  # ".nii.gz"
 prefix = modality + "_" + anatomy + "_"
 
-nii_path = "data/FLARE22Train/images"  # path to the nii images
-gt_path = "data/FLARE22Train/labels"  # path to the ground truth
-npy_path = "data/npy/" + prefix[:-1]
-os.makedirs(join(npy_path, "gts"), exist_ok=True)
-os.makedirs(join(npy_path, "imgs"), exist_ok=True)
+nii_path = args.img_path  # path to the nii images
+gt_path = args.gt_path  # path to the ground truth
+output_path = args.output_path  # path to save the preprocessed files
+npy_tr_path = join(output_path, "MedSAM_train", prefix[:-1])
+os.makedirs(join(npy_tr_path, "gts"), exist_ok=True)
+os.makedirs(join(npy_tr_path, "imgs"), exist_ok=True)
+npy_ts_path = join(output_path, "MedSAM_test", prefix[:-1])
+os.makedirs(join(npy_ts_path, "gts"), exist_ok=True)
+os.makedirs(join(npy_ts_path, "imgs"), exist_ok=True)
 
-image_size = 1024
+num_workers = args.num_workers
+
 voxel_num_thre2d = 100
 voxel_num_thre3d = 1000
 
@@ -45,11 +79,17 @@ remove_label_ids = [
 tumor_id = None  # only set this when there are multiple tumors; convert semantic masks to instance masks
 # set window level and width
 # https://radiopaedia.org/articles/windowing-ct
-WINDOW_LEVEL = 40  # only for CT images
-WINDOW_WIDTH = 400  # only for CT images
+WINDOW_LEVEL = args.window_level # only for CT images
+WINDOW_WIDTH = args.window_width # only for CT images
 
 # %% save preprocessed images and masks as npz files
-for name in tqdm(names[:40]):  # use the remaining 10 cases for validation
+def preprocess(name):
+    re_case = re.compile(r"FLARE22_Tr_(\d+)")
+    case_num = int(re_case.findall(name)[0])
+    if case_num > 40:
+        npy_path = npy_ts_path ## Last 10 cases are used for testing
+    else:
+        npy_path = npy_tr_path ## First 40 cases are used for fine-tuning
     image_name = name.split(gt_name_suffix)[0] + img_name_suffix
     gt_name = name
     gt_sitk = sitk.ReadImage(join(gt_path, gt_name))
@@ -134,28 +174,15 @@ for name in tqdm(names[:40]):  # use the remaining 10 cases for validation
         for i in range(img_roi.shape[0]):
             img_i = img_roi[i, :, :]
             img_3c = np.repeat(img_i[:, :, None], 3, axis=-1)
-            resize_img_skimg = transform.resize(
-                img_3c,
-                (image_size, image_size),
-                order=3,
-                preserve_range=True,
-                mode="constant",
-                anti_aliasing=True,
-            )
-            resize_img_skimg_01 = (resize_img_skimg - resize_img_skimg.min()) / np.clip(
-                resize_img_skimg.max() - resize_img_skimg.min(), a_min=1e-8, a_max=None
+
+            img_01 = (img_3c - img_3c.min()) / np.clip(
+                img_3c.max() - img_3c.min(), a_min=1e-8, a_max=None
             )  # normalize to [0, 1], (H, W, 3)
+
             gt_i = gt_roi[i, :, :]
-            resize_gt_skimg = transform.resize(
-                gt_i,
-                (image_size, image_size),
-                order=0,
-                preserve_range=True,
-                mode="constant",
-                anti_aliasing=False,
-            )
-            resize_gt_skimg = np.uint8(resize_gt_skimg)
-            assert resize_img_skimg_01.shape[:2] == resize_gt_skimg.shape
+
+            gt_i = np.uint8(gt_i)
+            assert img_01.shape[:2] == gt_i.shape
             np.save(
                 join(
                     npy_path,
@@ -166,7 +193,7 @@ for name in tqdm(names[:40]):  # use the remaining 10 cases for validation
                     + str(i).zfill(3)
                     + ".npy",
                 ),
-                resize_img_skimg_01,
+                img_01,
             )
             np.save(
                 join(
@@ -178,5 +205,11 @@ for name in tqdm(names[:40]):  # use the remaining 10 cases for validation
                     + str(i).zfill(3)
                     + ".npy",
                 ),
-                resize_gt_skimg,
+                gt_i,
             )
+
+if __name__ == "__main__":
+    with mp.Pool(num_workers) as p:
+        with tqdm(total=len(names)) as pbar:
+            for i, _ in tqdm(enumerate(p.imap_unordered(preprocess, names))):
+                pbar.update()

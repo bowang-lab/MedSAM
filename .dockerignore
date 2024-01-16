@@ -1,0 +1,7 @@
+*.md
+!README.md
+*.npz
+*.csv
+.git
+**/test_demo
+test_demo/**/*
