@@ -88,6 +88,7 @@ python npz_to_npy.py \
     -npz_dir data/MedSAM_train \ ## path to the preprocessed npz training data
     -npy_dir data/npy \ ## path to save the converted npy data for training
     -num_workers 4 ## number of workers for conversion in parallel
+```
 
 ### Fine-tune pretrained Lite-MedSAM
 
