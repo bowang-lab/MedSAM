@@ -25,7 +25,7 @@ The codebase is tested with: `Ubuntu 20.04` | Python `3.10` | `CUDA 11.8` | `Pyt
 - Run the following command for a sanity test
 
 ```bash
-python CVPR24_LiteMedSAM_infer -i test_demo/imgs/ -o test_demo/segs
+python CVPR24_LiteMedSAM_infer.py -i test_demo/imgs/ -o test_demo/segs
 ```
 
 
