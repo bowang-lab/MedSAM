@@ -24,8 +24,6 @@ parser.add_argument("-img_name_suffix", type=str, default="_0000.nii.gz",
                     help="Suffix of the image name, [default: _0000.nii.gz]")
 parser.add_argument("-gt_name_suffix", type=str, default=".nii.gz",
                     help="Suffix of the ground truth name, [default: .nii.gz]")
-parser.add_argument("-prefix", type=str, default="CT_Abd_",
-                    help="Prefix of the npz file name, [default: CT_Abd_]")
 parser.add_argument("-img_path", type=str, default="data/FLARE22Train/images",
                     help="Path to the nii images, [default: data/FLARE22Train/images]")
 parser.add_argument("-gt_path", type=str, default="data/FLARE22Train/labels",
