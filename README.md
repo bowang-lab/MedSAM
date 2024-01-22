@@ -115,7 +115,9 @@ If you only want to train the mask decoder, please check the tutorial on the [0.
 @article{MedSAM,
   title={Segment Anything in Medical Images},
   author={Ma, Jun and He, Yuting and Li, Feifei and Han, Lin and You, Chenyu and Wang, Bo},
-  journal={arXiv preprint arXiv:2304.12306},
-  year={2023}
+  journal={Nature Communications},
+  volume={15},
+  pages={1--9},
+  year={2024}
 }
 ```
