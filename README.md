@@ -48,10 +48,11 @@ python gui.py
 
 Load the image to the GUI and specify segmentation targets by drawing bounding boxes.
 
-![seg_demo](assets/seg_demo.gif)
 
 
-https://github.com/bowang-lab/MedSAM/assets/19947331/42db8cae-6ad1-41d3-8db7-013ccf8b28b1
+https://github.com/bowang-lab/MedSAM/assets/19947331/a8d94b4d-0221-4d09-a43a-1251842487ee
+
+
 
 
 
