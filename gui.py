@@ -46,7 +46,11 @@ np.random.seed(2023)
 SAM_MODEL_TYPE = "vit_b"
 MedSAM_CKPT_PATH = "work_dir/MedSAM/medsam_vit_b.pth"
 MEDSAM_IMG_INPUT_SIZE = 1024
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 @torch.no_grad()
