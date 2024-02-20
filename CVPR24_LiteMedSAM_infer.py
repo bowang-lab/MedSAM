@@ -15,6 +15,7 @@ import cv2
 import argparse
 from collections import OrderedDict
 import pandas as pd
+from datetime import datetime
 
 
 #%% set seeds
@@ -395,7 +396,7 @@ def MedSAM_infer_npz_2D(img_npz_file):
         box256 = box256[None, ...] # (1, 4)
         medsam_mask, iou_pred = medsam_inference(medsam_lite_model, image_embedding, box256, (newh, neww), (H, W))
         segs[medsam_mask>0] = idx
-        print(f'{npz_name}, box: {box}, predicted iou: {np.round(iou_pred.item(), 4)}')
+        # print(f'{npz_name}, box: {box}, predicted iou: {np.round(iou_pred.item(), 4)}')
    
     np.savez_compressed(
         join(pred_save_dir, npz_name),
@@ -432,14 +433,15 @@ def MedSAM_infer_npz_3D(img_npz_file):
     boxes_3D = npz_data['boxes'] # [[x_min, y_min, z_min, x_max, y_max, z_max]]
 
     for idx, box3D in enumerate(boxes_3D, start=1):
+        segs_3d_temp = np.zeros_like(img_3D, dtype=np.uint8) 
         x_min, y_min, z_min, x_max, y_max, z_max = box3D
         assert z_min < z_max, f"z_min should be smaller than z_max, but got {z_min=} and {z_max=}"
         mid_slice_bbox_2d = np.array([x_min, y_min, x_max, y_max])
         z_middle = int((z_max - z_min)/2 + z_min)
 
         # infer from middle slice to the z_max
-        print(npz_name, 'infer from middle slice to the z_max')
-        for z in tqdm(range(z_middle, z_max)):
+        # print(npz_name, 'infer from middle slice to the z_max')
+        for z in range(z_middle, z_max):
             img_2d = img_3D[z, :, :]
             if len(img_2d.shape) == 2:
                 img_3c = np.repeat(img_2d[:, :, None], 3, axis=-1)
@@ -472,11 +474,11 @@ def MedSAM_infer_npz_3D(img_npz_file):
                 else:
                     box_256 = resize_box_to_256(mid_slice_bbox_2d, original_size=(H, W))
             img_2d_seg, iou_pred = medsam_inference(medsam_lite_model, image_embedding, box_256, [new_H, new_W], [H, W])
-            segs[z, img_2d_seg>0] = idx
-
+            segs_3d_temp[z, img_2d_seg>0] = idx
+        
         # infer from middle slice to the z_max
-        print(npz_name, 'infer from middle slice to the z_min')
-        for z in tqdm(range(z_middle-1, z_min, -1)):
+        # print(npz_name, 'infer from middle slice to the z_min')
+        for z in range(z_middle-1, z_min, -1):
             img_2d = img_3D[z, :, :]
             if len(img_2d.shape) == 2:
                 img_3c = np.repeat(img_2d[:, :, None], 3, axis=-1)
@@ -507,8 +509,8 @@ def MedSAM_infer_npz_3D(img_npz_file):
                 scale_256 = 256 / max(H, W)
                 box_256 = mid_slice_bbox_2d * scale_256
             img_2d_seg, iou_pred = medsam_inference(medsam_lite_model, image_embedding, box_256, [new_H, new_W], [H, W])
-            segs[z, img_2d_seg>0] = idx
-    
+            segs_3d_temp[z, img_2d_seg>0] = idx
+        segs[segs_3d_temp>0] = idx
     np.savez_compressed(
         join(pred_save_dir, npz_name),
         segs=segs,
@@ -552,5 +554,7 @@ if __name__ == '__main__':
         end_time = time()
         efficiency['case'].append(basename(img_npz_file))
         efficiency['time'].append(end_time - start_time)
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(current_time, 'file name:', basename(img_npz_file), 'time cost:', np.round(end_time - start_time, 4))
     efficiency_df = pd.DataFrame(efficiency)
     efficiency_df.to_csv(join(pred_save_dir, 'efficiency.csv'), index=False)
