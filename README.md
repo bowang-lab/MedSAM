@@ -72,7 +72,6 @@ python pre_CT_MR.py \
     -gt_name_suffix .nii.gz \ ## extension of training labels
     -output_path data \ ## path to save the preprocessed data
     -num_workers 4 \ ## number of workers for preprocessing
-    -prefix CT_Abd_ \ ## prefix of the preprocessed data
     -modality CT \ ## modality of the preprocessed data
     -anatomy Abd \ ## anatomy of the preprocessed data
     -window_level 40 \ ## window level for CT
