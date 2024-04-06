@@ -30,9 +30,9 @@ For additional command line arguments, see `python train_one_gpu_scribble.py -h`
 
 ## Automatic Generation of Scribbles
 
-Please note that for training, `sampler.py` and `scribble.py` are used for faster automatic scribble generation whereas here we use `sampler.py` and `scribble.py` to generate refined scribbles.
+Please note that for training, `sampler.py` and `scribble.py` in `visual_sampler` are used for faster automatic scribble generation whereas here we use `sampler.py` and `scribble.py` to generate refined scribbles.
 
-### Installating Dependencies
+### Installing Dependencies
 
 In addition to the packages installed for MedSAM, please install `cc3d` and `largestinteriorrectangle`.
 
