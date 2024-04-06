@@ -1,0 +1,1 @@
+from .interactive_orig import interactive_infer_image
