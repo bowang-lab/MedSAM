@@ -24,7 +24,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     '-medsam_lite_checkpoint_path',
     type=str,
-    default= '/home/sumin2/Documents/MedSAM/checkpoints/medsam_lite_scribble.pth', 
+    default= './checkpoints/medsam_lite_scribble.pth', 
     help='path to the checkpoint of MedSAM-Lite',
     required=False
 )
