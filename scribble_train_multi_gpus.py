@@ -26,6 +26,9 @@ import torch.nn.functional as F
 from matplotlib import pyplot as plt
 import argparse
 
+from visual_sampler.sampler import build_shape_sampler
+from visual_sampler.config import cfg
+
 torch.cuda.empty_cache()
 os.environ["OMP_NUM_THREADS"] = "4" # export OMP_NUM_THREADS=4
 os.environ["OPENBLAS_NUM_THREADS"] = "4" # export OPENBLAS_NUM_THREADS=4 
@@ -37,12 +40,12 @@ os.environ["NUMEXPR_NUM_THREADS"] = "6" # export NUMEXPR_NUM_THREADS=6
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--tr_npy_path', type=str,
-                        default='data/npy',
+                        default='',
                         help='Path to training npy files; two subfolders: gts and imgs')
-    parser.add_argument('-task_name', type=str, default='MedSAM-Lite')
-    parser.add_argument('-pretrained_checkpoint', type=str, default='lite_medsam.pth',
+    parser.add_argument('-task_name', type=str, default='LiteMedSAM_scribble')
+    parser.add_argument('-pretrained_checkpoint', type=str, default=None,
                         help='Path to pretrained MedSAM-Lite checkpoint')
-    parser.add_argument('-work_dir', type=str, default='./work_dir')
+    parser.add_argument('-work_dir', type=str, default='./work_dir_scribble')
     parser.add_argument('--data_aug', action='store_true', default=False,
                         help='use data augmentation during training')
     # train
@@ -119,18 +122,21 @@ def revert_sync_batchnorm(module: torch.nn.Module) -> torch.nn.Module:
 
     return converted_module
 
-
 class NpyDataset(Dataset): 
-    def __init__(self, data_root, image_size=256, bbox_shift=10, data_aug=True):
+    def __init__(self, data_root, image_size=256, data_aug=True):
         self.data_root = data_root
-        self.gt_path = join(data_root, 'gts')
-        self.img_path = join(data_root, 'imgs')
-        self.gt_path_files = sorted(glob(join(self.gt_path, '*.npy'), recursive=True))
-        self.gt_path_files = [file for file in self.gt_path_files if isfile(join(self.img_path, basename(file)))]
+        self.gt_path = join(data_root, 'lesion-gts')
+        self.img_path = join(data_root, 'lesion-imgs')
+        self.gt_path_files = sorted(glob(join(self.gt_path, '**/*.npy'), recursive=True))
+        self.gt_path_files = [
+            file for file in self.gt_path_files
+            if isfile(join(self.img_path, basename(file)))
+        ]
+        print(f"Found {len(self.gt_path_files)} images")
         self.image_size = image_size
         self.target_length = image_size
-        self.bbox_shift = bbox_shift
         self.data_aug = data_aug
+        self.shape_sampler = build_shape_sampler(cfg)
     
     def __len__(self):
         return len(self.gt_path_files)
@@ -139,15 +145,14 @@ class NpyDataset(Dataset):
         img_name = basename(self.gt_path_files[index])
         assert img_name == basename(self.gt_path_files[index]), 'img gt name error' + self.gt_path_files[index] + self.npy_files[index]
         img_3c = np.load(join(self.img_path, img_name), 'r', allow_pickle=True) # (H, W, 3)
-        # Resizing and normalization
         img_resize = self.resize_longest_side(img_3c)
+        # Resizing
         img_resize = (img_resize - img_resize.min()) / np.clip(img_resize.max() - img_resize.min(), a_min=1e-8, a_max=None) # normalize to [0, 1], (H, W, 3
         img_padded = self.pad_image(img_resize) # (256, 256, 3)
         # convert the shape to (3, H, W)
         img_padded = np.transpose(img_padded, (2, 0, 1)) # (3, 256, 256)
         assert np.max(img_padded)<=1.0 and np.min(img_padded)>=0.0, 'image should be normalized to [0, 1]'
         gt = np.load(self.gt_path_files[index], 'r', allow_pickle=True) # multiple labels [0, 1,4,5...], (256,256)
-        assert gt.max() >= 1, 'gt should have at least one label'
         gt = cv2.resize(
             gt,
             (img_resize.shape[1], img_resize.shape[0]),
@@ -171,20 +176,11 @@ class NpyDataset(Dataset):
                 gt2D = np.ascontiguousarray(np.flip(gt2D, axis=-2))
                 # print('DA with flip upside down')
         gt2D = np.uint8(gt2D > 0)
-        y_indices, x_indices = np.where(gt2D > 0)
-        x_min, x_max = np.min(x_indices), np.max(x_indices)
-        y_min, y_max = np.min(y_indices), np.max(y_indices)
-        # add perturbation to bounding box coordinates
-        H, W = gt2D.shape
-        x_min = max(0, x_min - random.randint(0, self.bbox_shift))
-        x_max = min(W, x_max + random.randint(0, self.bbox_shift))
-        y_min = max(0, y_min - random.randint(0, self.bbox_shift))
-        y_max = min(H, y_max + random.randint(0, self.bbox_shift))
-        bboxes = np.array([x_min, y_min, x_max, y_max])
+        scribbles = (self.shape_sampler(gt2D) * 1).squeeze()
         return {
             "image": torch.tensor(img_padded).float(),
             "gt2D": torch.tensor(gt2D[None, :,:]).long(),
-            "bboxes": torch.tensor(bboxes[None, None, ...]).float(), # (B, 1, 4)
+            "scribbles": scribbles[None, ...].clone().detach().float(), 
             "image_name": img_name,
             "new_size": torch.tensor(np.array([img_resize.shape[0], img_resize.shape[1]])).long(),
             "original_size": torch.tensor(np.array([img_3c.shape[0], img_3c.shape[1]])).long()
@@ -218,25 +214,13 @@ class NpyDataset(Dataset):
 
         return image_padded
 
-def collate_fn(batch):
-    """
-    Collate function for PyTorch DataLoader.
-    """
-    batch_dict = {}
-    for key in batch[0].keys():
-        if key == "image_name":
-            batch_dict[key] = [sample[key] for sample in batch]
-        else:
-            batch_dict[key] = torch.stack([sample[key] for sample in batch], dim=0)
-
-    return batch_dict
 
 #%% sanity test of dataset class
 def sanity_check_dataset(args):
     print('tr_npy_path', args.tr_npy_path)
     tr_dataset = NpyDataset(args.tr_npy_path, data_aug=args.data_aug)
     print('len(tr_dataset)', len(tr_dataset))
-    tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
+    tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
     makedirs(args.work_dir, exist_ok=True)
     for step, batch in enumerate(tr_dataloader):
         # print(image.shape, gt.shape, bboxes.shape)
@@ -246,26 +230,26 @@ def sanity_check_dataset(args):
 
         image = batch["image"]
         gt = batch["gt2D"]
-        bboxes = batch["bboxes"]
+        masks = batch['scribbles']
         names_temp = batch["image_name"]
 
         axs[0].imshow(image[idx].cpu().permute(1,2,0).numpy())
         show_mask(gt[idx].cpu().squeeze().numpy(), axs[0])
-        show_box(bboxes[idx].numpy().squeeze(), axs[0])
+        show_mask(masks[idx].numpy().squeeze(), axs[0])
         axs[0].axis('off')
         # set title
         axs[0].set_title(names_temp[idx])
         idx = random.randint(4, 7)
         axs[1].imshow(image[idx].cpu().permute(1,2,0).numpy())
         show_mask(gt[idx].cpu().squeeze().numpy(), axs[1])
-        show_box(bboxes[idx].numpy().squeeze(), axs[1])
+        show_mask(masks[idx].numpy().squeeze(), axs[1])
         axs[1].axis('off')
         # set title
         axs[1].set_title(names_temp[idx])
         # plt.show()  
         plt.subplots_adjust(wspace=0.01, hspace=0)
         plt.savefig(
-            join(args.work_dir, 'medsam_lite-train_bbox_prompt_sanitycheck_DA.png'),
+            join(args.work_dir, 'medsam_lite-train_scribble_prompt_sanitycheck_DA.png'),
             bbox_inches='tight',
             dpi=300
         )
@@ -278,21 +262,21 @@ class MedSAM_Lite(nn.Module):
                 image_encoder, 
                 mask_decoder,
                 prompt_encoder
-        ):
+                ):
         super().__init__()
         self.image_encoder = image_encoder
         self.mask_decoder = mask_decoder
         self.prompt_encoder = prompt_encoder
-
-    def forward(self, image, boxes):
+        
+    def forward(self, image, masks):
         image_embedding = self.image_encoder(image) # (B, 256, 64, 64)
 
         sparse_embeddings, dense_embeddings = self.prompt_encoder(
             points=None,
-            boxes=boxes,
-            masks=None,
+            boxes=None, 
+            masks=masks,
         )
-        low_res_logits, iou_predictions = self.mask_decoder(
+        low_res_masks, iou_predictions = self.mask_decoder(
             image_embeddings=image_embedding, # (B, 256, 64, 64)
             image_pe=self.prompt_encoder.get_dense_pe(), # (1, 256, 64, 64)
             sparse_prompt_embeddings=sparse_embeddings, # (B, 2, 256)
@@ -300,7 +284,7 @@ class MedSAM_Lite(nn.Module):
             multimask_output=False,
           ) # (B, 1, 256, 256)
 
-        return low_res_logits, iou_predictions
+        return low_res_masks, iou_predictions
 
     @torch.no_grad()
     def postprocess_masks(self, masks, new_size, original_size):
@@ -394,11 +378,11 @@ def main_worker(gpu, ngpus_per_node, args):
         prompt_encoder = medsam_lite_prompt_encoder
     )
     
-    if (not os.path.exists(args.resume)) and isfile(args.pretrained_checkpoint):
+    if args.pretrained_checkpoint and isfile(args.pretrained_checkpoint):
         ## Load pretrained checkpoint if there's no checkpoint to resume from and there's a pretrained checkpoint
         print(f"Loading pretrained checkpoint from {args.pretrained_checkpoint}")
         medsam_lite_checkpoint = torch.load(args.pretrained_checkpoint, map_location="cpu")
-        medsam_lite_model.load_state_dict(medsam_lite_checkpoint, strict=True)
+        medsam_lite_model.load_state_dict(medsam_lite_checkpoint, strict=False)
 
     medsam_lite_model = medsam_lite_model.to(device)
 
@@ -448,7 +432,7 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=num_workers,
         pin_memory=True,
         sampler=train_sampler,
-        collate_fn=collate_fn
+        #collate_fn=collate_fn
     )
     # %%
 
@@ -482,10 +466,10 @@ def main_worker(gpu, ngpus_per_node, args):
         for step, batch in enumerate(pbar):
             image = batch["image"]
             gt2D = batch["gt2D"]
-            boxes = batch["bboxes"]
+            masks = batch['scribbles']
             optimizer.zero_grad()
-            image, gt2D, boxes = image.to(device), gt2D.to(device), boxes.to(device)
-            logits_pred, iou_pred = medsam_lite_model(image, boxes)
+            image, gt2D, masks = image.to(device), gt2D.to(device), masks.to(device)
+            logits_pred, iou_pred = medsam_lite_model(image, masks)
             l_seg = seg_loss(logits_pred, gt2D)
             l_ce = ce_loss(logits_pred, gt2D.float())
             mask_loss = l_seg + l_ce
@@ -498,6 +482,10 @@ def main_worker(gpu, ngpus_per_node, args):
             optimizer.step()
             optimizer.zero_grad()
             pbar.set_description(f"[RANK {rank}] Epoch {epoch} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, loss: {loss.item():.4f}")
+
+            ## show smi
+            if is_main_host and step == 10 and epoch == 0:
+                os.system('nvidia-smi')
 
         epoch_end_time = time()
         epoch_duration = epoch_end_time - epoch_start_time

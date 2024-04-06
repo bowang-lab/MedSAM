@@ -22,10 +22,13 @@ import torch.nn.functional as F
 
 from matplotlib import pyplot as plt
 import argparse
+
+from visual_sampler.sampler import build_shape_sampler
+from visual_sampler.config import cfg
 # %%
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "-data_root", type=str, default="./data/npy",
+    "-data_root", type=str, default="",
     help="Path to the npy data root."
 )
 parser.add_argument(
@@ -37,15 +40,15 @@ parser.add_argument(
     help="Path to the checkpoint to continue training."
 )
 parser.add_argument(
-    "-work_dir", type=str, default="./workdir",
+    "-work_dir", type=str, default="",
     help="Path to the working directory where checkpoints and logs will be saved."
 )
 parser.add_argument(
-    "-num_epochs", type=int, default=10,
+    "-num_epochs", type=int, default=1000,
     help="Number of epochs to train."
 )
 parser.add_argument(
-    "-batch_size", type=int, default=4,
+    "-batch_size", type=int, default=1,
     help="Batch size."
 )
 parser.add_argument(
@@ -55,10 +58,6 @@ parser.add_argument(
 parser.add_argument(
     "-device", type=str, default="cuda:0",
     help="Device to train on."
-)
-parser.add_argument(
-    "-bbox_shift", type=int, default=5,
-    help="Perturbation to bounding box coordinates during training."
 )
 parser.add_argument(
     "-lr", type=float, default=0.00005,
@@ -94,7 +93,6 @@ num_epochs = args.num_epochs
 batch_size = args.batch_size
 num_workers = args.num_workers
 device = args.device
-bbox_shift = args.bbox_shift
 lr = args.lr
 weight_decay = args.weight_decay
 iou_loss_weight = args.iou_loss_weight
@@ -104,6 +102,10 @@ do_sancheck = args.sanity_check
 checkpoint = args.resume
 
 makedirs(work_dir, exist_ok=True)
+
+run_id = datetime.now().strftime("%Y%m%d-%H%M")
+model_save_path = join(args.work_dir, 'litemedsam_scribble' + '-' + run_id)
+makedirs(model_save_path, exist_ok=True)
 
 # %%
 torch.cuda.empty_cache()
@@ -138,19 +140,20 @@ def cal_iou(result, reference):
 
 # %%
 class NpyDataset(Dataset): 
-    def __init__(self, data_root, image_size=256, bbox_shift=5, data_aug=True):
+    def __init__(self, data_root, image_size=256, data_aug=True):
         self.data_root = data_root
         self.gt_path = join(data_root, 'gts')
         self.img_path = join(data_root, 'imgs')
-        self.gt_path_files = sorted(glob(join(self.gt_path, '*.npy'), recursive=True))
+        self.gt_path_files = sorted(glob(join(self.gt_path, 'CT_AbdTumor/*.npy'), recursive=True))
         self.gt_path_files = [
             file for file in self.gt_path_files
             if isfile(join(self.img_path, basename(file)))
         ]
+        print(f"Found {len(self.gt_path_files)} images")
         self.image_size = image_size
         self.target_length = image_size
-        self.bbox_shift = bbox_shift
         self.data_aug = data_aug
+        self.shape_sampler = build_shape_sampler(cfg)
     
     def __len__(self):
         return len(self.gt_path_files)
@@ -190,20 +193,11 @@ class NpyDataset(Dataset):
                 gt2D = np.ascontiguousarray(np.flip(gt2D, axis=-2))
                 # print('DA with flip upside down')
         gt2D = np.uint8(gt2D > 0)
-        y_indices, x_indices = np.where(gt2D > 0)
-        x_min, x_max = np.min(x_indices), np.max(x_indices)
-        y_min, y_max = np.min(y_indices), np.max(y_indices)
-        # add perturbation to bounding box coordinates
-        H, W = gt2D.shape
-        x_min = max(0, x_min - random.randint(0, self.bbox_shift))
-        x_max = min(W, x_max + random.randint(0, self.bbox_shift))
-        y_min = max(0, y_min - random.randint(0, self.bbox_shift))
-        y_max = min(H, y_max + random.randint(0, self.bbox_shift))
-        bboxes = np.array([x_min, y_min, x_max, y_max])
+        scribbles = (self.shape_sampler(gt2D) * 1).squeeze()
         return {
             "image": torch.tensor(img_padded).float(),
             "gt2D": torch.tensor(gt2D[None, :,:]).long(),
-            "bboxes": torch.tensor(bboxes[None, None, ...]).float(), # (B, 1, 4)
+            "scribbles": scribbles[None, ...].clone().detach().float(), 
             "image_name": img_name,
             "new_size": torch.tensor(np.array([img_resize.shape[0], img_resize.shape[1]])).long(),
             "original_size": torch.tensor(np.array([img_3c.shape[0], img_3c.shape[1]])).long()
@@ -249,25 +243,25 @@ if do_sancheck:
 
         image = batch["image"]
         gt = batch["gt2D"]
-        bboxes = batch["bboxes"]
+        masks = batch['scribbles']
         names_temp = batch["image_name"]
 
         axs[0].imshow(image[idx].cpu().permute(1,2,0).numpy())
         show_mask(gt[idx].cpu().squeeze().numpy(), axs[0])
-        show_box(bboxes[idx].numpy().squeeze(), axs[0])
+        show_mask(masks[idx].numpy().squeeze(), axs[0])
         axs[0].axis('off')
         # set title
         axs[0].set_title(names_temp[idx])
         idx = random.randint(4, 7)
         axs[1].imshow(image[idx].cpu().permute(1,2,0).numpy())
         show_mask(gt[idx].cpu().squeeze().numpy(), axs[1])
-        show_box(bboxes[idx].numpy().squeeze(), axs[1])
+        show_mask(masks[idx].numpy().squeeze(), axs[1])
         axs[1].axis('off')
         # set title
         axs[1].set_title(names_temp[idx])
         plt.subplots_adjust(wspace=0.01, hspace=0)
         plt.savefig(
-            join(work_dir, 'medsam_lite-train_bbox_prompt_sanitycheck_DA.png'),
+            join(model_save_path, 'medsam_lite-train_bbox_prompt_sanitycheck_DA.png'),
             bbox_inches='tight',
             dpi=300
         )
@@ -286,13 +280,13 @@ class MedSAM_Lite(nn.Module):
         self.mask_decoder = mask_decoder
         self.prompt_encoder = prompt_encoder
         
-    def forward(self, image, boxes):
+    def forward(self, image, masks):
         image_embedding = self.image_encoder(image) # (B, 256, 64, 64)
 
         sparse_embeddings, dense_embeddings = self.prompt_encoder(
             points=None,
-            boxes=boxes,
-            masks=None,
+            boxes=None, 
+            masks=masks,
         )
         low_res_masks, iou_predictions = self.mask_decoder(
             image_embeddings=image_embedding, # (B, 256, 64, 64)
@@ -427,10 +421,11 @@ for epoch in range(start_epoch + 1, num_epochs):
     for step, batch in enumerate(pbar):
         image = batch["image"]
         gt2D = batch["gt2D"]
-        boxes = batch["bboxes"]
+        # boxes = batch["bboxes"]
+        masks = batch['scribbles']
         optimizer.zero_grad()
-        image, gt2D, boxes = image.to(device), gt2D.to(device), boxes.to(device)
-        logits_pred, iou_pred = medsam_lite_model(image, boxes)
+        image, gt2D, masks = image.to(device), gt2D.to(device), masks.to(device)
+        logits_pred, iou_pred = medsam_lite_model(image, masks)
         l_seg = seg_loss(logits_pred, gt2D)
         l_ce = ce_loss(logits_pred, gt2D.float())
         #mask_loss = l_seg + l_ce
@@ -457,12 +452,12 @@ for epoch in range(start_epoch + 1, num_epochs):
         "loss": epoch_loss_reduced,
         "best_loss": best_loss,
     }
-    torch.save(checkpoint, join(work_dir, "medsam_lite_latest.pth"))
+    torch.save(checkpoint, join(model_save_path, "litemedsam_scribble_latest.pth"))
     if epoch_loss_reduced < best_loss:
         print(f"New best loss: {best_loss:.4f} -> {epoch_loss_reduced:.4f}")
         best_loss = epoch_loss_reduced
         checkpoint["best_loss"] = best_loss
-        torch.save(checkpoint, join(work_dir, "medsam_lite_best.pth"))
+        torch.save(checkpoint, join(model_save_path, "litemedsam_scribble_best.pth"))
 
     epoch_loss_reduced = 1e10
     # %% plot loss
@@ -470,5 +465,5 @@ for epoch in range(start_epoch + 1, num_epochs):
     plt.title("Dice + Binary Cross Entropy + IoU Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.savefig(join(work_dir, "train_loss.png"))
+    plt.savefig(join(model_save_path, "train_loss.png"))
     plt.close()
