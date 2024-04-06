@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from .point import Point
-from .scribble import Scribble
+from .scribble_v2 import Scribble
 from .circle import Circle
 
 from .config import configurable

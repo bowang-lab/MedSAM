@@ -5,21 +5,56 @@ import functools
 import inspect
 
 
+
+
 cfg = {
     'STROKE_SAMPLER':
             {
             'MAX_CANDIDATE': 1,
-                'CANDIDATE_PROBS': [0.5, 0.5], #[0.25, 0.50, 0.25],
+                'CANDIDATE_PROBS': [1.0, 0.0], #[0.25, 0.50, 0.25],
                 'CANDIDATE_NAMES': ["Scribble", "Circle"], #["Point", "Scribble", "Circle"],
             'CIRCLE': {
                 'NUM_STROKES': 1,
                 'STROKE_PRESET': ['object_like', 'object_like_middle', 'object_like_small'],
-                'STROKE_PROB': [0.33, 0.33, 0.33]
+                'STROKE_PROB': [0, 0, 0.0]
             },
             'SCRIBBLE': {
                 'NUM_STROKES': 1,
                 'STROKE_PRESET': ['rand_curve', 'rand_curve_small'],
-                'STROKE_PROB': [0.5, 0.5]
+                'STROKE_PROB': [1.0, 0.0]
+            },
+            'POINT': {
+                'NUM_POINTS': 20
+            },
+            'POLYGON': {
+                'MAX_POINTS': 9
+            },
+            'EVAL': {
+                'MODE': 'best',  # best/random/best_random
+                'NEGATIVE': False,
+                'MAX_ITER': 1,  # 20
+                'IOU_ITER': 1,
+                'GROUNDING': False
+            }
+        }
+
+}
+
+cfg_tiny = {
+    'STROKE_SAMPLER':
+            {
+            'MAX_CANDIDATE': 1,
+                'CANDIDATE_PROBS': [1.0, 0.0], #[0.25, 0.50, 0.25],
+                'CANDIDATE_NAMES': ["Scribble", "Circle"], #["Point", "Scribble", "Circle"],
+            'CIRCLE': {
+                'NUM_STROKES': 1,
+                'STROKE_PRESET': ['object_like', 'object_like_middle', 'object_like_small'],
+                'STROKE_PROB': [0, 0, 0.0]
+            },
+            'SCRIBBLE': {
+                'NUM_STROKES': 1,
+                'STROKE_PRESET': ['rand_curve', 'rand_curve_small', 'rand_curve_tiny'],
+                'STROKE_PROB': [0.0, 0.0, 1.0]
             },
             'POINT': {
                 'NUM_POINTS': 20
@@ -173,3 +208,36 @@ def _get_args_from_config(from_config_func, *args, **kwargs):
         # forward the other arguments to __init__
         ret.update(extra_kwargs)
     return ret
+
+#cfg_small = {
+#     'STROKE_SAMPLER':
+#             {
+#             'MAX_CANDIDATE': 1,
+#                 'CANDIDATE_PROBS': [1.0, 0.0], #[0.25, 0.50, 0.25],
+#                 'CANDIDATE_NAMES': ["Scribble", "Circle"], #["Point", "Scribble", "Circle"],
+#             'CIRCLE': {
+#                 'NUM_STROKES': 1,
+#                 'STROKE_PRESET': ['object_like', 'object_like_middle', 'object_like_small'],
+#                 'STROKE_PROB': [0, 0, 0.0]
+#             },
+#             'SCRIBBLE': {
+#                 'NUM_STROKES': 1,
+#                 'STROKE_PRESET': ['rand_curve', 'rand_curve_small'],
+#                 'STROKE_PROB': [0.0, 1.0]
+#             },
+#             'POINT': {
+#                 'NUM_POINTS': 20
+#             },
+#             'POLYGON': {
+#                 'MAX_POINTS': 9
+#             },
+#             'EVAL': {
+#                 'MODE': 'best',  # best/random/best_random
+#                 'NEGATIVE': False,
+#                 'MAX_ITER': 1,  # 20
+#                 'IOU_ITER': 1,
+#                 'GROUNDING': False
+#             }
+#         }
+
+# }
