@@ -6,7 +6,7 @@ import glob
 import argparse
 import cv2
 
-from visual_sampler.sampler import build_shape_sampler
+from visual_sampler.sampler_v2 import build_shape_sampler
 from visual_sampler.config import cfg
 # %%
 parser = argparse.ArgumentParser()
