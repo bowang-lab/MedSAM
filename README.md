@@ -51,7 +51,7 @@ python generate_scribbles_train.py -root ./scribble-train-demo -save_path ./trai
 ```
 
 ### Demo Inference script 
-The interactive scribble prompt inference can be run using the following command:
+The interactive scribble prompt inference can be run using the following command. Please drag an image to the input, draw a scribble on it, and submit it to get the output mask using the Gradio API.
 
 ```bash
 python demo_scribble_LiteMedSAM.py -medsam_lite_checkpoint_path ./checkpoints/medsam_lite_scribble.pth
