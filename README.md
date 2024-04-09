@@ -21,7 +21,7 @@ The codebase is tested with: `Ubuntu 20.04` | Python `3.10` | `CUDA 11.8` | `Pyt
 ### Sanity test
 
 - Download the LiteMedSAM checkpoint here and put it in `work_dir/LiteMedSAM`.
-- Download the demo data [here](https://drive.google.com/drive/folders/1t3Rs9QbfGSEv2fIFlk8vi7jc0SclD1cq?usp=sharing)
+- Download the demo data `demo_scribble.zip` [here](https://drive.google.com/drive/folders/1t3Rs9QbfGSEv2fIFlk8vi7jc0SclD1cq?usp=sharing)
 - Run the following command for a sanity test
 
 ```bash
