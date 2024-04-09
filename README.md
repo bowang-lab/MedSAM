@@ -39,6 +39,43 @@ In addition to the packages installed for MedSAM, please install `cc3d` and `lar
 1. pip install connected-components-3d
 2. pip install largestinteriorrectangle
 
+
+
+
+## Quick tutorial on making submissions to CVPR 2024 MedSAM on Laptop Challenge
+
+### Sanity test
+- Download the LiteMedSAM checkpoint here and put it in `work_dir/LiteMedSAM`.
+- Download the demo data [here](https://drive.google.com/drive/folders/1QOpXVpx-E05mviafi_wMMkkLs6VAMkCR)
+- Run the following command for a sanity test
+
+```bash
+python CVPR24_LiteMedSAM_infer_scribble.py -i demo_scribble/imgs -o demo_scribble/segs
+```
+
+### Build Docker
+```bash
+docker build -f Dockerfile -t litemedsam .
+```
+> Note: don't forget the `.` in the end
+Run the docker on the testing demo images
+```bash
+docker container run -m 8G --name litemedsam --rm -v $PWD/test_demo/imgs/:/workspace/inputs/ -v $PWD/test_demo/litemedsam-seg/:/workspace/outputs/ litemedsam:latest /bin/bash -c "sh predict.sh"
+```
+> Note: please run `chmod -R 777 ./*` if you run into `Permission denied` error.
+
+### Save docker 
+
+```bash
+docker save litemedsam | gzip -c > litemedsam.tar.gz
+```
+
+### Compute Metrics
+
+```bash
+python evaluation/compute_metrics.py -s test_demo/litemedsam-seg -g test_demo/gts -csv_dir ./metrics.csv
+```
+
 ### Prepare Demo Train Dataset
 - We prepared a small subset of the train data in `scribble-train-demo`. Please download it.
 
