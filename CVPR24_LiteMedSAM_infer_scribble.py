@@ -190,9 +190,7 @@ def show_mask(mask, ax, mask_color=None, alpha=0.5):
 @torch.no_grad()
 def medsam_inference(medsam_model, img_embed, scribble, new_size, original_size):
     scribble_torch = torch.as_tensor(scribble, dtype=torch.float, device=img_embed.device)
-    # if len(scribble_torch.shape) == 2:
-    #     scribble_torch = scribble_torch[:, None, :] # (B, 1, 4)
-    
+
     sparse_embeddings, dense_embeddings = medsam_model.prompt_encoder(
         points = None,
         boxes = None,
@@ -269,18 +267,11 @@ medsam_lite_model.eval()
 # %%
 def MedSAM_infer_npz(gt_path_file):
     npz_name = basename(gt_path_file)
-    #if (not isfile(join(pred_save_dir, task_folder, npz_name))) or overwrite:
     npz_data = np.load(gt_path_file, 'r', allow_pickle=True) # (H, W, 3)
     img_3c = npz_data['imgs'] # (H, W, 3)
     assert np.max(img_3c)<256, f'input data should be in range [0, 255], but got {np.unique(img_3c)}'
     H, W = img_3c.shape[:2]
-    #gts = npz_data['gts']
     scribble = npz_data['scribbles']
-    # if gts.shape != (H, W):
-    #     gts = cv2.resize(
-    #         gts.astype(np.uint8), (W, H),
-    #         interpolation=cv2.INTER_NEAREST
-    #     ).astype(np.uint8)
     segs = np.zeros(img_3c.shape[:2], dtype=np.uint8)
 
     ## MedSAM Lite preprocessing
@@ -294,33 +285,16 @@ def MedSAM_infer_npz(gt_path_file):
     with torch.no_grad():
         image_embedding = medsam_lite_model.image_encoder(img_256_tensor)
 
-    # scribble = pad_image(resize_longest_side(scribble[...,np.newaxis],256)[:, :, None], 256)
-    # scribble = torch.from_numpy(scribble).permute(2,0,1)[None,]
-    #scribble_input = (scribble_input > 0) * 1
-    # assert np.array_equal(np.unique(scribble[scribble !=1000]), np.unique(gts))
+
     label_ids = np.unique(scribble[(scribble != 0) & (scribble != 1000)])
     scribbles_list = []
     for label_id in label_ids:
         
-        #gt2D = np.uint8(gts == label_id)
         scribble_input = np.uint8(scribble == label_id)
-        # if gt2D.shape != (newh, neww):
-        #     gt2D_resize = cv2.resize(
-        #         gt2D.astype(np.uint8), (neww, newh),
-        #         interpolation=cv2.INTER_NEAREST
-        #     ).astype(np.uint8)
-        # else:
-        #     gt2D_resize = gt2D.astype(np.uint8)
         scribble_input = pad_image(resize_longest_side(scribble_input[...,np.newaxis],256)[:, :, None], 256)
         scribble_input = torch.from_numpy(scribble_input).permute(2,0,1)[None,]
-        # scribble_input = pad_image(resize_longest_side(scribble[...,np.newaxis],256)[:, :, None], 256)
-        # scribble_input = torch.from_numpy(scribble_input).permute(2,0,1)[None,]
         scribble_input = (scribble_input > 0) * 1
-        #gt2D_padded = pad_image(gt2D_resize, 256)
-        
-        #if np.sum(gt2D_padded) > 0:
-            #box = get_bbox(gt2D_padded, bbox_shift) # (4,)
-            #box = box[None, ...] # (1, 4)
+
 
         medsam_mask, iou_pred = medsam_inference(medsam_lite_model, image_embedding, scribble_input, (newh, neww), (H, W))
         segs[medsam_mask>0] = label_id
@@ -346,11 +320,7 @@ def MedSAM_infer_npz(gt_path_file):
 
         for i, label_id in enumerate(label_ids):
             color = np.random.rand(3)
-            #box_viz = revert_box(box_list[i], (newh, neww), (H, W))
-            #show_box(box_viz, ax[1], edgecolor=color)
             show_mask((scribbles_list[i]==label_id).astype(np.uint8), ax[1], mask_color=color)
-            #show_mask((gts == label_id).astype(np.uint8), ax[1], mask_color=color)
-            #show_box(box_viz, ax[2], edgecolor=color)
             show_mask((segs == label_id).astype(np.uint8), ax[2], mask_color=color)
 
         plt.tight_layout()
@@ -359,8 +329,6 @@ def MedSAM_infer_npz(gt_path_file):
 
 if __name__ == '__main__':
     num_workers = num_workers
-    # for i in gt_path_files:
-    #     MedSAM_infer_npz(i)
 
     mp.set_start_method('spawn')
     with mp.Pool(processes=num_workers) as pool:
