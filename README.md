@@ -10,8 +10,8 @@ The codebase is tested with: `Ubuntu 20.04` | Python `3.10` | `CUDA 11.8` | `Pyt
 3. `git clone -b LiteMedSAMScribble https://github.com/bowang-lab/MedSAM/`
 4. Enter the MedSAM folder `cd MedSAM` and run `pip install -e .`
 
-## Quick tutorial on making submissions to CVPR 2024 MedSAM on Laptop Challenge \
-(TASK 2: SCRIBBLE): [Link to Challenge Website](https://www.codabench.org/competitions/2566/)
+## Quick tutorial on making submissions to CVPR 2024 MedSAM on Laptop Challenge 
+TASK 2: SCRIBBLE: [Link to Challenge Website](https://www.codabench.org/competitions/2566/)
 
 ### Sanity test
 - Download the LiteMedSAM checkpoint here and put it in `work_dir/LiteMedSAM`.
