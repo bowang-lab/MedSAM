@@ -29,26 +29,26 @@ parser.add_argument(
     '-i',
     '--input_dir',
     type=str,
-    default='./demo_scribble/imgs',
+    default='/demo_scribble/imgs/',
     help='root directory of the data',
 )
 parser.add_argument(
     '-o',
     '--output_dir',
     type=str,
-    default='./demo_scribble/segs',
+    default='/demo_scribble/segs/',
     help='directory to save the prediction',
 )
 parser.add_argument(
     '-lite_medsam_checkpoint_path',
     type=str,
-    default="./checkpoints/medsam_lite_scribble.pth",
+    default="work_dir/LiteMedSAM/lite_medsam_scribble.pth",
     help='path to the checkpoint of MedSAM-Lite',
 )
 parser.add_argument(
     '-device',
     type=str,
-    default="cuda:0",
+    default="cpu",
     help='device to run the inference',
 )
 parser.add_argument(
@@ -65,7 +65,7 @@ parser.add_argument(
 parser.add_argument(
     '-png_save_dir',
     type=str,
-    default='/home/sumin2/Documents/MedSAM/dump',
+    default='.',
     help='directory to save the overlay image'
 )
 
