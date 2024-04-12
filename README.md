@@ -14,11 +14,11 @@ The codebase is tested with: `Ubuntu 20.04` | Python `3.10` | `CUDA 11.8` | `Pyt
 
 ### Sanity test
 - Download the LiteMedSAM checkpoint here and put it in `work_dir/LiteMedSAM`.
-- Download the demo data [here](https://drive.google.com/drive/folders/1QOpXVpx-E05mviafi_wMMkkLs6VAMkCR)
+- Download the validation data [here](https://drive.google.com/drive/folders/1QOpXVpx-E05mviafi_wMMkkLs6VAMkCR)
 - Run the following command for a sanity test
 
 ```bash
-python CVPR24_LiteMedSAM_infer_scribble.py -i demo_scribble/imgs -o demo_scribble/segs
+python CVPR24_LiteMedSAM_infer_scribble.py -i validation_scribbles -o ./segs
 ```
 
 ### Build Docker
