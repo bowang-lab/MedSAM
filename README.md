@@ -10,6 +10,39 @@ The codebase is tested with: `Ubuntu 20.04` | Python `3.10` | `CUDA 11.8` | `Pyt
 3. `git clone -b LiteMedSAMScribble https://github.com/bowang-lab/MedSAM/`
 4. Enter the MedSAM folder `cd MedSAM` and run `pip install -e .`
 
+## Quick tutorial on making submissions to CVPR 2024 MedSAM on Laptop Challenge
+
+### Sanity test
+- Download the LiteMedSAM checkpoint here and put it in `work_dir/LiteMedSAM`.
+- Download the demo data [here](https://drive.google.com/drive/folders/1QOpXVpx-E05mviafi_wMMkkLs6VAMkCR)
+- Run the following command for a sanity test
+
+```bash
+python CVPR24_LiteMedSAM_infer_scribble.py -i demo_scribble/imgs -o demo_scribble/segs
+```
+
+### Build Docker
+```bash
+docker build -f Dockerfile -t litemedsamscribble .
+```
+> Note: don't forget the `.` in the end
+Run the docker on the testing demo images
+```bash
+docker container run -m 8G --name litemedsamscribble --rm -v $PWD/test_demo/imgs/:/workspace/inputs/ -v $PWD/test_demo/litemedsam-seg/:/workspace/outputs/ litemedsamscribble:latest /bin/bash -c "sh predict.sh"
+```
+> Note: please run `chmod -R 777 ./*` if you run into `Permission denied` error.
+
+### Save docker 
+
+```bash
+docker save litemedsamscribble | gzip -c > litemedsamscribble.tar.gz
+```
+
+### Compute Metrics
+
+```bash
+python evaluation/compute_metrics.py -s test_demo/litemedsam-seg -g test_demo/gts -csv_dir ./metrics.csv
+```
 
 ## Model Training
 
@@ -38,40 +71,6 @@ In addition to the packages installed for MedSAM, please install `cc3d`.
 
 ```bash
 pip install connected-components-3
-```
-
-## Quick tutorial on making submissions to CVPR 2024 MedSAM on Laptop Challenge
-
-### Sanity test
-- Download the LiteMedSAM checkpoint here and put it in `work_dir/LiteMedSAM`.
-- Download the demo data [here](https://drive.google.com/drive/folders/1QOpXVpx-E05mviafi_wMMkkLs6VAMkCR)
-- Run the following command for a sanity test
-
-```bash
-python CVPR24_LiteMedSAM_infer_scribble.py -i demo_scribble/imgs -o demo_scribble/segs
-```
-
-### Build Docker
-```bash
-docker build -f Dockerfile -t litemedsam .
-```
-> Note: don't forget the `.` in the end
-Run the docker on the testing demo images
-```bash
-docker container run -m 8G --name litemedsam --rm -v $PWD/test_demo/imgs/:/workspace/inputs/ -v $PWD/test_demo/litemedsam-seg/:/workspace/outputs/ litemedsam:latest /bin/bash -c "sh predict.sh"
-```
-> Note: please run `chmod -R 777 ./*` if you run into `Permission denied` error.
-
-### Save docker 
-
-```bash
-docker save litemedsam | gzip -c > litemedsam.tar.gz
-```
-
-### Compute Metrics
-
-```bash
-python evaluation/compute_metrics.py -s test_demo/litemedsam-seg -g test_demo/gts -csv_dir ./metrics.csv
 ```
 
 ### Prepare Demo Train Dataset
