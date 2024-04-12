@@ -10,10 +10,9 @@ import random
 import torch
 from .mask_generators import get_mask_by_input_strokes
 import copy
-import cv2
 import numpy as np
-import largestinteriorrectangle as lir
 import cc3d
+
 
 def set_edges_to_false(mask, size):
     # Set the edges to False
@@ -83,76 +82,33 @@ class Scribble:
         return torch.cat((x[:,None], y[:,None]), dim=1).numpy()
 
     def draw(self, mask=None, box=None):
-        if not self.is_train:
-            return self.draw_eval(mask=mask, box=box)
-        stroke_preset_name = random.choices(self.stroke_preset, weights=self.stroke_prob, k=1)[0]
-        preset = Scribble.get_stroke_preset(stroke_preset_name)
-        nStroke = random.randint(1, min(self.num_stroke, mask.sum().item()))
-        contours, _ = cv2.findContours(np.uint8(mask.numpy()) * 255, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-        contour = np.array([contours[0][:, 0, :]])
-        min_x, min_y, width, height = lir.lir(contour)
-        max_x = min_x + width
-        max_y = min_y + height
-        mask2 = copy.deepcopy(mask)
-        submask = mask2[min_y:max_y+1, min_x:max_x+1]
-        
-        
-        h,w = submask.shape
-        points = self.get_random_points_from_mask(submask, n=nStroke) #shape 1,2
-        rand_mask = get_mask_by_input_strokes(
-            init_points=points,
-            imageWidth=w, imageHeight=h, nStroke=min(nStroke, len(points)), **preset)
-        new_mask = torch.zeros_like(mask2).bool()
-        new_mask[min_y:(max_y+1), min_x:(max_x+1)] = ~torch.tensor(rand_mask)
-        
-        result = new_mask * mask
-        return result
-
-    def draw(self, mask=None, box=None):
-        if not self.is_train:
-            return self.draw_eval(mask=mask, box=box)
-        stroke_preset_name = random.choices(self.stroke_preset, weights=self.stroke_prob, k=1)[0]
-        preset = Scribble.get_stroke_preset(stroke_preset_name)
-        nStroke = random.randint(1, min(self.num_stroke, mask.sum().item()))
-        while True:
-            contours, tmp = cv2.findContours(np.uint8(mask.numpy()) * 255, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-            for i in range(tmp.shape[1]):
-                try:
-                    if tmp[0,i,-1]==-1:
-                        contour = np.array([contours[i][:, 0, :]])
-                        min_x, min_y, width, height = lir.lir(contour)
-                        break
-                except:
-                    #print(i)
-                    pass
-            try:
-                max_x = min_x + width
-                max_y = min_y + height
-            except:
-                continue
-            mask2 = copy.deepcopy(mask)
-            submask = mask2[min_y:max_y+1, min_x:max_x+1]
-            h,w = submask.shape
-            points = self.get_random_points_from_mask(submask, n=nStroke) #shape 1,2
-            rand_mask = get_mask_by_input_strokes(
-                init_points=points,
-                imageWidth=w, imageHeight=h, nStroke=min(nStroke, len(points)), **preset)
-            new_mask = torch.zeros_like(mask2).bool()
-            new_mask[min_y:(max_y+1), min_x:(max_x+1)] = ~torch.tensor(rand_mask)
-            if new_mask.sum() > 0:
-                break
-        return new_mask
-
-
-    def draw_background(self, mask=None, box=None):
-        if not self.is_train:
-            return self.draw_eval(mask=mask, box=box)
         stroke_preset_name = random.choices(self.stroke_preset, weights=self.stroke_prob, k=1)[0]
         preset = Scribble.get_stroke_preset(stroke_preset_name)
         nStroke = random.randint(1, min(self.num_stroke, mask.sum().item()))
         while True:
             mask0 = copy.deepcopy(mask)
-            mask0 = set_edges_to_false(mask0, int(mask0.shape[0]*random.uniform(0.05, 0.25)))
+            h,w = mask0.shape
+            points = self.get_random_points_from_mask(mask0, n=nStroke)
+            rand_mask = get_mask_by_input_strokes(
+                init_points=points,
+                imageWidth=w, imageHeight=h, nStroke=min(nStroke, len(points)), **preset)
+            rand_mask = (~torch.from_numpy(rand_mask)) * mask0
+            if rand_mask.sum() == 0:
+                continue
+            labels_out = cc3d.connected_components(rand_mask.numpy().astype(np.uint8))
+            largest_component = np.argmax(np.bincount(labels_out.flat)[1:]) + 1
+            rand_mask = labels_out == largest_component
+            if rand_mask.sum()>5:
+                break
+        return torch.tensor(rand_mask)
+
+    def draw_background(self, mask=None, box=None):
+        stroke_preset_name = random.choices(self.stroke_preset, weights=self.stroke_prob, k=1)[0]
+        preset = Scribble.get_stroke_preset(stroke_preset_name)
+        nStroke = random.randint(1, min(self.num_stroke, mask.sum().item()))
+        while True:
+            mask0 = copy.deepcopy(mask)
+            mask0 = set_edges_to_false(mask0, int(mask0.shape[0]*random.uniform(0.02, 0.25)))
             h,w = mask0.shape
             points = self.get_random_points_from_mask(mask0, n=nStroke)
             rand_mask = get_mask_by_input_strokes(
