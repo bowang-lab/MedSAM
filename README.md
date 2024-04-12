@@ -34,13 +34,11 @@ Please note that for training, `sampler.py` and `scribble.py` in `visual_sampler
 
 ### Installing Dependencies
 
-In addition to the packages installed for MedSAM, please install `cc3d` and `largestinteriorrectangle`.
+In addition to the packages installed for MedSAM, please install `cc3d`.
 
-1. pip install connected-components-3d
-2. pip install largestinteriorrectangle
-
-
-
+```bash
+pip install connected-components-3
+```
 
 ## Quick tutorial on making submissions to CVPR 2024 MedSAM on Laptop Challenge
 
