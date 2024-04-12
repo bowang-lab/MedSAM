@@ -29,7 +29,7 @@ docker build -f Dockerfile -t litemedsamscribble .
 > Note: don't forget the `.` in the end
 Run the docker on the testing demo images
 ```bash
-docker container run -m 8G --name litemedsamscribble --rm -v $PWD/test_demo/imgs/:/workspace/inputs/ -v $PWD/test_demo/litemedsam-seg/:/workspace/outputs/ litemedsamscribble:latest /bin/bash -c "sh predict.sh"
+docker container run -m 8G --name litemedsamscribble --rm -v $PWD/validation_scribbles/:/workspace/inputs/ -v $PWD/test_demo/litemedsam-seg/:/workspace/outputs/ litemedsamscribble:latest /bin/bash -c "sh predict.sh"
 ```
 > Note: please run `chmod -R 777 ./*` if you run into `Permission denied` error.
 
