@@ -19,23 +19,41 @@ class Point:
         self.is_train = is_train
 
     def draw(self, mask=None, box=None):
-        if mask.sum() < 10:
-            return torch.zeros(mask.shape).bool() # if mask is empty
-        if not self.is_train:
-            return self.draw_eval(mask=mask, box=box)
-        max_points = min(self.max_points, mask.sum().item()) # max number of points no more than total mask number
-        num_points = random.randint(1, max_points) # get a random number of points 
-        h,w = mask.shape
-        view_mask = mask.view(-1)
-        non_zero_idx = view_mask.nonzero()[:,0] # get non-zero index of mask
-        selected_idx = torch.randperm(len(non_zero_idx))[:num_points] # select id
-        non_zero_idx = non_zero_idx[selected_idx] # select non-zero index
-        rand_mask = torch.zeros(view_mask.shape).bool() # init rand mask
-        rand_mask[non_zero_idx] = True # get non zero place to zero
-        # dilate
-        # struct = ndimage.generate_binary_structure(2, 2)
-        # rand_mask = torch.from_numpy((ndimage.binary_dilation(rand_mask.reshape(h, w).numpy(), structure=struct, iterations=5).astype(rand_mask.numpy().dtype)))
-        # return rand_mask
+        while True:
+            max_points = min(self.max_points, mask.sum().item()) # max number of points no more than total mask number
+            num_points = random.randint(1, max_points) # get a random number of points 
+            h,w = mask.shape
+            view_mask = mask.view(-1)
+            non_zero_idx = view_mask.nonzero()[:,0] # get non-zero index of mask
+            selected_idx = torch.randperm(len(non_zero_idx))[:num_points] # select id
+            non_zero_idx = non_zero_idx[selected_idx] # select non-zero index
+            rand_mask = torch.zeros(view_mask.shape).bool() # init rand mask
+            rand_mask[non_zero_idx] = True # get non zero place to zero
+            # dilate
+            # struct = ndimage.generate_binary_structure(2, 2)
+            # rand_mask = torch.from_numpy((ndimage.binary_dilation(rand_mask.reshape(h, w).numpy(), structure=struct, iterations=5).astype(rand_mask.numpy().dtype)))
+            # return rand_mask
+            if rand_mask.sum() >0:
+                break
+        return rand_mask.reshape(h, w)
+    
+    def draw_background(self, mask=None, box=None):
+        while True:
+            max_points = min(self.max_points, mask.sum().item()) # max number of points no more than total mask number
+            num_points = random.randint(1, max_points) # get a random number of points 
+            h,w = mask.shape
+            view_mask = mask.view(-1)
+            non_zero_idx = view_mask.nonzero()[:,0] # get non-zero index of mask
+            selected_idx = torch.randperm(len(non_zero_idx))[:num_points] # select id
+            non_zero_idx = non_zero_idx[selected_idx] # select non-zero index
+            rand_mask = torch.zeros(view_mask.shape).bool() # init rand mask
+            rand_mask[non_zero_idx] = True # get non zero place to zero
+            # dilate
+            # struct = ndimage.generate_binary_structure(2, 2)
+            # rand_mask = torch.from_numpy((ndimage.binary_dilation(rand_mask.reshape(h, w).numpy(), structure=struct, iterations=5).astype(rand_mask.numpy().dtype)))
+            # return rand_mask
+            if rand_mask.sum() >0:
+                break
         return rand_mask.reshape(h, w)
     
     def draw_eval(self, mask=None, box=None):
