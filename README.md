@@ -64,7 +64,7 @@ For additional command line arguments, see `python train_one_gpu_scribble.py -h`
 
 ## Automatic Generation of Scribbles
 
-Please note that for training, `sampler.py` and `scribble.py` in `visual_sampler` are used for faster automatic scribble generation whereas here we use `sampler.py` and `scribble.py` to generate refined scribbles.
+Please note that for training, `sampler.py` and `scribble.py` in `visual_sampler` are used for faster automatic scribble generation whereas here we use `sampler_v2.py` and `scribble_v2.py` to generate scribbles with one stroke.
 
 ### Installing Dependencies
 
