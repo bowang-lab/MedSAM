@@ -86,7 +86,7 @@ python generate_scribbles_train.py -root ./scribble-train-demo -save_path ./trai
 ```
 
 ### Demo Inference script 
-The link to the LiteMedSAM scribble checkpoint is [here](https://drive.google.com/drive/folders/13_7JunloWvXgXaa_kfJrg7sZCLVE33TK)
+The link to the LiteMedSAM scribble checkpoint is [here](https://drive.google.com/drive/folders/13_7JunloWvXgXaa_kfJrg7sZCLVE33TK).
 The interactive scribble prompt inference can be run using the following command. Please drag an image to the input, draw a scribble on it, and submit it to get the output mask using the Gradio API.
 
 ```bash
