@@ -466,9 +466,9 @@ def MedSAM_infer_npz_3D(img_npz_file):
             if z == z_middle:
                 box_256 = resize_box_to_256(mid_slice_bbox_2d, original_size=(H, W))
             else:
-                pre_seg = segs[z-1, :, :]
-                if np.max(pre_seg) > 0:
-                    pre_seg256 = resize_longest_side(pre_seg)
+                pre_seg = segs_3d_temp[z-1, :, :]
+                pre_seg256 = resize_longest_side(pre_seg)
+                if np.max(pre_seg256) > 0:
                     pre_seg256 = pad_image(pre_seg256)
                     box_256 = get_bbox256(pre_seg256)
                 else:
@@ -500,14 +500,13 @@ def MedSAM_infer_npz_3D(img_npz_file):
             with torch.no_grad():
                 image_embedding = medsam_lite_model.image_encoder(img_256_tensor) # (1, 256, 64, 64)
 
-            pre_seg = segs[z+1, :, :]
-            if np.max(pre_seg) > 0:
-                pre_seg256 = resize_longest_side(pre_seg)
+            pre_seg = segs_3d_temp[z+1, :, :]
+            pre_seg256 = resize_longest_side(pre_seg)
+            if np.max(pre_seg256) > 0:
                 pre_seg256 = pad_image(pre_seg256)
                 box_256 = get_bbox256(pre_seg256)
             else:
-                scale_256 = 256 / max(H, W)
-                box_256 = mid_slice_bbox_2d * scale_256
+                box_256 = resize_box_to_256(mid_slice_bbox_2d, original_size=(H, W))
             img_2d_seg, iou_pred = medsam_inference(medsam_lite_model, image_embedding, box_256, [new_H, new_W], [H, W])
             segs_3d_temp[z, img_2d_seg>0] = idx
         segs[segs_3d_temp>0] = idx
