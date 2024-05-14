@@ -177,9 +177,9 @@ class NpyDataset(Dataset):
         # add perturbation to bounding box coordinates
         H, W = gt2D.shape
         x_min = max(0, x_min - random.randint(0, self.bbox_shift))
-        x_max = min(W, x_max + random.randint(0, self.bbox_shift))
+        x_max = min(W-1, x_max + random.randint(0, self.bbox_shift))
         y_min = max(0, y_min - random.randint(0, self.bbox_shift))
-        y_max = min(H, y_max + random.randint(0, self.bbox_shift))
+        y_max = min(H-1, y_max + random.randint(0, self.bbox_shift))
         bboxes = np.array([x_min, y_min, x_max, y_max])
         return {
             "image": torch.tensor(img_padded).float(),
