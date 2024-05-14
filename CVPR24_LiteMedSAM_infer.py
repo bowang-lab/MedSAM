@@ -441,7 +441,7 @@ def MedSAM_infer_npz_3D(img_npz_file):
 
         # infer from middle slice to the z_max
         # print(npz_name, 'infer from middle slice to the z_max')
-        for z in range(z_middle, z_max):
+        for z in range(z_middle, z_max+1):
             img_2d = img_3D[z, :, :]
             if len(img_2d.shape) == 2:
                 img_3c = np.repeat(img_2d[:, :, None], 3, axis=-1)
@@ -478,6 +478,7 @@ def MedSAM_infer_npz_3D(img_npz_file):
         
         # infer from middle slice to the z_max
         # print(npz_name, 'infer from middle slice to the z_min')
+        zmin = max(0, z_min-1)
         for z in range(z_middle-1, z_min, -1):
             img_2d = img_3D[z, :, :]
             if len(img_2d.shape) == 2:
