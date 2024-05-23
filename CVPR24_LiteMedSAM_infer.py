@@ -479,7 +479,7 @@ def MedSAM_infer_npz_3D(img_npz_file):
         
         # infer from middle slice to the z_max
         # print(npz_name, 'infer from middle slice to the z_min')
-        z_min = max(0, z_min-1)
+        z_min = max(-1, z_min-1)
         for z in range(z_middle-1, z_min, -1):
             img_2d = img_3D[z, :, :]
             if len(img_2d.shape) == 2:
