@@ -77,7 +77,7 @@ python pre_CT_MR.py
 - split dataset: 80% for training and 20% for testing
 - adjust CT scans to [soft tissue](https://radiopaedia.org/articles/windowing-ct) window level (40) and width (400)
 - max-min normalization
-- resample image size to `1024x2014`
+- resample image size to `1024x1024`
 - save the pre-processed images and labels as `npy` files
 
 
