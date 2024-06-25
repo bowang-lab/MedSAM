@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+
+"""
+usage example:
+python MedSAM_Inference.py -i assets/img_demo.png -o ./ --box "[95,255,190,350]"
+
+"""
+
 # %% load environment
 import numpy as np
 import matplotlib.pyplot as plt
@@ -85,8 +92,8 @@ parser.add_argument(
 )
 parser.add_argument(
     "--box",
-    type=list,
-    default=[95, 255, 190, 350],
+    type=str,
+    default='[95, 255, 190, 350]',
     help="bounding box of the segmentation target",
 )
 parser.add_argument("--device", type=str, default="cuda:0", help="device")
@@ -122,7 +129,7 @@ img_1024_tensor = (
     torch.tensor(img_1024).float().permute(2, 0, 1).unsqueeze(0).to(device)
 )
 
-box_np = np.array([args.box])
+box_np = np.array([[int(x) for x in args.box[1:-1].split(',')]]) 
 # transfer box_np t0 1024x1024 scale
 box_1024 = box_np / np.array([W, H, W, H]) * 1024
 with torch.no_grad():
