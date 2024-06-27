@@ -157,7 +157,7 @@ parser.add_argument(
 )
 # parser.add_argument('-device', type=str, default='cuda:0')
 parser.add_argument(
-    "--load_pretrain", type=bool, default=True, help="use wandb to monitor training"
+    "--load_pretrain", type=bool, default=True, help="load pretrain model"
 )
 parser.add_argument("-pretrain_model_path", type=str, default="")
 parser.add_argument("-work_dir", type=str, default="./work_dir")
