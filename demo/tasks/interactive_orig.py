@@ -89,12 +89,12 @@ transform = transforms.Compose(t)
 
 def interactive_infer_image(medsam_lite_model, image, img_side_len=256):
 
-    image_ori = resize_longest_side(np.array(image['image']),img_side_len)
+    image_ori = resize_longest_side(np.array(image['background']),img_side_len)
     image_ori = (image_ori - image_ori.min()) / np.clip(
             image_ori.max() - image_ori.min(), a_min=1e-8, a_max=None
             ).astype(np.float32)
     image_ori = pad_image(image_ori,img_side_len)
-    mask_ori = image['mask']
+    mask_ori = image['layers'][0]
     width = image_ori.shape[0]
     height = image_ori.shape[1]
     image_ori = np.asarray(image_ori)
@@ -103,12 +103,12 @@ def interactive_infer_image(medsam_lite_model, image, img_side_len=256):
     images = images[None,...]
     with torch.no_grad():
         image_embedding = medsam_lite_model.image_encoder(images)
-
-    mask_ori = np.asarray(mask_ori)[:,:,0:1].copy()
-    mask_ori = resize_longest_side(mask_ori,img_side_len)
+    #print(mask_ori.size)
+    mask_ori =np.array(mask_ori)[:,:,0:1].copy() # (264, 276, 1)
+    mask_ori = resize_longest_side(mask_ori,img_side_len) #(245,256)
     mask_ori = mask_ori[:, :, None]
-    mask_ori = pad_image(mask_ori,img_side_len)
-    mask_ori = torch.from_numpy(mask_ori).permute(2,0,1)[None,]
+    mask_ori = pad_image(mask_ori,img_side_len) # (256, 256, 1)
+    mask_ori = torch.from_numpy(mask_ori).permute(2,0,1)[None,] #(1,1,256,256)
     mask_ori = mask_ori > 0
     mask_ori = mask_ori * 1
 
