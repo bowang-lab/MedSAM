@@ -1,123 +1,146 @@
-# --------------------------------------------------------
-# Adapted from 
-# SEEM -- Segment Everything Everywhere All At Once
-# Copyright (c) 2022 Microsoft
-# Licensed under The MIT License [see LICENSE for details]
-# Written by Xueyan Zou (xueyan@cs.wisc.edu)
-# --------------------------------------------------------
-
-import torch
-import numpy as np
+import os
+from segment_anything.modeling import MaskDecoder, PromptEncoder, TwoWayTransformer
+from tiny_vit_sam import TinyViT
 import torch.nn.functional as F
-from PIL import Image
-from torchvision import transforms
-from utils.visualizer import Visualizer
-import matplotlib.pyplot as plt
+import torch.nn as nn
+import argparse
+import gradio as gr
+import torch
+import sys
+
+current_path = os.path.dirname(os.path.abspath(__file__))
+parent_parent_directory = os.path.dirname(os.path.dirname(current_path))
+if parent_parent_directory not in sys.path:
+    sys.path.append(parent_parent_directory)
+from demo.tasks import *
 
 
-import cv2
-from PIL import Image
+parser = argparse.ArgumentParser()
 
-def show_mask(mask, color=None, alpha=0.45):
-    if color is None:
-        color = np.concatenate([np.random.random(3), np.array([alpha])], axis=0)
-    else:
-        color = np.array([*color, alpha])
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    return mask_image
+parser.add_argument(
+    '-medsam_lite_checkpoint_path',
+    type=str,
+    default='/home/sumin2/Documents/MedSAM/checkpoints/medsam_lite_scribble.pth', 
+    help='path to the checkpoint of MedSAM-Lite',
+    required=False
+)
+parser.add_argument(
+    '-device',
+    type=str,
+    default="cuda:0",
+    help='device to run the inference',
+)
 
-def resize_longest_side(image,img_side_len=256):
-    """
-    Expects a numpy array with shape HxWxC in uint8 format.
-    """
-    long_side_length = img_side_len
-    oldh, oldw = image.shape[0], image.shape[1]
-    scale = long_side_length * 1.0 / max(oldh, oldw)
-    newh, neww = oldh * scale, oldw * scale
-    neww, newh = int(neww + 0.5), int(newh + 0.5)
-    target_size = (neww, newh)
+args = parser.parse_args()
+medsam_lite_checkpoint_path = args.medsam_lite_checkpoint_path
+device = torch.device(args.device)
+image_size = 256
 
-    return cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+class MedSAM_Lite(nn.Module):
+    def __init__(self, image_encoder, mask_decoder, prompt_encoder):
+        super().__init__()
+        self.image_encoder = image_encoder
+        self.mask_decoder = mask_decoder
+        self.prompt_encoder = prompt_encoder
+        
+    def forward(self, image, masks):
+        image_embedding = self.image_encoder(image)
 
-def pad_image(image,img_side_len=256):
-    """
-    Expects a numpy array with shape HxWxC in uint8 format.
-    """
-    # Pad
-    h, w = image.shape[0], image.shape[1]
-    padh = img_side_len - h
-    padw = img_side_len - w
-    if len(image.shape) == 3: ## Pad image
-        image_padded = np.pad(image, ((0, padh), (0, padw), (0, 0)))
-    else: ## Pad gt mask
-        image_padded = np.pad(image, ((0, padh), (0, padw)))
-    return image_padded
+        sparse_embeddings, dense_embeddings = self.prompt_encoder(
+            points=None,
+            boxes=None,
+            masks=masks,
+        )
+        low_res_masks, iou_predictions = self.mask_decoder(
+            image_embeddings=image_embedding,
+            image_pe=self.prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+        )
 
+        return low_res_masks, iou_predictions
+
+    @torch.no_grad()
+    def postprocess_masks(self, masks, new_size, original_size):
+        masks = masks[:, :, :new_size[0], :new_size[1]]
+        masks = F.interpolate(
+            masks,
+            size=(original_size[0], original_size[1]),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        return masks
+
+medsam_lite_image_encoder = TinyViT(
+    img_size=256,
+    in_chans=3,
+    embed_dims=[
+        64,
+        128,
+        160,
+        320
+    ],
+    depths=[2, 2, 6, 2],
+    num_heads=[2, 4, 5, 10],
+    window_sizes=[7, 7, 14, 7],
+    mlp_ratio=4.,
+    drop_rate=0.,
+    drop_path_rate=0.0,
+    use_checkpoint=False,
+    mbconv_expand_ratio=4.0,
+    local_conv_size=3,
+    layer_lr_decay=0.8
+)
+
+medsam_lite_prompt_encoder = PromptEncoder(
+    embed_dim=256,
+    image_embedding_size=(64, 64),
+    input_image_size=(256, 256),
+    mask_in_chans=16
+)
+
+medsam_lite_mask_decoder = MaskDecoder(
+    num_multimask_outputs=3,
+    transformer=TwoWayTransformer(
+        depth=2,
+        embedding_dim=256,
+        mlp_dim=2048,
+        num_heads=8,
+    ),
+    transformer_dim=256,
+    iou_head_depth=3,
+    iou_head_hidden_dim=256,
+)
+
+medsam_lite_model = MedSAM_Lite(
+    image_encoder=medsam_lite_image_encoder,
+    mask_decoder=medsam_lite_mask_decoder,
+    prompt_encoder=medsam_lite_prompt_encoder
+)
+
+medsam_lite_checkpoint = torch.load(medsam_lite_checkpoint_path, map_location='cpu')
+medsam_lite_model.load_state_dict(medsam_lite_checkpoint, strict=True)
+medsam_lite_model.to(device)
+medsam_lite_model.eval()
 
 @torch.no_grad()
-def medsam_inference(medsam_model, img_embed, scribble_256, new_size, original_size):
-    scribble_torch = torch.as_tensor(scribble_256, dtype=torch.float, device=img_embed.device)
-    # if len(box_torch.shape) == 2:
-    #     box_torch = box_torch[:, None, :] # (B, 1, 4)
-    
-    sparse_embeddings, dense_embeddings = medsam_model.prompt_encoder(
-        points = None,
-        boxes = None,
-        masks = scribble_torch,
-    )
-    low_res_logits, _ = medsam_model.mask_decoder(
-        image_embeddings=img_embed, # (B, 256, 64, 64)
-        image_pe=medsam_model.prompt_encoder.get_dense_pe(), # (1, 256, 64, 64)
-        sparse_prompt_embeddings=sparse_embeddings, # (B, 2, 256)
-        dense_prompt_embeddings=dense_embeddings, # (B, 256, 64, 64)
-        multimask_output=False
-    )
+def inference(image, *args, **kwargs):
+    return interactive_infer_image(medsam_lite_model, image, *args, **kwargs)
 
-    low_res_pred = medsam_model.postprocess_masks(low_res_logits, new_size, original_size)
-    low_res_pred = torch.sigmoid(low_res_pred)
-    low_res_pred = low_res_pred.squeeze().cpu().numpy()
-    medsam_seg = (low_res_pred > 0.5).astype(np.uint8)
+inputs = gr.ImageEditor(label="[Stroke] Draw on Image", type="pil", image_mode='RGB')
+outputs = gr.Image(type="pil", label="Segmentation Results")
 
-    return medsam_seg
+title = "LiteMedSAM: stoke demo"
+description = "MedSAM scribble demo"
 
-
-
-t = []
-t.append(transforms.Resize((256,256), interpolation=Image.BICUBIC))
-transform = transforms.Compose(t)
-
-def interactive_infer_image(medsam_lite_model, image, img_side_len=256):
-
-    image_ori = resize_longest_side(np.array(image['background']),img_side_len)
-    image_ori = (image_ori - image_ori.min()) / np.clip(
-            image_ori.max() - image_ori.min(), a_min=1e-8, a_max=None
-            ).astype(np.float32)
-    image_ori = pad_image(image_ori,img_side_len)
-    mask_ori = image['layers'][0]
-    width = image_ori.shape[0]
-    height = image_ori.shape[1]
-    image_ori = np.asarray(image_ori)
-    visual = Visualizer(image_ori*255, metadata=None)
-    images = torch.from_numpy(image_ori.copy()).permute(2,0,1).cuda()
-    images = images[None,...]
-    with torch.no_grad():
-        image_embedding = medsam_lite_model.image_encoder(images)
-    #print(mask_ori.size)
-    mask_ori =np.array(mask_ori)[:,:,0:1].copy() # (264, 276, 1)
-    mask_ori = resize_longest_side(mask_ori,img_side_len) #(245,256)
-    mask_ori = mask_ori[:, :, None]
-    mask_ori = pad_image(mask_ori,img_side_len) # (256, 256, 1)
-    mask_ori = torch.from_numpy(mask_ori).permute(2,0,1)[None,] #(1,1,256,256)
-    mask_ori = mask_ori > 0
-    mask_ori = mask_ori * 1
-
-    sam_mask = medsam_inference(medsam_lite_model, image_embedding, mask_ori, (256, 256), (256, 256))
-    sam_mask = sam_mask[None, ...]
-
-
-    for idx, mask in enumerate(sam_mask): # 1,256,256
-        demo = visual.draw_binary_mask(mask)
-    res = demo.get_image()
-    torch.cuda.empty_cache()
-    return Image.fromarray(res)
+gr.Interface(
+    fn=inference,
+    inputs=inputs,
+    outputs=outputs,
+    title=title,
+    description=description,
+    allow_flagging='never',
+    cache_examples=False,
+).launch()
