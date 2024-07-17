@@ -3,7 +3,7 @@
 ## Prerequisites
 Set up the environment and perform data preprocessing as instructed in the [LiteMedSAM README](https://github.com/bowang-lab/MedSAM/tree/LiteMedSAM)
 
-The codebase contains a pretrained Tiny-ViT pretrained weights `tinyvit_pretrained.pth` to serve as a starting point for distillation.
+The codebase contains a pretrained Tiny-ViT pretrained weights `tinyvit_pretrained.pth` (download [here](https://drive.google.com/file/d/1WeS_vuHmkLk3Hb5EpRbU6z66o56J0qvN/view?usp=sharing)) to serve as a starting point for distillation.
 
 ## Single GPU Distillation
 
