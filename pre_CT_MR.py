@@ -8,24 +8,56 @@ import SimpleITK as sitk
 import os
 
 join = os.path.join
-from skimage import transform
 from tqdm import tqdm
 import cc3d
 
+import multiprocessing as mp
+from functools import partial
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-modality", type=str, default="CT", help="CT or MR, [default: CT]")
+parser.add_argument("-anatomy", type=str, default="Abd",
+                    help="Anaotmy name, [default: Abd]")
+parser.add_argument("-img_name_suffix", type=str, default="_0000.nii.gz",
+                    help="Suffix of the image name, [default: .nii.gz]")
+parser.add_argument("-gt_name_suffix", type=str, default=".nii.gz",
+                    help="Suffix of the ground truth name, [default: .nii.gz]")
+parser.add_argument("-img_path", type=str, default="data/FLARE22Train/images",
+                    help="Path to the nii images, [default: data/FLARE22Train/images]")
+parser.add_argument("-gt_path", type=str, default="data/FLARE22Train/labels",
+                    help="Path to the ground truth, [default: data/FLARE22Train/labels]")
+parser.add_argument("-output_path", type=str, default="data/npz/Flare22Train",
+                    help="Path to save the npy files, [default: ./data/npz]")
+parser.add_argument("-num_workers", type=int, default=4,
+                    help="Number of workers, [default: 4]")
+parser.add_argument("-window_level", type=int, default=40,
+                    help="CT window level, [default: 40]")
+parser.add_argument("-window_width", type=int, default=400,
+                    help="CT window width, [default: 400]")
+parser.add_argument("--save_nii", action="store_true",
+                    help="Save the image and ground truth as nii files for sanity check; they can be removed")
+
+args = parser.parse_args()
+
 # convert nii image to npz files, including original image and corresponding masks
-modality = "CT"
-anatomy = "Abd"  # anantomy + dataset name
-img_name_suffix = "_0000.nii.gz"
-gt_name_suffix = ".nii.gz"
+modality = args.modality  # CT or MR
+anatomy = args.anatomy  # anantomy + dataset name
+img_name_suffix = args.img_name_suffix  # "_0000.nii.gz"
+gt_name_suffix = args.gt_name_suffix  # ".nii.gz"
 prefix = modality + "_" + anatomy + "_"
 
-nii_path = "data/FLARE22Train/images"  # path to the nii images
-gt_path = "data/FLARE22Train/labels"  # path to the ground truth
-npy_path = "data/npy/" + prefix[:-1]
-os.makedirs(join(npy_path, "gts"), exist_ok=True)
-os.makedirs(join(npy_path, "imgs"), exist_ok=True)
+nii_path = args.img_path  # path to the nii images
+gt_path = args.gt_path  # path to the ground truth
+output_path = args.output_path  # path to save the preprocessed files
+npz_tr_path = join(output_path, "npz_train", prefix[:-1])
+os.makedirs(npz_tr_path, exist_ok=True)
+npz_ts_path = join(output_path, "npz_test", prefix[:-1])
+os.makedirs(npz_ts_path, exist_ok=True)
 
-image_size = 1024
+num_workers = args.num_workers
+
 voxel_num_thre2d = 100
 voxel_num_thre3d = 1000
 
@@ -45,11 +77,22 @@ remove_label_ids = [
 tumor_id = None  # only set this when there are multiple tumors; convert semantic masks to instance masks
 # set window level and width
 # https://radiopaedia.org/articles/windowing-ct
-WINDOW_LEVEL = 40  # only for CT images
-WINDOW_WIDTH = 400  # only for CT images
+WINDOW_LEVEL = args.window_level # only for CT images
+WINDOW_WIDTH = args.window_width # only for CT images
 
+save_nii = args.save_nii
 # %% save preprocessed images and masks as npz files
-for name in tqdm(names[:40]):  # use the remaining 10 cases for validation
+def preprocess(name, npz_path):
+    """
+    Preprocess the image and ground truth, and save them as npz files
+
+    Parameters
+    ----------
+    name : str
+        name of the ground truth file
+    npz_path : str
+        path to save the npz files
+    """
     image_name = name.split(gt_name_suffix)[0] + img_name_suffix
     gt_name = name
     gt_sitk = sitk.ReadImage(join(gt_path, gt_name))
@@ -117,66 +160,37 @@ for name in tqdm(names[:40]):  # use the remaining 10 cases for validation
 
         image_data_pre = np.uint8(image_data_pre)
         img_roi = image_data_pre[z_index, :, :]
-        np.savez_compressed(join(npy_path, prefix + gt_name.split(gt_name_suffix)[0]+'.npz'), imgs=img_roi, gts=gt_roi, spacing=img_sitk.GetSpacing())
+        np.savez_compressed(join(npz_path, prefix + gt_name.split(gt_name_suffix)[0]+'.npz'), imgs=img_roi, gts=gt_roi, spacing=img_sitk.GetSpacing())
+
         # save the image and ground truth as nii files for sanity check;
         # they can be removed
-        img_roi_sitk = sitk.GetImageFromArray(img_roi)
-        gt_roi_sitk = sitk.GetImageFromArray(gt_roi)
-        sitk.WriteImage(
-            img_roi_sitk,
-            join(npy_path, prefix + gt_name.split(gt_name_suffix)[0] + "_img.nii.gz"),
-        )
-        sitk.WriteImage(
-            gt_roi_sitk,
-            join(npy_path, prefix + gt_name.split(gt_name_suffix)[0] + "_gt.nii.gz"),
-        )
-        # save the each CT image as npy file
-        for i in range(img_roi.shape[0]):
-            img_i = img_roi[i, :, :]
-            img_3c = np.repeat(img_i[:, :, None], 3, axis=-1)
-            resize_img_skimg = transform.resize(
-                img_3c,
-                (image_size, image_size),
-                order=3,
-                preserve_range=True,
-                mode="constant",
-                anti_aliasing=True,
+        if save_nii:
+            img_roi_sitk = sitk.GetImageFromArray(img_roi)
+            img_roi_sitk.SetSpacing(img_sitk.GetSpacing())
+            sitk.WriteImage(
+                img_roi_sitk,
+                join(npz_path, prefix + gt_name.split(gt_name_suffix)[0] + "_img.nii.gz"),
             )
-            resize_img_skimg_01 = (resize_img_skimg - resize_img_skimg.min()) / np.clip(
-                resize_img_skimg.max() - resize_img_skimg.min(), a_min=1e-8, a_max=None
-            )  # normalize to [0, 1], (H, W, 3)
-            gt_i = gt_roi[i, :, :]
-            resize_gt_skimg = transform.resize(
-                gt_i,
-                (image_size, image_size),
-                order=0,
-                preserve_range=True,
-                mode="constant",
-                anti_aliasing=False,
+            gt_roi_sitk = sitk.GetImageFromArray(gt_roi)
+            gt_roi_sitk.SetSpacing(img_sitk.GetSpacing())
+            sitk.WriteImage(
+                gt_roi_sitk,
+                join(npz_path, prefix + gt_name.split(gt_name_suffix)[0] + "_gt.nii.gz"),
             )
-            resize_gt_skimg = np.uint8(resize_gt_skimg)
-            assert resize_img_skimg_01.shape[:2] == resize_gt_skimg.shape
-            np.save(
-                join(
-                    npy_path,
-                    "imgs",
-                    prefix
-                    + gt_name.split(gt_name_suffix)[0]
-                    + "-"
-                    + str(i).zfill(3)
-                    + ".npy",
-                ),
-                resize_img_skimg_01,
-            )
-            np.save(
-                join(
-                    npy_path,
-                    "gts",
-                    prefix
-                    + gt_name.split(gt_name_suffix)[0]
-                    + "-"
-                    + str(i).zfill(3)
-                    + ".npy",
-                ),
-                resize_gt_skimg,
-            )
+
+if __name__ == "__main__":
+    tr_names = names[:40]
+    ts_names = names[40:]
+
+    preprocess_tr = partial(preprocess, npz_path=npz_tr_path)
+    preprocess_ts = partial(preprocess, npz_path=npz_ts_path)
+
+    with mp.Pool(num_workers) as p:
+        with tqdm(total=len(tr_names)) as pbar:
+            pbar.set_description("Preprocessing training data")
+            for i, _ in tqdm(enumerate(p.imap_unordered(preprocess_tr, tr_names))):
+                pbar.update()
+        with tqdm(total=len(ts_names)) as pbar:
+            pbar.set_description("Preprocessing testing data")
+            for i, _ in tqdm(enumerate(p.imap_unordered(preprocess_ts, ts_names))):
+                pbar.update()

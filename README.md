@@ -1,113 +1,131 @@
-# MedSAM
-This is the official repository for MedSAM: Segment Anything in Medical Images.
+# Segment Anything In Medical Images and Videos: Benchmark and Deployment
 
-## News
-
-- 2024.01.15: Welcome to join [CVPR 2024 Challenge: MedSAM on Laptop](https://www.codabench.org/competitions/1847/)
-- 2024.01.15: Release [LiteMedSAM](https://github.com/bowang-lab/MedSAM/blob/LiteMedSAM/README.md) and [3D Slicer Plugin](https://github.com/bowang-lab/MedSAMSlicer), 10x faster than MedSAM! 
-
+This is the official repository for fine-tuning SAM2 on medical images. 
 
 ## Installation
-1. Create a virtual environment `conda create -n medsam python=3.10 -y` and activate it `conda activate medsam`
-2. Install [Pytorch 2.0](https://pytorch.org/get-started/locally/)
-3. `git clone https://github.com/bowang-lab/MedSAM`
-4. Enter the MedSAM folder `cd MedSAM` and run `pip install -e .`
 
+Environment Requirements: `Ubuntu 20.04` | Python `3.10` | `CUDA 12.1+` | `Pytorch 2.3.1`
+
+1. Create a virtual environment `conda create -n sam2_in_med python=3.10 -y` and activate it `conda activate sam2_in_med`
+2. Install [Pytorch 2.3.1+](https://pytorch.org/get-started/locally/)
+3. git clone -b MedSAM2 https://github.com/bowang-lab/MedSAM/`
+4. Set `CUDA_HOME` environment variable to the path of your CUDA installation. For example, `export CUDA_HOME=/usr/local/cuda-12.1`
+5. Enter the MedSAM2 folder `cd MedSAM2` and run `pip install -e .`
+> If one enconters error in building wheels, please refer to this [issue](https://github.com/facebookresearch/segment-anything-2/issues/142).
 
 ## Get Started
-Download the [model checkpoint](https://drive.google.com/drive/folders/1ETWmi4AiniJeWOt6HAsYgTjYv_fkgzoN?usp=drive_link) and place it at e.g., `work_dir/MedSAM/medsam_vit_b`
 
-We provide three ways to quickly test the model on your images
+1. Download [SAM2 checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt) and place it at `./checkpoints/sam2_hiera_tiny.pt` .
 
-1. Command line
+2. Download the [demo dataset](https://zenodo.org/records/7860267). This tutorial assumes it is unzipped it to `data/FLARE22Train/`.
 
-```bash
-python MedSAM_Inference.py # segment the demo image
-```
-
-Segment other images with the following flags
-```bash
--i input_img
--o output path
---box bounding box of the segmentation target
-```
-
-2. Jupyter-notebook
-
-We provide a step-by-step tutorial on [CoLab](https://colab.research.google.com/drive/19WNtRMbpsxeqimBlmJwtd1dzpaIvK2FZ?usp=sharing)
-
-You can also run it locally with `tutorial_quickstart.ipynb`.
-
-3. GUI
-
-Install `PyQt5` with [pip](https://pypi.org/project/PyQt5/): `pip install PyQt5 ` or [conda](https://anaconda.org/anaconda/pyqt): `conda install -c anaconda pyqt`
-
-```bash
-python gui.py
-```
-
-Load the image to the GUI and specify segmentation targets by drawing bounding boxes.
-
-
-
-https://github.com/bowang-lab/MedSAM/assets/19947331/a8d94b4d-0221-4d09-a43a-1251842487ee
-
-
-
-
-
-## Model Training
-
-### Data preprocessing
-
-Download [SAM checkpoint](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth) and place it at `work_dir/SAM/sam_vit_b_01ec64.pth` .
-
-Download the demo [dataset](https://zenodo.org/record/7860267) and unzip it to `data/FLARE22Train/`.
+### Data preparation and preprocessing
 
 This dataset contains 50 abdomen CT scans and each scan contains an annotation mask with 13 organs. The names of the organ label are available at [MICCAI FLARE2022](https://flare22.grand-challenge.org/).
 
-Run pre-processing
-
-Install `cc3d`: `pip install connected-components-3d`
-
+1. Run the pre-processing script to convert the dataset to `npz` format:
 ```bash
-python pre_CT_MR.py
+python pre_CT_MR.py \
+    -img_path data/FLARE22Train/images \
+    -img_name_suffix _0000.nii.gz \
+    -gt_path data/FLARE22Train/labels \
+    -gt_name_suffix .nii.gz \
+    -output_path data \
+    -num_workers 4 \
+    -modality CT \
+    -anatomy Abd \
+    -window_level 40 \
+    -window_width 400 \
+    --save_nii
+```
+- Split dataset: 80% for training and 20% for testing
+- Adjust CT scans to [soft tissue](https://radiopaedia.org/articles/windowing-ct) window level (40) and width (400)
+- Save the pre-processed images and labels as `npz` files
+- For detailed usage of the script, see `python pre_CT_MR.py -h`.
+
+2. Convert the training `npz` to `npy` format for training:
+```bash
+python npz_to_npy.py \
+    -npz_dir data/npz_train/CT_Abd \
+    -npy_dir data/npy \
+    -num_workers 4
+```
+> For more efficient fine-tuning, the ground truth `npy` masks are resampled to `[256, 256]`.
+
+### Fine-tune SAM2 on Abdomen CT Dataset
+
+> The fine-tuning pipeline requires about 42GB GPU memory with a batch size of 16 for the Tiny model on a single A6000 GPU.
+
+To fine-tune SAM2, run:
+```bash
+python finetune_sam2_img.py \
+    -i ./data/npy \
+    -task_name MedSAM2-Tiny-Flare22 \
+    -work_dir ./work_dir \
+    -batch_size 16 \
+    -pretrain_model_path ./checkpoints/sam2_hiera_tiny.pt \
+    -model_cfg sam2_hiera_t.yaml
 ```
 
-- split dataset: 80% for training and 20% for testing
-- adjust CT scans to [soft tissue](https://radiopaedia.org/articles/windowing-ct) window level (40) and width (400)
-- max-min normalization
-- resample image size to `1024x1024`
-- save the pre-processed images and labels as `npy` files
-
-
-### Training on multiple GPUs (Recommend)
-
-The model was trained on five A100 nodes and each node has four GPUs (80G) (20 A100 GPUs in total). Please use the slurm script to start the training process.
-
+To resume interrupted finetuning from a checkpoint, run:
 ```bash
-sbatch train_multi_gpus.sh
+python finetune_sam2_img.py \
+    -i ./data/npy \
+    -task_name MedSAM2-Tiny-Flare22 \
+    -work_dir ./work_dir \
+    -batch_size 16 \
+    -pretrain_model_path ./checkpoints/sam2_hiera_tiny.pt \
+    -model_cfg sam2_hiera_t.yaml \
+    -resume ./work_dir/<task_name>-<date>-<time>/medsam2_model_latest.pth
 ```
 
-When the training process is done, please convert the checkpoint to SAM's format for convenient inference.
+For additional command line arguments, see `python finetune_sam2_img.py -h`.
 
+## Inference
+The inference script assumes the testing data have been converted to `npz` format.
+To run inference on the 3D CT FLARE22 dataset with the fine-tuned model, run:
 ```bash
-python utils/ckpt_convert.py # Please set the corresponding checkpoint path first
+python infer_medsam2_flare22.py \
+    -data_root data/npz_test/CT_Abd \
+    -pred_save_dir segs/medsam2 \
+    -sam2_checkpoint checkpoints/sam2_hiera_tiny.pt \
+    -medsam2_checkpoint ./work_dir/medsam2_t_flare22.pth \
+    -model_cfg sam2_hiera_t.yaml \
+    -bbox_shift 5 \
+    -num_workers 10 \ ## number of workers for inference in parallel
+    --visualize ## Save segmentation, ground truth volume, and images in .nii.gz for visualization
 ```
 
-### Training on one GPU
-
+Similarly, to run inference with the vanilla SAM2 model as described in the paper, run:
 ```bash
-python train_one_gpu.py
+python infer_sam2_flare22.py \
+    -data_root data/npz_test/CT_Abd \
+    -pred_save_dir segs/sam2 \
+    -sam2_checkpoint checkpoints/sam2_hiera_tiny.pt \
+    -model_cfg sam2_hiera_t.yaml \
+    -bbox_shift 5 \
+    -num_workers 10
 ```
 
-If you only want to train the mask decoder, please check the tutorial on the [0.1 branch](https://github.com/bowang-lab/MedSAM/tree/0.1).
+## Evaluation
+
+The evaluation script to compute the Dice and NSD scores are provided under the `./metrics` folder. To evaluate the segmentation results, run:
+```bash
+python compute_metrics_flare22.py \
+    -s ../segs/medsam2 \
+    -g ../data/npz_test/CT_Abd \
+    -csv_dir ./medsam2
+```
+
+
+###  To-do list
+- support multi-gpu training
+- provide video tutorial 
 
 
 ## Acknowledgements
 - We highly appreciate all the challenge organizers and dataset owners for providing the public dataset to the community.
-- We thank Meta AI for making the source code of [segment anything](https://github.com/facebookresearch/segment-anything) publicly available.
-- We also thank Alexandre Bonnet for sharing this great [blog](https://encord.com/blog/learn-how-to-fine-tune-the-segment-anything-model-sam/)
+- We thank Meta AI for making the source code of [SAM2](https://github.com/facebookresearch/segment-anything-2) publicly available.
 
 
 ## Reference
@@ -118,7 +136,7 @@ If you only want to train the mask decoder, please check the tutorial on the [0.
   author={Ma, Jun and He, Yuting and Li, Feifei and Han, Lin and You, Chenyu and Wang, Bo},
   journal={Nature Communications},
   volume={15},
-  pages={1--9},
+  pages={654},
   year={2024}
 }
 ```
