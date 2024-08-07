@@ -2,7 +2,7 @@
 
 This is the official repository for bechmarking and fine-tuning SAM2 on medical images. 
 
-[[`Paper`]()] [[`Gradio API`](./app.py)] [[`3D Slicer Plugin`](https://github.com/bowang-lab/MedSAMSlicer/tree/SAM2)] [[`Dataset`](https://www.codabench.org/competitions/1847/)] 
+[[`Paper`](https://arxiv.org/abs/2408.03322)] [[`Gradio API`](./app.py)] [[`3D Slicer Plugin`](https://github.com/bowang-lab/MedSAMSlicer/tree/SAM2)] [[`Dataset`](https://www.codabench.org/competitions/1847/)] 
 
 
 
@@ -151,8 +151,9 @@ python compute_metrics_flare22.py \
 
 
 ## Acknowledgements
-- We highly appreciate all the challenge organizers and dataset owners for providing the public dataset to the community.
+- We highly appreciate all the dataset owners for providing the public dataset to the community.
 - We thank Meta AI for making the source code of [SAM2](https://github.com/facebookresearch/segment-anything-2) publicly available.
+- We thank 3D Slicer and Gradio team for providing the user-friendly platforms
 
 
 ## Reference
@@ -161,7 +162,7 @@ python compute_metrics_flare22.py \
 @article{MedSAM2-Eval-Deploy,
     title={U-Mamba: Enhancing Long-range Dependency for Biomedical Image Segmentation},
     author={Ma, Jun and Kim, Sumin and Li, Feifei and Baharoon, Mohammed and Askereh, Reza and Lyu, Hongwei and Wang, Bo},
-    journal={arXiv preprint arXiv:2408.},
+    journal={arXiv preprint arXiv:2408.03322},
     year={2024}
 }
       
