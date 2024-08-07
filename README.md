@@ -1,8 +1,9 @@
 # Segment Anything In Medical Images and Videos: Benchmark and Deployment
 
-This is the official repository for bechmarking and fine-tuning SAM2 on medical images. 
+This is the official repository for benchmarking and fine-tuning SAM2 on medical images. Welcome to join our [mailing list](https://forms.gle/hk4Efp6uWnhjUHFP6) to get updates.
 
-[[`Paper`](https://arxiv.org/abs/2408.03322)] [[`Gradio API`](./app.py)] [[`3D Slicer Plugin`](https://github.com/bowang-lab/MedSAMSlicer/tree/SAM2)] [[`Dataset`](https://www.codabench.org/competitions/1847/)] 
+
+[[`Paper`](https://arxiv.org/abs/2408.03322)] [[`Gradio API`](./app.py)] [[`3D Slicer Plugin`](https://github.com/bowang-lab/MedSAMSlicer/tree/SAM2)] 
 
 
 
