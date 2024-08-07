@@ -4,6 +4,16 @@ This is the official repository for bechmarking and fine-tuning SAM2 on medical 
 
 [[`Paper`]()] [[`Gradio API`](./app.py)] [[`3D Slicer Plugin`](https://github.com/bowang-lab/MedSAMSlicer/tree/SAM2)] [[`Dataset`](https://www.codabench.org/competitions/1847/)] 
 
+
+
+
+
+https://github.com/user-attachments/assets/48d32ef4-1f15-469e-993a-bdf8854ec88c
+
+
+
+
+
 ## Installation
 
 Environment Requirements: `Ubuntu 20.04` | Python `3.10` | `CUDA 12.1+` | `Pytorch 2.3.1`
