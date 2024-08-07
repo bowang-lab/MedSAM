@@ -161,7 +161,7 @@ python compute_metrics_flare22.py \
 
 ```
 @article{MedSAM2-Eval-Deploy,
-    title={U-Mamba: Enhancing Long-range Dependency for Biomedical Image Segmentation},
+    title={Segment Anything in Medical Images and Videos: Benchmark and Deployment},
     author={Ma, Jun and Kim, Sumin and Li, Feifei and Baharoon, Mohammed and Askereh, Reza and Lyu, Hongwei and Wang, Bo},
     journal={arXiv preprint arXiv:2408.03322},
     year={2024}
