@@ -1,6 +1,9 @@
 # MedSAM
 This is the official repository for MedSAM: Segment Anything in Medical Images.
 
+Welcome to join our [mailing list](https://forms.gle/hk4Efp6uWnhjUHFP6) to get updates.
+
+
 ## News
 
 - 2024.08.06: Benchmark, Transfer Learning, and Deployment of [SAM2](https://github.com/facebookresearch/segment-anything-2): [[`Paper`](https://arxiv.org/abs/2408.03322)] [[`Code`](https://github.com/bowang-lab/MedSAM/tree/MedSAM2)] [[`Gradio API`](https://github.com/bowang-lab/MedSAM/blob/MedSAM2/app.py)] [[`3D Slicer Plugin`](https://github.com/bowang-lab/MedSAMSlicer/tree/SAM2)]
