@@ -1,6 +1,8 @@
 # Segment Anything In Medical Images and Videos: Benchmark and Deployment
 
-This is the official repository for fine-tuning SAM2 on medical images. 
+This is the official repository for bechmarking and fine-tuning SAM2 on medical images. 
+
+[[`Paper`]()] [[`Gradio API`](./app.py)] [[`3D Slicer Plugin`](https://github.com/bowang-lab/MedSAMSlicer/tree/SAM2)] [[`Dataset`](https://www.codabench.org/competitions/1847/)] 
 
 ## Installation
 
@@ -8,16 +10,31 @@ Environment Requirements: `Ubuntu 20.04` | Python `3.10` | `CUDA 12.1+` | `Pytor
 
 1. Create a virtual environment `conda create -n sam2_in_med python=3.10 -y` and activate it `conda activate sam2_in_med`
 2. Install [Pytorch 2.3.1+](https://pytorch.org/get-started/locally/)
-3. git clone -b MedSAM2 https://github.com/bowang-lab/MedSAM/`
+3. git clone -b MedSAM2 https://github.com/bowang-lab/MedSAM/
 4. Set `CUDA_HOME` environment variable to the path of your CUDA installation. For example, `export CUDA_HOME=/usr/local/cuda-12.1`
 5. Enter the MedSAM2 folder `cd MedSAM2` and run `pip install -e .`
-> If one enconters error in building wheels, please refer to this [issue](https://github.com/facebookresearch/segment-anything-2/issues/142).
+> If one enconters error in building wheels, please refer to [common installation issues](https://github.com/facebookresearch/segment-anything-2/blob/main/INSTALL.md#common-installation-issues).
+
+## Gradio API
+
+1. Install dependencies 
+
+```bash
+pip install gradio==3.38.0
+sudo add-apt-repository ppa:jonathonf/ffmpeg-4
+sudo apt-get update
+sudo apt-get install ffmpeg
+```
+
+2. Run `python app.py`
 
 ## Get Started
 
 1. Download [SAM2 checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt) and place it at `./checkpoints/sam2_hiera_tiny.pt` .
 
 2. Download the [demo dataset](https://zenodo.org/records/7860267). This tutorial assumes it is unzipped it to `data/FLARE22Train/`.
+
+> zenodo_get 7860267
 
 ### Data preparation and preprocessing
 
@@ -131,12 +148,12 @@ python compute_metrics_flare22.py \
 ## Reference
 
 ```
-@article{MedSAM,
-  title={Segment Anything in Medical Images},
-  author={Ma, Jun and He, Yuting and Li, Feifei and Han, Lin and You, Chenyu and Wang, Bo},
-  journal={Nature Communications},
-  volume={15},
-  pages={654},
-  year={2024}
+@article{MedSAM2-Eval-Deploy,
+    title={U-Mamba: Enhancing Long-range Dependency for Biomedical Image Segmentation},
+    author={Ma, Jun and Kim, Sumin and Li, Feifei and Baharoon, Mohammed and Askereh, Reza and Lyu, Hongwei and Wang, Bo},
+    journal={arXiv preprint arXiv:2408.},
+    year={2024}
 }
+      
 ```
+
