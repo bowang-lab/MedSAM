@@ -415,35 +415,7 @@ def seg_track_app():
                 output_mp4 = gr.File(label="Predicted video")
                 output_mask = gr.File(label="Predicted masks")
 
-        # with gr.Tab(label='Video examples'):
-        #     gr.Examples(
-        #         label="",
-        #         examples=[
-        #             "assets1/clip_012251_fps5_07_25.mp4",
-        #             "assets1/FLARE22_Tr_0004.mp4",
-        #             "assets1/FLARE22_Tr_0016.mp4",
-        #             "assets1/FLARE22_Tr_0046.mp4",
-        #             "assets1/c_elegans_mov_cut_fps12.mp4",
-        #             "assets1/12fps_Dylan_Burnette_neutrophil.mp4",
-        #             "assets1/12fps_Dancing_cells_trimmed.mp4",
-        #         ],
-        #         inputs=[input_video],
-        #     )
-        #     gr.Examples(
-        #         label="",
-        #         examples=[
-        #             "assets1/12fps_volvox_microcystis_play_trimmed.mp4",
-        #             "assets1/12fps_neuron_time_lapse.mp4",
-        #             "assets1/12fps_macrophages_phagocytosis.mp4",
-        #             "assets1/12fps_worm_eats_organism_3.mp4",
-        #             "assets1/12fps_worm_eats_organism_4.mp4",
-        #             "assets1/12fps_worm_eats_organism_5.mp4",
-        #             "assets1/12fps_worm_eats_organism_6.mp4",
-        #             "assets1/12fps_02_cups.mp4",
-        #         ],
-        #         inputs=[input_video],
-        #     )
-        
+
         gr.Markdown(
             '''
             <div style="text-align:center; margin-top: 20px;">
