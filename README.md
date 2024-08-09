@@ -39,13 +39,12 @@ sudo apt-get install ffmpeg
 
 2. Run `python app.py`
 
-## Get Started
+## Fine-tune SAM2 on the Abdomen CT Dataset
 
 1. Download [SAM2 checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt) and place it at `./checkpoints/sam2_hiera_tiny.pt` .
 
 2. Download the [demo dataset](https://zenodo.org/records/7860267). This tutorial assumes it is unzipped it to `data/FLARE22Train/`.
-
-> zenodo_get 7860267
+Or directly run `pip install zenodo_get` and `zenodo_get7860267`
 
 ### Data preparation and preprocessing
 
@@ -80,7 +79,7 @@ python npz_to_npy.py \
 ```
 > For more efficient fine-tuning, the ground truth `npy` masks are resampled to `[256, 256]`.
 
-### Fine-tune SAM2 on Abdomen CT Dataset
+### Model Fine-tuning
 
 > The fine-tuning pipeline requires about 42GB GPU memory with a batch size of 16 for the Tiny model on a single A6000 GPU.
 
