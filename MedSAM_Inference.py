@@ -101,7 +101,7 @@ parser.add_argument(
     "-chk",
     "--checkpoint",
     type=str,
-    default="work_dir/MedSAM/medsam_vit_b.pth",
+    default="medsam_vit_b.pth",
     help="path to the trained model",
 )
 args = parser.parse_args()
