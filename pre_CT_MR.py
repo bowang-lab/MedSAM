@@ -110,7 +110,7 @@ def preprocess(name, npz_path):
         )
         # put the tumor instances back to gt_data_ori
         gt_data_ori[tumor_inst > 0] = (
-            tumor_inst[tumor_inst > 0] + np.max(gt_data_ori) + 1
+            tumor_inst[tumor_inst > 0] + np.max(gt_data_ori)
         )
 
     # exclude the objects with less than 1000 pixels in 3D
