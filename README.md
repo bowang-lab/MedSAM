@@ -6,7 +6,8 @@ Welcome to join our [mailing list](https://forms.gle/hk4Efp6uWnhjUHFP6) to get u
 
 ## News
 
-- 2024.08.06: Med[SAM2](https://github.com/facebookresearch/segment-anything-2)-Segment Anything in Medical Images and Videos: Benchmark and Deployment [[`Paper`](https://arxiv.org/abs/2408.03322)] [[`Code`](https://github.com/bowang-lab/MedSAM/tree/MedSAM2)] [[Online Demo](https://huggingface.co/spaces/junma/MedSAM2)] [[`Gradio API`](https://github.com/bowang-lab/MedSAM/blob/MedSAM2/app.py)] [[`3D Slicer Plugin`](https://github.com/bowang-lab/MedSAMSlicer/tree/SAM2)] [[Fine-tune SAM2](https://github.com/bowang-lab/MedSAM/tree/MedSAM2?tab=readme-ov-file#fine-tune-sam2-on-the-abdomen-ct-dataset)]
+- 2025.04.07: Release [MedSAM2](https://github.com/bowang-lab/MedSAM2) for 3D and video segmentation.
+- 2025.02: Welcome to join CVPR 2025 Challenges: [Interactive](https://www.codabench.org/competitions/5263/) and [Text-guided](https://www.codabench.org/competitions/5651/) 3D Biomedical Image Segmentation
 - 2024.01.15: Welcome to join [CVPR 2024 Challenge: MedSAM on Laptop](https://www.codabench.org/competitions/1847/)
 - 2024.01.15: Release [LiteMedSAM](https://github.com/bowang-lab/MedSAM/blob/LiteMedSAM/README.md) and [3D Slicer Plugin](https://github.com/bowang-lab/MedSAMSlicer), 10x faster than MedSAM! 
 
