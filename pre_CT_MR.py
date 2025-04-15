@@ -58,8 +58,8 @@ os.makedirs(npz_ts_path, exist_ok=True)
 
 num_workers = args.num_workers
 
-voxel_num_thre2d = 100
-voxel_num_thre3d = 1000
+voxel_num_thre2d = 10
+voxel_num_thre3d = 100
 
 names = sorted(os.listdir(gt_path))
 print(f"ori \# files {len(names)=}")
