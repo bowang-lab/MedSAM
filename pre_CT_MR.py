@@ -32,6 +32,7 @@ parser.add_argument("-output_path", type=str, default="data/npz",
                     help="Path to save the npy files, [default: ./data/npz]")
 parser.add_argument("-num_workers", type=int, default=4,
                     help="Number of workers, [default: 4]")
+# common windows for CT scans https://radiopaedia.org/articles/windowing-ct
 parser.add_argument("-window_level", type=int, default=40,
                     help="CT window level, [default: 40]")
 parser.add_argument("-window_width", type=int, default=400,
