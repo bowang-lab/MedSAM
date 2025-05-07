@@ -61,8 +61,10 @@ class NpyDataset(Dataset):
         self.gt_path = join(data_root, "gts")
         self.img_path = join(data_root, "imgs")
         self.gt_path_files = sorted(
-            glob.glob(join(self.gt_path, "**/*.npy"), recursive=True)
+            glob.glob(join(self.gt_path, "**/*.npy.npz"), recursive=True)
         )
+        print(f"number of images: {len(self.gt_path_files)}")
+
         self.gt_path_files = [
             file
             for file in self.gt_path_files
@@ -80,6 +82,10 @@ class NpyDataset(Dataset):
         img_1024 = np.load(
             join(self.img_path, img_name), "r", allow_pickle=True
         )  # (1024, 1024, 3)
+
+        # Access the array using the default key 'arr_0'
+        img_1024 = img_1024['arr_0']/255.0  # Use the key 'arr_0' here
+
         # convert the shape to (3, H, W)
         img_1024 = np.transpose(img_1024, (2, 0, 1))
         assert (
@@ -87,24 +93,37 @@ class NpyDataset(Dataset):
         ), "image should be normalized to [0, 1]"
         gt = np.load(
             self.gt_path_files[index], "r", allow_pickle=True
-        )  # multiple labels [0, 1,4,5...], (256,256)
+        )['arr_0']  # Use the key 'arr_0' here  # multiple labels [0, 1,4,5...], (256,256)
         assert img_name == os.path.basename(self.gt_path_files[index]), (
             "img gt name error" + self.gt_path_files[index] + self.npy_files[index]
         )
         label_ids = np.unique(gt)[1:]
-        gt2D = np.uint8(
-            gt == random.choice(label_ids.tolist())
-        )  # only one label, (256, 256)
-        assert np.max(gt2D) == 1 and np.min(gt2D) == 0.0, "ground truth should be 0, 1"
-        y_indices, x_indices = np.where(gt2D > 0)
-        x_min, x_max = np.min(x_indices), np.max(x_indices)
-        y_min, y_max = np.min(y_indices), np.max(y_indices)
-        # add perturbation to bounding box coordinates
-        H, W = gt2D.shape
-        x_min = max(0, x_min - random.randint(0, self.bbox_shift))
-        x_max = min(W, x_max + random.randint(0, self.bbox_shift))
-        y_min = max(0, y_min - random.randint(0, self.bbox_shift))
-        y_max = min(H, y_max + random.randint(0, self.bbox_shift))
+        if label_ids.size > 0:
+            gt2D = np.uint8(gt == random.choice(label_ids.tolist()))  # Choose a random label
+        else:
+            gt2D = np.zeros_like(gt)  # If no labels, create an empty mask
+            # print("Warning: No labels found other than background. Returning an empty mask.")
+
+        # Check and handle if gt2D is empty
+        if np.max(gt2D) == 0:  # Means gt2D contains no positive labels
+            y_indices, x_indices = np.array([]), np.array([])
+        else:
+            y_indices, x_indices = np.where(gt2D > 0)
+
+        # If no indices are found, set bounding box to zero-size at top left corner
+        if y_indices.size == 0 or x_indices.size == 0:
+            x_min, x_max, y_min, y_max = 0, 0, 0, 0
+        else:
+            x_min, x_max = np.min(x_indices), np.max(x_indices)
+            y_min, y_max = np.min(y_indices), np.max(y_indices)
+            # Add perturbation to bounding box coordinates
+            H, W = gt2D.shape
+            x_min = max(0, x_min - random.randint(0, self.bbox_shift))
+            x_max = min(W, x_max + random.randint(0, self.bbox_shift))
+            y_min = max(0, y_min - random.randint(0, self.bbox_shift))
+            y_max = min(H, y_max + random.randint(0, self.bbox_shift))
+
+
         bboxes = np.array([x_min, y_min, x_max, y_max])
         return (
             torch.tensor(img_1024).float(),
@@ -115,7 +134,7 @@ class NpyDataset(Dataset):
 
 
 # %% sanity test of dataset class
-tr_dataset = NpyDataset("data/npy/CT_Abd")
+tr_dataset = NpyDataset("/app/data/medsam_practice/npy/Ultrasound_femoralTriangle")
 tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
 for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):
     print(image.shape, gt.shape, bboxes.shape)
@@ -147,7 +166,7 @@ parser.add_argument(
     "-i",
     "--tr_npy_path",
     type=str,
-    default="data/npy/CT_Abd",
+    default="/app/data/medsam_practice/npy/Ultrasound_femoralTriangle",
     help="path to training npy files; two subfolders: gts and imgs",
 )
 parser.add_argument("-task_name", type=str, default="MedSAM-ViT-B")
@@ -162,9 +181,9 @@ parser.add_argument(
 parser.add_argument("-pretrain_model_path", type=str, default="")
 parser.add_argument("-work_dir", type=str, default="./work_dir")
 # train
-parser.add_argument("-num_epochs", type=int, default=1000)
+parser.add_argument("-num_epochs", type=int, default=5)
 parser.add_argument("-batch_size", type=int, default=2)
-parser.add_argument("-num_workers", type=int, default=0)
+parser.add_argument("-num_workers", type=int, default=4)
 # Optimizer parameters
 parser.add_argument(
     "-weight_decay", type=float, default=0.01, help="weight decay (default: 0.01)"
@@ -298,6 +317,7 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=True
     )
 
     start_epoch = 0
