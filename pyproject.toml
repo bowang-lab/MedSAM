@@ -1,0 +1,51 @@
+[tool.poetry]
+name = "medsam"
+version = "0.0.1"
+description = ""
+authors = ["Jun Ma", "Soumick Chatterjee, PhD <soumick.chatterjee@fht.org>"] 
+license = "Apache-2.0"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+
+# Dependencies from install_requires
+matplotlib = "*"
+scikit-image = "*"
+SimpleITK = ">=2.2.1"
+nibabel = "*"
+tqdm = "*"
+scipy = "*"
+ipympl = "*"
+opencv-python = "*"
+jupyterlab = "*"
+ipywidgets = "*"
+
+# Dependencies from the CustomInstall class
+monai = "*"
+numpy = ">=2.0.0"
+torch = {version = "^2.7.1+cu118", source = "pytorch"}
+torchvision = {version = "^0.22.1+cu118", source = "pytorch"}
+torchaudio = {version = "^2.7.1+cu118", source = "pytorch"}
+
+[[tool.poetry.source]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu118"
+priority = "explicit"
+
+[tool.poetry.group.all.dependencies]
+# Corresponds to extras_require["all"]
+pycocotools = "*"
+onnx = "*"
+onnxruntime = "*"
+
+[tool.poetry.group.dev.dependencies]
+# Corresponds to extras_require["dev"]
+flake8 = "*"
+isort = "*"
+black = "*"
+mypy = "*"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
