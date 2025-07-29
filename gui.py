@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import sys
+from contextlib import suppress
 import time
 from PyQt5.QtGui import (
     QBrush,
@@ -27,6 +28,10 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QShortcut,
+    QInputDialog,
+    QDialog,
+    QLabel,
+    QComboBox
 )
 
 import numpy as np
@@ -36,6 +41,13 @@ import torch.nn as nn
 from torch.nn import functional as F
 from PIL import Image
 from segment_anything import sam_model_registry
+
+#The following imports are optional (only if NII or DICOM files are used, respectively), so will be suppressed if not available - to avoid breaking the script in case the packages aren't available
+with suppress(ImportError):
+    import nibabel as nib
+
+with suppress(ImportError):
+    import pydicom
 
 # freeze seeds
 torch.manual_seed(2023)
@@ -194,18 +206,145 @@ class Window(QWidget):
 
     def load_image(self):
         file_path, file_type = QFileDialog.getOpenFileName(
-            self, "Choose Image to Segment", ".", "Image Files (*.png *.jpg *.bmp)"
+            self, "Choose Image to Segment", ".", 
+            "Image Files (*.png *.jpg *.bmp *.nii *.nii.gz *.dcm)"
         )
 
         if file_path is None or len(file_path) == 0:
             print("No image path specified, plz select an image")
             exit()
 
-        img_np = io.imread(file_path)
-        if len(img_np.shape) == 2:
+        if file_path.endswith('.nii') or file_path.endswith('.nii.gz'):
+            nii = nib.load(file_path)
+            data = nii.get_fdata().squeeze()
+            if data.ndim == 2:
+                img_np = data
+            elif data.ndim == 3:
+                # Ask user for slice dimension
+                dim_labels = [f"Dim {i} (size={data.shape[i]})" for i in range(3)]
+                dim_idx, ok_dim = QInputDialog.getItem(
+                    self, "Select Slice Dimension", "Slice dimension:", dim_labels, 2, False
+                )
+                if not ok_dim:
+                    print("No dimension selected, aborting.")
+                    return
+                slice_dim = int(dim_idx.split()[1])
+                max_slice = data.shape[slice_dim] - 1
+                idx, ok = QInputDialog.getInt(
+                    self, "Select Slice", f"Slice index (0-{max_slice}) along dimension {slice_dim}:", 0, 0, max_slice, 1
+                )
+                if not ok:
+                    print("No slice selected, aborting.")
+                    return
+                # Get the slice along the selected dimension
+                slicer = [slice(None)] * 3
+                slicer[slice_dim] = idx
+                img_np = data[tuple(slicer)]
+            elif data.ndim > 3:
+                # Ask user for H and W dims in one dialog with two dropdowns
+                class HWDialog(QDialog):
+                    def __init__(self, dim_labels, parent=None):
+                        super().__init__(parent)
+                        self.setWindowTitle("Select Height and Width Dims")
+                        self.h_dim = 0
+                        self.w_dim = 1 if len(dim_labels) > 1 else 0
+                        vbox = QVBoxLayout()
+                        # Height selection
+                        vbox.addWidget(QLabel("Height dim:"))
+                        self.h_combo = QComboBox()
+                        self.h_combo.setMinimumWidth(250)
+                        self.h_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+                        self.h_combo.addItems(dim_labels)
+                        vbox.addWidget(self.h_combo)
+                        # Width selection
+                        vbox.addWidget(QLabel("Width dim:"))
+                        self.w_combo = QComboBox()
+                        self.w_combo.setMinimumWidth(250)
+                        self.w_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+                        self.w_combo.addItems(dim_labels)
+                        self.w_combo.setCurrentIndex(1 if len(dim_labels) > 1 else 0)
+                        vbox.addWidget(self.w_combo)
+                        self.error_label = QLabel("")
+                        vbox.addWidget(self.error_label)
+                        btn_box = QHBoxLayout()
+                        ok_btn = QPushButton("OK")
+                        cancel_btn = QPushButton("Cancel")
+                        btn_box.addWidget(ok_btn)
+                        btn_box.addWidget(cancel_btn)
+                        vbox.addLayout(btn_box)
+                        self.setLayout(vbox)
+                        ok_btn.clicked.connect(self.accept)
+                        cancel_btn.clicked.connect(self.reject)
+                        self.h_combo.currentIndexChanged.connect(self._update_w_combo)
+                        self.w_combo.currentIndexChanged.connect(self._update_h_combo)
+                    def _update_w_combo(self):
+                        h_idx = self.h_combo.currentIndex()
+                        w_idx = self.w_combo.currentIndex()
+                        if h_idx == w_idx:
+                            # Move width to next available
+                            for i in range(self.w_combo.count()):
+                                if i != h_idx:
+                                    self.w_combo.setCurrentIndex(i)
+                                    break
+                    def _update_h_combo(self):
+                        h_idx = self.h_combo.currentIndex()
+                        w_idx = self.w_combo.currentIndex()
+                        if h_idx == w_idx:
+                            # Move height to next available
+                            for i in range(self.h_combo.count()):
+                                if i != w_idx:
+                                    self.h_combo.setCurrentIndex(i)
+                                    break
+                    def get_dims(self):
+                        return self.h_combo.currentIndex(), self.w_combo.currentIndex()
+                dim_labels = [f"Dim {i} (size={data.shape[i]})" for i in range(data.ndim)]
+                dlg = HWDialog(dim_labels, self)
+                if not dlg.exec_():
+                    print("No height/width dims selected, aborting.")
+                    return
+                h_dim, w_dim = dlg.get_dims()
+                # Other dims: ask for index
+                other_dims = [i for i in range(data.ndim) if i not in [h_dim, w_dim]]
+                slicer = [0] * data.ndim
+                for d in other_dims:
+                    max_idx = data.shape[d] - 1
+                    idx, ok = QInputDialog.getInt(
+                        self, f"Select Index for Dim {d}", f"Index for dimension {d} (0-{max_idx}):", 0, 0, max_idx, 1
+                    )
+                    if not ok:
+                        print(f"No index selected for dimension {d}, aborting.")
+                        return
+                    slicer[d] = idx
+                # Set slices for H and W
+                slicer[h_dim] = slice(None)
+                slicer[w_dim] = slice(None)
+                img_np = data[tuple(slicer)]
+                # Ensure H is first, W is second
+                if h_dim > w_dim:
+                    img_np = np.transpose(img_np, (1, 0))
+            else:
+                print("Unsupported NIfTI shape.")
+                return
+            # Normalise and convert to uint8
+            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8) * 255
+            img_np = img_np.astype(np.uint8)
             img_3c = np.repeat(img_np[:, :, None], 3, axis=-1)
+        elif file_path.endswith('.dcm'):
+            ds = pydicom.dcmread(file_path)
+            img_np = ds.pixel_array
+            # Normalise and convert to uint8
+            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8) * 255
+            img_np = img_np.astype(np.uint8)
+            if len(img_np.shape) == 2:
+                img_3c = np.repeat(img_np[:, :, None], 3, axis=-1)
+            else:
+                img_3c = img_np  # In case it's already 3-channel (rare)
         else:
-            img_3c = img_np
+            img_np = io.imread(file_path)
+            if len(img_np.shape) == 2:
+                img_3c = np.repeat(img_np[:, :, None], 3, axis=-1)
+            else:
+                img_3c = img_np
 
         self.img_3c = img_3c
         self.image_path = file_path
@@ -297,8 +436,25 @@ class Window(QWidget):
         self.bg_img = self.scene.addPixmap(np2pixmap(np.array(img)))
 
     def save_mask(self):
-        out_path = f"{self.image_path.split('.')[0]}_mask.png"
-        io.imsave(out_path, self.mask_c)
+        # Ask user for save location and format
+        out_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Mask",
+            self.image_path.rsplit('.', 1)[0] + "_mask",
+            "PNG Image (*.png);;NIfTI Image (*.nii *.nii.gz)"
+        )
+        if not out_path:
+            print("Save cancelled.")
+            return
+        if selected_filter.startswith("PNG") or out_path.lower().endswith(".png"):
+            # Save as PNG
+            io.imsave(out_path if out_path.lower().endswith('.png') else out_path + '.png', self.mask_c)
+        elif selected_filter.startswith("NIfTI") or out_path.lower().endswith(".nii") or out_path.lower().endswith(".nii.gz"):
+            nii_img = nib.Nifti1Image(self.mask_c, affine=np.eye(4))
+            nib.save(nii_img, out_path)
+        else:
+            print("Unknown format selected.")
+            return
 
     @torch.no_grad()
     def get_embeddings(self):
