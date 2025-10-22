@@ -21,7 +21,7 @@ CONFIG="${SCRATCH_DIR}/src/configs/pipeline_hpc.yaml"
 
 # Create dirs (fix logs path)
 mkdir -p "$(dirname "${CONFIG}")" \
-       "${SCRATCH_DIR}/data" \
+       "${SCRATCH_DIR}/data3" \
        "${SCRATCH_DIR}/logs"
 
 # --- Conda env ---

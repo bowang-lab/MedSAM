@@ -9,12 +9,12 @@ disc_masks:  "/scratch/st-ipor-1/cperez/MedSAM/bounding_box/data/disc_masks"
 cup_masks:   "/scratch/st-ipor-1/cperez/MedSAM/bounding_box/data/cup_masks"
 
 # ---- Outputs ----
-labels_dir:      "/scratch/st-ipor-1/cperez/MedSAM/data2/labels"
-yolo_split:      "/scratch/st-ipor-1/cperez/MedSAM/data2/yolo_split"
-yolo_aug:        "/scratch/st-ipor-1/cperez/MedSAM/data2/yolo_split_aug"
-yolo_roi:        "/scratch/st-ipor-1/cperez/MedSAM/data2/yolo_split_cupROI"
-yolo_disc_only:  "/scratch/st-ipor-1/cperez/MedSAM/data2/yolo_split_disc_only"
-viz_out:         "/scratch/st-ipor-1/cperez/MedSAM/data2/viz_labels"
+labels_dir:      "/scratch/st-ipor-1/cperez/MedSAM/data3/labels"
+yolo_split:      "/scratch/st-ipor-1/cperez/MedSAM/data3/yolo_split"
+yolo_aug:        "/scratch/st-ipor-1/cperez/MedSAM/data3/yolo_split_aug"
+yolo_roi:        "/scratch/st-ipor-1/cperez/MedSAM/data3/yolo_split_cupROI"
+yolo_disc_only:  "/scratch/st-ipor-1/cperez/MedSAM/data3/yolo_split_disc_only"
+viz_out:         "/scratch/st-ipor-1/cperez/MedSAM/data3/viz_labels"
 
 # ---- Which stages to run ----
 all: true         # defaults to collect,split,save,augment,disc_only,roi when steps is not set
@@ -28,7 +28,7 @@ prefer_copy: false          # set true only if your FS disallows symlinks
 
 # ---- Split config ----
 val_frac: 0.15
-test_frac: 0.15
+test_frac: 0.1
 seed: 1337
 patient_regex: ""           # optional regex with ONE capturing group for patient ID
 
