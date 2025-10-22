@@ -23,7 +23,7 @@ transform:
     scale: [0.9, 1.0]
     ratio: [0.9, 1.1]
   color_jitter:
-    p: 0.5
+    p: 0.8
     brightness: 0.2
     contrast: 0.2
     saturation: 0.2

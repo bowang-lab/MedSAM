@@ -28,7 +28,7 @@ prefer_copy: false       # set true on filesystems that dislike symlinks (OneDri
 
 # ---- Split config ----
 val_frac: 0.15
-test_frac: 0.15
+test_frac: 0.10
 seed: 1337
 patient_regex: ""        # optional regex with one capturing group if you need custom subject_id grouping
 
