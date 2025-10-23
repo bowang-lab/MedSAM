@@ -248,7 +248,43 @@ def main() -> None:
     )
 
     model.train(**overrides)
+
     print("[OK] Training complete.")
+
+    # --- Evaluate on test split (if present), else fall back to val ---
+    # Load data.yaml to see if 'test' exists
+    dy = yaml.safe_load(train_cfg.data.read_text()) or {}
+    has_test = bool(dy.get("test"))
+
+    # Locate best checkpoint
+    best_ckpt = train_cfg.runs_root / train_cfg.name / "weights" / "best.pt"
+    last_ckpt = train_cfg.runs_root / train_cfg.name / "weights" / "last.pt"
+    ckpt_path = best_ckpt if best_ckpt.exists() else (last_ckpt if last_ckpt.exists() else None)
+    if ckpt_path is None:
+        print("[WARN] No checkpoint found for test evaluation.")
+        return
+
+    tester = YOLO(str(ckpt_path))
+    split = "test" if has_test else "val"
+    print(f"[EVAL] Evaluating checkpoint on split='{split}' …")
+    val_res = tester.val(
+        data=str(train_cfg.data),
+        split=split,
+        imgsz=train_cfg.imgsz,
+        device=train_cfg.device,
+        plots=True  # saves PR curves, confusion matrix, etc. into the run dir
+    )
+
+    # Try to print a compact metrics summary (keys vary slightly by version/task)
+    try:
+        metrics = getattr(val_res, "results_dict", None) or {}
+        if metrics:
+            print("[EVAL] Metrics:", {k: float(v) for k, v in metrics.items()})
+        else:
+            print("[EVAL] Finished; see run directory for detailed metrics/plots.")
+    except Exception:
+        print("[EVAL] Finished; see run directory for detailed metrics/plots.")
+
 
 
 if __name__ == "__main__":
