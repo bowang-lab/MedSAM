@@ -23,7 +23,7 @@ ENV_PREFIX="/arc/project/st-ipor-1/carlosp/envs/medsam"
 # Make project importable as `src.*`
 export PYTHONPATH="${PROJ_DIR}:${PYTHONPATH:-}"
 
-TRAIN_MOD="src.model.train_multiclass"
+TRAIN_MOD="src.scripts.train_multiclass"
 RUNS_DIR="${PROJ_DIR}/runs/detect"
 WEIGHTS_LOCAL="${PROJ_DIR}/weights/yolo12x.pt"
 EXP_NAME="multiclass_12x"
@@ -83,7 +83,6 @@ echo "YOLO_DEVICES=${YOLO_DEVICES}"
 nvidia-smi -L || true
 
 # -------- Sanity checks --------
-[[ -d "${ROI_ROOT}"     ]] || { echo "[ERR] ROI root not found: ${ROI_ROOT}" >&2; exit 2; }
 [[ -f "${WEIGHTS_LOCAL}" ]]|| { echo "[ERR] Local weights not found: ${WEIGHTS_LOCAL}" >&2; exit 2; }
 
 # -------- Build args safely --------
