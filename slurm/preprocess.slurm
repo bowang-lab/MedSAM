@@ -4,10 +4,10 @@
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=24
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=32G
 #SBATCH --time=1:00:00
-#SBATCH --gpus=4
+#SBATCH --gpus=1
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/logs/%x-%j.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/logs/%x-%j.err
 #SBATCH --mail-user=cperez67@student.ubc.ca
