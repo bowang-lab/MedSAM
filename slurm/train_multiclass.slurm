@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --time=48:00:00
 #SBATCH --gpus=4
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/logs/%x-%j.out
@@ -28,7 +28,7 @@ RUNS_DIR="${PROJ_DIR}/runs/detect"
 WEIGHTS_LOCAL="${PROJ_DIR}/weights/yolo12x.pt"
 EXP_NAME="multiclass_12x"
 
-CONFIG="${PROJ_DIR}/src/configs/train.yaml"
+CONFIG="${PROJ_DIR}/src/configs/train_hpc.yaml"
 
 mkdir -p "${PROJ_DIR}/logs" "${RUNS_DIR}"
 

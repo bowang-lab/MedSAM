@@ -1,0 +1,51 @@
+# ------------------ data & outputs ------------------
+data: "/scratch/st-ipor-1/cperez/MedSAM/data/yolo_multiclass/data.yaml"
+runs_root: "/scratch/st-ipor-1/cperez/MedSAM/runs/detect"
+
+# ------------------ model choice --------------------
+# If 'weights' is omitted, it's picked from (family,size).
+weights: "/scratch/st-ipor-1/cperez/MedSAM/bounding_box/weights/yolo12x.pt"
+family: "auto"      # auto | yolo12 | yolo11 | yolov8
+size: "x"           # n | s | m | l | x
+
+# ------------------ training core -------------------
+name: "multiclass_disc_cup"
+epochs: 200
+imgsz: 640
+batch: 16
+workers: 8
+seed: 1337
+device: "auto"      # "auto" → YOLO_DEVICES or CUDA "0", else "cpu"
+amp: true
+freeze: 10
+optimizer: "AdamW"  # AdamW | SGD | RMSProp | Adam
+cos_lr: true
+patience: 50
+
+# Scheduling helpers
+multi_scale: true   # vary input size each epoch
+close_mosaic: 10    # disable mosaic in last N epochs
+
+# ------------------ augmentations -------------------
+augment:
+  # Color jitter
+  hsv_h: 0.015
+  hsv_s: 0.70
+  hsv_v: 0.40
+
+  # Geometric (robustness to ROI crops/zooms)
+  degrees: 10.0
+  translate: 0.20
+  scale: 0.60      # key knob for variable ROI crops
+  shear: 2.0
+  perspective: 0.001
+
+  # Flips
+  flipud: 0.0      # vertical flips usually off for medical
+  fliplr: 0.5
+
+  # Sample mixing & occlusion
+  mosaic: 0.20
+  mixup: 0.10
+  copy_paste: 0.00
+  erasing: 0.40
