@@ -13,6 +13,64 @@ from ultralytics import YOLO
 
 from src.utils import ultralytics_device_arg, expand, need  # removed load_cfg import
 
+# add near the top
+import numpy as np, json, shutil
+from pathlib import Path
+
+def _rect_to_mask(H, W, bbox_xywh):
+    x, y, w, h = bbox_xywh
+    x1 = max(0, int(round(x))); y1 = max(0, int(round(y)))
+    x2 = min(W, int(round(x + w))); y2 = min(H, int(round(y + h)))
+    m = np.zeros((H, W), dtype=np.uint8)
+    if x2 > x1 and y2 > y1: m[y1:y2, x1:x2] = 1
+    return m
+
+def _dice(a: np.ndarray, b: np.ndarray) -> float:
+    inter = (a & b).sum()
+    s = a.sum() + b.sum()
+    return (2.0 * inter / s) if s > 0 else np.nan
+
+def compute_rect_dice_from_predictions(eval_dir: Path) -> dict:
+    """
+    Expects Ultralytics `predictions.json` (COCO format) and `labels.json` (if present).
+    If only predictions exist, returns empty.
+    """
+    pred_json = eval_dir / "predictions.json"
+    labels_json = eval_dir / "labels.json"  # recent Ultralytics may export GT in JSON; if not, skip
+    if not pred_json.exists() or not labels_json.exists():
+        return {}
+    preds = json.loads(pred_json.read_text())       # list of dicts
+    gts   = json.loads(labels_json.read_text())     # list of dicts
+    # group by image_id
+    by_img_pred, by_img_gt = {}, {}
+    for p in preds: by_img_pred.setdefault(p["image_id"], []).append(p)
+    for g in gts:   by_img_gt.setdefault(g["image_id"], []).append(g)
+
+    per_class = {}
+    # you'll need image sizes; Ultralytics labels.json typically contains them
+    for img_id, gboxes in by_img_gt.items():
+        H = gboxes[0].get("height", None); W = gboxes[0].get("width", None)
+        if H is None or W is None: continue
+        pboxes = by_img_pred.get(img_id, [])
+        # greedy match by IoU≥0.5 class-wise (simple)
+        used = set()
+        for g in gboxes:
+            gc = g["category_id"]; gb = g["bbox"]  # xywh
+            gmask = _rect_to_mask(H, W, gb)
+            best_dice = np.nan
+            best_j = -1
+            for j, pr in enumerate(pboxes):
+                if j in used or pr["category_id"] != gc: continue
+                pmask = _rect_to_mask(H, W, pr["bbox"])
+                d = _dice(gmask, pmask)
+                if not np.isnan(d) and (np.isnan(best_dice) or d > best_dice):
+                    best_dice, best_j = d, j
+            if best_j >= 0:
+                used.add(best_j)
+                per_class.setdefault(gc, []).append(float(best_dice))
+    out = {str(k): float(np.nanmean(v)) for k, v in per_class.items() if v}
+    (eval_dir / "dice_rect_summary.json").write_text(json.dumps(out, indent=2))
+    return out
 
 def _resolve_weights(family: str | None, size: str | None, explicit: Optional[str]) -> str:
     if explicit:
@@ -290,6 +348,15 @@ def main() -> None:
         plots=True,
         save_json=True,  # also drops predictions.json for deeper analysis
     )
+
+    # Consolidate where Ultralytics saved test artifacts
+    save_dir = Path(getattr(val_res, "save_dir", train_cfg.runs_root / train_cfg.name / "eval_tmp"))
+    try:
+        rect_dice = compute_rect_dice_from_predictions(save_dir)
+        if rect_dice:
+            print("[EVAL] Rectangle-Dice (per class):", rect_dice)
+    except Exception as e:
+        print(f"[WARN] Dice metric computation failed: {e}")
 
     try:
         metrics = getattr(val_res, "results_dict", {}) or {}
