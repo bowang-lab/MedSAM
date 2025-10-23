@@ -17,7 +17,7 @@ workers: 8
 seed: 1337
 device: "auto"      # "auto" → YOLO_DEVICES or CUDA "0", else "cpu"
 amp: true
-freeze: 0
+freeze: 10
 optimizer: "AdamW"  # AdamW | SGD | RMSProp | Adam
 cos_lr: true
 patience: 50
