@@ -23,7 +23,7 @@ ENV_PREFIX="/arc/project/st-ipor-1/carlosp/envs/medsam"
 # Make project importable as `src.*`
 export PYTHONPATH="${PROJ_DIR}:${PYTHONPATH:-}"
 
-TRAIN_MOD="src.model.preprocess"
+TRAIN_MOD="src.scripts.preprocess"
 RUNS_DIR="${PROJ_DIR}/runs/detect"
 WEIGHTS_LOCAL="${PROJ_DIR}/weights/yolo12x.pt"
 EXP_NAME="preprocess"
