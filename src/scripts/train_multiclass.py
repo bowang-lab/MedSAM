@@ -8,59 +8,74 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+import json
+import numpy as np
 import yaml
 from ultralytics import YOLO
 
-from src.utils import ultralytics_device_arg, expand, need  # removed load_cfg import
+from src.utils import ultralytics_device_arg, expand  # keep only what we use
 
-# add near the top
-import numpy as np, json, shutil
-from pathlib import Path
 
-def _rect_to_mask(H, W, bbox_xywh):
+# ---------------- Rectangle-based Dice (proxy) ----------------
+
+def _rect_to_mask(H: int, W: int, bbox_xywh) -> np.ndarray:
     x, y, w, h = bbox_xywh
-    x1 = max(0, int(round(x))); y1 = max(0, int(round(y)))
-    x2 = min(W, int(round(x + w))); y2 = min(H, int(round(y + h)))
+    x1 = max(0, int(round(x)))
+    y1 = max(0, int(round(y)))
+    x2 = min(W, int(round(x + w)))
+    y2 = min(H, int(round(y + h)))
     m = np.zeros((H, W), dtype=np.uint8)
-    if x2 > x1 and y2 > y1: m[y1:y2, x1:x2] = 1
+    if x2 > x1 and y2 > y1:
+        m[y1:y2, x1:x2] = 1
     return m
+
 
 def _dice(a: np.ndarray, b: np.ndarray) -> float:
     inter = (a & b).sum()
     s = a.sum() + b.sum()
-    return (2.0 * inter / s) if s > 0 else np.nan
+    return (2.0 * inter / s) if s > 0 else float("nan")
+
 
 def compute_rect_dice_from_predictions(eval_dir: Path) -> dict:
     """
-    Expects Ultralytics `predictions.json` (COCO format) and `labels.json` (if present).
-    If only predictions exist, returns empty.
+    Compute per-class Dice between GT rectangles and predicted rectangles.
+    Requires Ultralytics 'predictions.json' and 'labels.json' (if available).
+    If 'labels.json' is absent, returns {} and does nothing.
+    Saves 'dice_rect_summary.json' in eval_dir if computed.
     """
     pred_json = eval_dir / "predictions.json"
-    labels_json = eval_dir / "labels.json"  # recent Ultralytics may export GT in JSON; if not, skip
+    labels_json = eval_dir / "labels.json"  # not always present
     if not pred_json.exists() or not labels_json.exists():
         return {}
-    preds = json.loads(pred_json.read_text())       # list of dicts
-    gts   = json.loads(labels_json.read_text())     # list of dicts
-    # group by image_id
-    by_img_pred, by_img_gt = {}, {}
-    for p in preds: by_img_pred.setdefault(p["image_id"], []).append(p)
-    for g in gts:   by_img_gt.setdefault(g["image_id"], []).append(g)
 
-    per_class = {}
-    # you'll need image sizes; Ultralytics labels.json typically contains them
+    preds = json.loads(pred_json.read_text())   # list[dict]
+    gts = json.loads(labels_json.read_text())   # list[dict]
+
+    by_img_pred, by_img_gt = {}, {}
+    for p in preds:
+        by_img_pred.setdefault(p["image_id"], []).append(p)
+    for g in gts:
+        by_img_gt.setdefault(g["image_id"], []).append(g)
+
+    per_class: Dict[int, list[float]] = {}
     for img_id, gboxes in by_img_gt.items():
-        H = gboxes[0].get("height", None); W = gboxes[0].get("width", None)
-        if H is None or W is None: continue
+        # Expect width/height stored alongside each GT item
+        H = gboxes[0].get("height")
+        W = gboxes[0].get("width")
+        if H is None or W is None:
+            continue
         pboxes = by_img_pred.get(img_id, [])
-        # greedy match by IoU≥0.5 class-wise (simple)
         used = set()
+
         for g in gboxes:
-            gc = g["category_id"]; gb = g["bbox"]  # xywh
+            gc = g["category_id"]
+            gb = g["bbox"]  # xywh
             gmask = _rect_to_mask(H, W, gb)
-            best_dice = np.nan
+            best_dice = float("nan")
             best_j = -1
             for j, pr in enumerate(pboxes):
-                if j in used or pr["category_id"] != gc: continue
+                if j in used or pr["category_id"] != gc:
+                    continue
                 pmask = _rect_to_mask(H, W, pr["bbox"])
                 d = _dice(gmask, pmask)
                 if not np.isnan(d) and (np.isnan(best_dice) or d > best_dice):
@@ -68,9 +83,13 @@ def compute_rect_dice_from_predictions(eval_dir: Path) -> dict:
             if best_j >= 0:
                 used.add(best_j)
                 per_class.setdefault(gc, []).append(float(best_dice))
+
     out = {str(k): float(np.nanmean(v)) for k, v in per_class.items() if v}
     (eval_dir / "dice_rect_summary.json").write_text(json.dumps(out, indent=2))
     return out
+
+
+# ---------------- helpers ----------------
 
 def _resolve_weights(family: str | None, size: str | None, explicit: Optional[str]) -> str:
     if explicit:
@@ -89,28 +108,29 @@ IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 
 def _count_images(path_key: str, data_yaml: Dict[str, Any], data_yaml_dir: Path) -> int:
     """
-    Given a key like 'train'/'val'/'test' from data.yaml, return #image files.
-    Supports common YOLO layout with optional 'path:' base.
+    Count images under the split referenced by 'train'/'val'/'test'.
+    If data.yaml has a 'path:' base, interpret it RELATIVE TO THE YAML FILE.
     """
     split_entry = data_yaml.get(path_key)
     if not split_entry:
         return 0
 
     split_path = Path(str(split_entry))
-    # Only expand base if `path` exists in YAML; otherwise use the yaml's directory
-    base = expand(data_yaml["path"]) if data_yaml.get("path") else data_yaml_dir
+    # base: either data_yaml['path'] (interpreted relative to YAML's folder) or that folder itself
+    base_field = data_yaml.get("path")
+    if base_field:
+        base_path = Path(str(base_field))
+        base = base_path if base_path.is_absolute() else (data_yaml_dir / base_path).resolve()
+    else:
+        base = data_yaml_dir
 
-    # If split_path is relative, join to 'path' (or data_yaml_dir as fallback)
     if not split_path.is_absolute():
         split_path = (base / split_path).resolve()
     if not split_path.exists():
         return 0
 
-    # Typical is images/<split>, but users may point directly at folder of images
     if split_path.is_dir():
         return sum(1 for p in split_path.rglob("*") if p.suffix.lower() in IMG_EXTS)
-
-    # If it's a text file list (rare), could add logic here in future.
     return 0
 
 
@@ -164,16 +184,18 @@ class TrainCfg:
 
     @staticmethod
     def from_yaml(path: Path) -> "TrainCfg":
-        need(path, "config YAML")
+        # read & validate
+        if not path.exists():
+            raise SystemExit(f"[ERR] config YAML not found: {path}")
         cfg = yaml.safe_load(path.read_text()) or {}
 
-        # minimal validation
-        data_yaml = expand(cfg.get("data"))
+        data_yaml = Path(str(cfg.get("data"))).expanduser().resolve() if cfg.get("data") else None
         if not data_yaml:
             raise SystemExit("[ERR] 'data' (path to data.yaml) is required in the config.")
-        need(data_yaml, "data.yaml")
+        if not data_yaml.exists():
+            raise SystemExit(f"[ERR] data.yaml not found: {data_yaml}")
 
-        runs_root = expand(cfg.get("runs_root")) or Path("./runs/detect").resolve()
+        runs_root = Path(str(cfg.get("runs_root", "./runs/detect"))).expanduser().resolve()
         runs_root.mkdir(parents=True, exist_ok=True)
 
         aug = cfg.get("augment", {}) or {}
@@ -194,7 +216,7 @@ class TrainCfg:
             erasing=float(aug.get("erasing", 0.40)),
         )
 
-        # "auto" device in YAML → choose at runtime
+        # device: "auto" → pick at runtime
         dev = cfg.get("device", "auto")
         if dev in (None, "", "auto"):
             dev = ultralytics_device_arg()
@@ -202,7 +224,7 @@ class TrainCfg:
         return TrainCfg(
             data=data_yaml,
             runs_root=runs_root,
-            weights=cfg.get("weights"),     # may be None → resolve by family/size
+            weights=cfg.get("weights"),
             family=str(cfg.get("family", "auto")),
             size=str(cfg.get("size", "x")),
             name=str(cfg.get("name", "multiclass_disc_cup")),
@@ -224,19 +246,17 @@ class TrainCfg:
         )
 
 
-# ---------------- train ----------------
+# ---------------- train & evaluate ----------------
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        description="Train Ultralytics multiclass (disc/cup) from a config YAML"
-    )
+    ap = argparse.ArgumentParser(description="Train Ultralytics multiclass (disc/cup) from a config YAML")
     ap.add_argument("--config", required=True, help="Path to YAML config.")
     return ap.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    cfg_path = expand(args.config)  # <-- pass a Path, not a dict
+    cfg_path = Path(str(args.config)).expanduser().resolve()
     train_cfg = TrainCfg.from_yaml(cfg_path)
 
     weights = _resolve_weights(train_cfg.family, train_cfg.size, train_cfg.weights)
@@ -248,7 +268,7 @@ def main() -> None:
           f"mosaic={train_cfg.aug.mosaic} mixup={train_cfg.aug.mixup} erasing={train_cfg.aug.erasing}")
     print(f"[RUN ] project={train_cfg.runs_root} name={train_cfg.name}")
 
-    # (Optional) show split counts for quick sanity
+    # Quick split counts
     try:
         dy = yaml.safe_load(train_cfg.data.read_text()) or {}
         dy_dir = train_cfg.data.parent
@@ -267,7 +287,7 @@ def main() -> None:
         epochs=train_cfg.epochs,
         imgsz=train_cfg.imgsz,
         batch=train_cfg.batch,
-        device=train_cfg.device,                     # e.g. "0,1,2,3" → DDP
+        device=train_cfg.device,  # e.g., "0,1,2,3" → DDP
         project=str(train_cfg.runs_root),
         name=train_cfg.name,
         workers=train_cfg.workers,
@@ -292,7 +312,7 @@ def main() -> None:
         # geometric
         degrees=train_cfg.aug.degrees,
         translate=train_cfg.aug.translate,
-        scale=train_cfg.aug.scale,                   # **key** for ROI crop/zoom robustness
+        scale=train_cfg.aug.scale,  # ROI crop/zoom robustness
         shear=train_cfg.aug.shear,
         perspective=train_cfg.aug.perspective,
 
@@ -300,36 +320,33 @@ def main() -> None:
         flipud=train_cfg.aug.flipud,
         fliplr=train_cfg.aug.fliplr,
 
-        # sample mixing / occlusion
+        # mixing / occlusion
         mosaic=train_cfg.aug.mosaic,
         mixup=train_cfg.aug.mixup,
         copy_paste=train_cfg.aug.copy_paste,
         erasing=train_cfg.aug.erasing,
     )
 
-    # resolve resume
+    # Resume wiring
     resume_arg: bool | str = False
     if train_cfg.resume:
         if str(train_cfg.resume).lower() == "auto":
             last = train_cfg.runs_root / train_cfg.name / "weights" / "last.pt"
-            resume_arg = str(last) if last.exists() else True  # let Ultralytics find it
+            resume_arg = str(last) if last.exists() else True  # let Ultralytics locate latest
             print(f"[RESUME] Using: {resume_arg}")
         else:
             resume_arg = str(expand(train_cfg.resume))
             print(f"[RESUME] Using explicit: {resume_arg}")
-
     overrides["resume"] = resume_arg
 
+    # Train
     model.train(**overrides)
-
     print("[OK] Training complete.")
 
-    # --- Evaluate on test split (if present), else fall back to val ---
-    # Load data.yaml to see if 'test' exists
+    # --- Evaluate on test split (if present), else val ---
     dy = yaml.safe_load(train_cfg.data.read_text()) or {}
     has_test = bool(dy.get("test"))
 
-    # Locate best checkpoint
     best_ckpt = train_cfg.runs_root / train_cfg.name / "weights" / "best.pt"
     last_ckpt = train_cfg.runs_root / train_cfg.name / "weights" / "last.pt"
     ckpt_path = best_ckpt if best_ckpt.exists() else (last_ckpt if last_ckpt.exists() else None)
@@ -345,11 +362,11 @@ def main() -> None:
         split=split,
         imgsz=train_cfg.imgsz,
         device=train_cfg.device,
-        plots=True,
-        save_json=True,  # also drops predictions.json for deeper analysis
+        plots=True,       # PR curves, confusion, etc.
+        save_json=True,   # writes predictions.json (+ labels.json if available)
     )
 
-    # Consolidate where Ultralytics saved test artifacts
+    # Rectangle-Dice (proxy). Writes dice_rect_summary.json if GT JSON present.
     save_dir = Path(getattr(val_res, "save_dir", train_cfg.runs_root / train_cfg.name / "eval_tmp"))
     try:
         rect_dice = compute_rect_dice_from_predictions(save_dir)
@@ -358,27 +375,27 @@ def main() -> None:
     except Exception as e:
         print(f"[WARN] Dice metric computation failed: {e}")
 
+    # Print core losses/metrics robustly
     try:
         metrics = getattr(val_res, "results_dict", {}) or {}
 
-        # normalize keys a bit for display
-        def pick(d, keys):
+        def pick(d: dict, keys: tuple[str, ...]):
             for k in keys:
-                if k in d: return d[k]
+                if k in d:
+                    return d[k]
             return None
 
         box_loss = pick(metrics, ("loss/box", "box_loss", "box"))
         cls_loss = pick(metrics, ("loss/cls", "cls_loss", "cls"))
         dfl_loss = pick(metrics, ("loss/dfl", "dfl_loss", "dfl"))
-        print("[EVAL] key metrics:",
-              {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))})
+        printable = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
+        print("[EVAL] key metrics:", printable)
         if box_loss is not None:
             print(f"[EVAL] box_loss={float(box_loss):.4f} | "
                   f"cls_loss={float(cls_loss or 0):.4f} | "
                   f"dfl_loss={float(dfl_loss or 0):.4f}")
     except Exception:
         print("[EVAL] Finished; see run directory for detailed metrics/plots.")
-
 
 
 if __name__ == "__main__":
