@@ -82,10 +82,6 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "YOLO_DEVICES=${YOLO_DEVICES}"
 nvidia-smi -L || true
 
-# -------- Sanity checks --------
-[[ -d "${ROI_ROOT}"     ]] || { echo "[ERR] ROI root not found: ${ROI_ROOT}" >&2; exit 2; }
-[[ -f "${WEIGHTS_LOCAL}" ]]|| { echo "[ERR] Local weights not found: ${WEIGHTS_LOCAL}" >&2; exit 2; }
-
 # -------- Build args safely --------
 ARGS=(
   --config "${CONFIG}"
