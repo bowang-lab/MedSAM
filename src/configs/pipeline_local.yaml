@@ -21,7 +21,7 @@ all: true         # pipeline_oop defaults to collect,split,save,augment,disc_onl
 steps: null       # or e.g. ["collect","split","save","augment","disc_only","roi"]
 
 # ---- Small subset mode (applies after collect, before split) ----
-subset_n: 50
+subset_n: 0
 subset_seed: 4343
 subset_copy: false       # only relevant if your save step copies files; OOP uses symlink by default
 prefer_copy: false       # set true on filesystems that dislike symlinks (OneDrive, some NAS, etc.)
