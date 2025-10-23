@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# train_disc_only.py
+# train_disc.py
 """
 Train a disc-only detector from a 2-class YOLO dataset (0=disc, 1=cup),
 OR run evaluation only on an existing checkpoint.

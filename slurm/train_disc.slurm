@@ -21,7 +21,7 @@ SCRATCH_DIR="/scratch/st-ipor-1/cperez/MedSAM"         # project root (contains 
 ENV_PREFIX="/arc/project/st-ipor-1/carlosp/envs/medsam"
 export PYTHONPATH="${SCRATCH_DIR}:${PYTHONPATH:-}"
 
-TRAIN_MOD="src.model.train_disc_only"                   # UPDATED module
+TRAIN_MOD="src.model.train_disc"
 DATA_ROOT="${SCRATCH_DIR}/bounding_box/data/yolo_split" # 2-class dataset root
 WEIGHTS_LOCAL="${SCRATCH_DIR}/bounding_box/weights/yolo12x.pt"
 RUNS_DIR="${SCRATCH_DIR}/bounding_box/runs/detect"
