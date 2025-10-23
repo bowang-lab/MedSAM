@@ -1,31 +1,21 @@
 #!/usr/bin/env python3
 # train_disc_only.py
 """
-OOP refactor: Train a disc-only detector from a 2-class YOLO dataset (0=disc, 1=cup).
+Train a disc-only detector from a 2-class YOLO dataset (0=disc, 1=cup),
+OR run evaluation only on an existing checkpoint.
 
-Additions
----------
-- Modern model selection (YOLOv12/YOLOv11/YOLOv8):
-  * --weights /path/to/weights.pt  OR a hub tag like yolo12x.pt
-  * --family {auto,yolo12,yolo11,yolov8} with --size {n,s,m,l,x}
-- AMP and layer freezing:
-  * --amp true/false, --freeze N
-- Backward compatible with --model (mapped to --weights).
-
-Behavior
---------
-- If <data_root>/data.yaml exists, use it as a precomputed disc-only dataset.
-- Otherwise derive <data_root>_disc_only/ by filtering labels to class 0 (disc).
-- Optional resume:
-  * --resume auto         -> runs/<name>/weights/last.pt
-  * --resume /abs/path/last.pt
-- Validate on 'test' if present, else 'val'.
+New:
+- Eval-only mode: --eval-ckpt /path/to/weights.pt (plus --eval-split, --no-eval-plots)
+- After training, always evaluates on the 'test' split when present (else 'val')
+  and writes metrics/plots into runs/<exp_name>/eval_<split>/<timestamp>/ with
+  a 'latest' symlink.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -41,10 +31,8 @@ from src.utils import ultralytics_device_arg, place, split_has_data, ensure_dir
 def _expand(p: str | Path) -> Path:
     return Path(os.path.expanduser(str(p))).resolve()
 
-def _looks_like_tag(s: str) -> bool:
-    # crude check for things like "yolo12x.pt", "yolo11l.pt", "yolov8s.pt"
-    s = s.lower()
-    return s.endswith(".pt") and ("yolo" in s)
+def _timestamp() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
 
 # ============================================================
 # Config & simple utilities
@@ -81,6 +69,11 @@ class DiscOnlyConfig:
 
     # resume
     resume: Optional[str]             # "", "auto", or path to last.pt
+
+    # ---- eval-only additions ----
+    eval_ckpt: Optional[str] = None   # if set, skip training and only eval this checkpoint
+    eval_split: str = "test"          # "test" (default) or "val"
+    eval_plots: bool = True           # write curves/PR/CM plots
 
 
 class DiscOnlyDatasetBuilder:
@@ -208,14 +201,8 @@ class YoloTrainer:
         p = Path(weights_spec)
         if p.exists():
             return YOLO(str(p))
-        # If it's not a local file, treat as tag (requires internet unless you’ve pre-downloaded to CWD)
-        try:
-            return YOLO(weights_spec)
-        except Exception as e:
-            raise SystemExit(
-                f"[ERR] Could not load weights '{weights_spec}'. "
-                f"If you are offline, pass a LOCAL .pt path. Underlying error: {e}"
-            )
+        # Treat as a tag (requires internet unless pre-downloaded)
+        return YOLO(weights_spec)
 
     def prepare_model(self) -> None:
         """Apply resume policy or start from provided/selected weights."""
@@ -266,15 +253,65 @@ class YoloTrainer:
             freeze=self.cfg.freeze,
         )
 
-    def validate(self, data_yaml: Path) -> None:
+    def _eval_to_dir(self, data_yaml: Path, split: str, plots: bool) -> Path:
+        """
+        Run model.val() writing to runs/<exp_name>/eval_<split>/<timestamp>/,
+        and update runs/<exp_name>/eval_<split>/latest symlink.
+        """
         assert self.model is not None
-        print("[INFO] Validating…")
-        y = yaml.safe_load(data_yaml.read_text())
-        if "test" in y:
-            self.model.val(data=str(data_yaml), split="test", imgsz=self.cfg.imgsz, device=self.device)
-        else:
-            self.model.val(data=str(data_yaml), imgsz=self.cfg.imgsz, device=self.device)
-        print("[OK] Done.")
+        ts = _timestamp()
+        base = self.cfg.runs_root / self.cfg.exp_name / f"eval_{split}"
+        out = base / ts
+        ensure_dir(out)
+
+        print(f"[EVAL] split={split} → {out}")
+        # Ultralytics will write under project/name
+        self.model.val(
+            data=str(data_yaml),
+            split=split if split in ("val", "test") else None,
+            imgsz=self.cfg.imgsz,
+            device=self.device,
+            project=str(base),
+            name=ts,
+            plots=bool(plots),
+        )
+
+        # Refresh 'latest' symlink
+        latest = base / "latest"
+        try:
+            if latest.exists() or latest.is_symlink():
+                latest.unlink()
+        except Exception:
+            pass
+        try:
+            latest.symlink_to(out, target_is_directory=True)
+        except Exception:
+            # Fallback: create a small marker file with the absolute path
+            (base / "_latest_path.txt").write_text(str(out.resolve()))
+        return out
+
+    def validate_after_train(self, data_yaml: Path) -> None:
+        """
+        After training, ALWAYS evaluate:
+          - on 'test' if present, otherwise 'val'
+        and save into a timestamped folder with 'latest' symlink.
+        """
+        assert self.model is not None
+        y = yaml.safe_load(data_yaml.read_text()) or {}
+        split = "test" if "test" in y else "val"
+        self._eval_to_dir(data_yaml, split=split, plots=True)
+        print(f"[OK] Post-train evaluation completed on split='{split}'.")
+
+    def eval_only(self, data_yaml: Path, ckpt: Path, split: str, plots: bool) -> None:
+        """
+        Load a specified checkpoint and run evaluation only, saving
+        metrics/curves to a timestamped folder and updating 'latest'.
+        """
+        print(f"[MODE] Eval-only | ckpt={ckpt} | split={split} | plots={plots}")
+        self.model = YOLO(str(ckpt))
+        self.resuming = False
+        self._eval_to_dir(data_yaml, split=split, plots=plots)
+        print("[OK] Eval-only run complete.")
 
 
 # ============================================================
@@ -282,7 +319,7 @@ class YoloTrainer:
 # ============================================================
 
 class DiscOnlyPipeline:
-    """High-level pipeline: dataset resolve/build → train → validate."""
+    """High-level pipeline: dataset resolve/build → (train) → eval."""
 
     def __init__(self, cfg: DiscOnlyConfig) -> None:
         self.cfg = cfg
@@ -331,9 +368,22 @@ class DiscOnlyPipeline:
         assert self.data_yaml is not None and dataset_root.exists()
 
         trainer = YoloTrainer(self.cfg)
+
+        # -------- EVAL-ONLY MODE --------
+        if self.cfg.eval_ckpt:
+            ckpt = _expand(self.cfg.eval_ckpt)
+            if not ckpt.exists():
+                raise SystemExit(f"[ERR] --eval-ckpt not found: {ckpt}")
+            split = self.cfg.eval_split.lower().strip()
+            if split not in ("val", "test"):
+                raise SystemExit("--eval-split must be 'val' or 'test'")
+            trainer.eval_only(self.data_yaml, ckpt, split=split, plots=bool(self.cfg.eval_plots))
+            return
+
+        # -------- TRAIN → TEST (or VAL) --------
         trainer.prepare_model()
         trainer.train(self.data_yaml)
-        trainer.validate(self.data_yaml)
+        trainer.validate_after_train(self.data_yaml)
 
 
 # ============================================================
@@ -347,7 +397,7 @@ def _parse_train_splits(val: str | List[str]) -> List[str]:
 
 def build_config_from_cli() -> DiscOnlyConfig:
     ap = argparse.ArgumentParser(
-        description="Train a disc-only detector from a 2-class YOLO dataset (0=disc,1=cup)."
+        description="Train a disc-only detector from a 2-class YOLO dataset (0=disc,1=cup) or eval-only on a checkpoint."
     )
 
     ap.add_argument("--project_dir", default=".", help="Project root.")
@@ -359,7 +409,7 @@ def build_config_from_cli() -> DiscOnlyConfig:
     ap.add_argument("--train_splits", default="train",
                     help="Comma list or YAML-style list of splits to pull from aug_root (default: 'train').")
 
-    # Model selection (NEW)
+    # Model selection
     ap.add_argument("--weights", default=None,
                     help="Explicit weights path or hub tag (e.g., yolo12x.pt). If omitted, selects by --family/--size.")
     ap.add_argument("--family", default="auto", choices=["auto","yolo12","yolo11","yolov8"],
@@ -376,7 +426,7 @@ def build_config_from_cli() -> DiscOnlyConfig:
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--name", default="stageA_disc_only", help="Ultralytics experiment name.")
-    ap.add_argument("--train", type=int, default=1, help="1=train+val, 0=val-only.")
+    ap.add_argument("--train", type=int, default=1, help="1=train+eval, 0=eval-only requires --eval-ckpt.")
     ap.add_argument("--freeze", type=int, default=0, help="Freeze first N layers (0 = none).")
     ap.add_argument("--amp", type=lambda v: str(v).lower() not in {"0","false","no"}, default=True,
                     help="Enable/disable AMP (default: True).")
@@ -387,6 +437,12 @@ def build_config_from_cli() -> DiscOnlyConfig:
     # Building options
     ap.add_argument("--copy_images", action="store_true", help="Copy images instead of symlinking (default: symlink).")
     ap.add_argument("--drop_empty", action="store_true", help="Drop label files that become empty after filtering.")
+
+    # ---- Eval-only flags ----
+    ap.add_argument("--eval-ckpt", default=None, help="If set, skip training and only evaluate this checkpoint.")
+    ap.add_argument("--eval-split", default="test", choices=["val","test"], help="Split to evaluate in eval-only mode.")
+    ap.add_argument("--no-eval-plots", dest="eval_plots", action="store_false", help="Disable PR/F1/CM plots on eval.")
+    ap.set_defaults(eval_plots=True)
 
     args = ap.parse_args()
 
@@ -422,6 +478,9 @@ def build_config_from_cli() -> DiscOnlyConfig:
         exp_name=str(args.name),
         do_train=bool(args.train),
         resume=(str(args.resume) if args.resume else ""),
+        eval_ckpt=(str(args.eval_ckpt) if args.eval_ckpt else None),
+        eval_split=str(args.eval_split),
+        eval_plots=bool(args.eval_plots),
     )
 
 
