@@ -90,8 +90,4 @@ ARGS=(
 cd "${PROJ_DIR}"
 srun -u python -m "${TRAIN_MOD}" "${ARGS[@]}"
 
-# -------- Post-run check --------
-BEST="${RUNS_DIR}/${EXP_NAME}/weights/best.pt"
-[[ -f "${BEST}" ]] || { echo "[ERR] best.pt not found at ${BEST}" >&2; exit 3; }
-
-echo "COMPLETED YOLO SPLIT SAVED"
+echo "SAVED YOLO SPLIT"
