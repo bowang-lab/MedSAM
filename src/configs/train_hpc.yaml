@@ -1,6 +1,11 @@
-# ------------------ data & outputs ------------------
-data: "/scratch/st-ipor-1/cperez/MedSAM/data/yolo_multiclass/data.yaml"
-runs_root: "/scratch/st-ipor-1/cperez/MedSAM/runs/detect"
+# train_multiclass.yaml
+data: /path/to/data.yaml
+runs_root: /scratch/.../runs/detect
+name: multiclass_disc_cup
+
+# resume training
+resume: "auto"         # "auto" | "" | "/abs/path/to/last.pt"
+epochs: 201            # TOTAL epochs to train to (not additional)
 
 # ------------------ model choice --------------------
 # If 'weights' is omitted, it's picked from (family,size).
@@ -8,9 +13,7 @@ weights: "/scratch/st-ipor-1/cperez/MedSAM/bounding_box/weights/yolo12x.pt"
 family: "auto"      # auto | yolo12 | yolo11 | yolov8
 size: "x"           # n | s | m | l | x
 
-# ------------------ training core -------------------
-name: "multiclass_disc_cup"
-epochs: 200
+
 imgsz: 640
 batch: 16
 workers: 8
@@ -49,3 +52,5 @@ augment:
   mixup: 0.10
   copy_paste: 0.00
   erasing: 0.40
+
+

@@ -86,6 +86,7 @@ class TrainCfg:
     family: str
     size: str
     # training
+    resume: Optional[str]  # "", "auto", or path to last.pt
     name: str
     epochs: int
     imgsz: int
@@ -160,6 +161,7 @@ class TrainCfg:
             patience=int(cfg.get("patience", 50)),
             multi_scale=bool(cfg.get("multi_scale", True)),
             close_mosaic=int(cfg.get("close_mosaic", 10)),
+            resume=(str(cfg.get("resume") or "") or None),
             aug=aug_cfg,
         )
 
@@ -247,6 +249,19 @@ def main() -> None:
         erasing=train_cfg.aug.erasing,
     )
 
+    # resolve resume
+    resume_arg: bool | str = False
+    if train_cfg.resume:
+        if str(train_cfg.resume).lower() == "auto":
+            last = train_cfg.runs_root / train_cfg.name / "weights" / "last.pt"
+            resume_arg = str(last) if last.exists() else True  # let Ultralytics find it
+            print(f"[RESUME] Using: {resume_arg}")
+        else:
+            resume_arg = str(expand(train_cfg.resume))
+            print(f"[RESUME] Using explicit: {resume_arg}")
+
+    overrides["resume"] = resume_arg
+
     model.train(**overrides)
 
     print("[OK] Training complete.")
@@ -272,16 +287,28 @@ def main() -> None:
         split=split,
         imgsz=train_cfg.imgsz,
         device=train_cfg.device,
-        plots=True  # saves PR curves, confusion matrix, etc. into the run dir
+        plots=True,
+        save_json=True,  # also drops predictions.json for deeper analysis
     )
 
-    # Try to print a compact metrics summary (keys vary slightly by version/task)
     try:
-        metrics = getattr(val_res, "results_dict", None) or {}
-        if metrics:
-            print("[EVAL] Metrics:", {k: float(v) for k, v in metrics.items()})
-        else:
-            print("[EVAL] Finished; see run directory for detailed metrics/plots.")
+        metrics = getattr(val_res, "results_dict", {}) or {}
+
+        # normalize keys a bit for display
+        def pick(d, keys):
+            for k in keys:
+                if k in d: return d[k]
+            return None
+
+        box_loss = pick(metrics, ("loss/box", "box_loss", "box"))
+        cls_loss = pick(metrics, ("loss/cls", "cls_loss", "cls"))
+        dfl_loss = pick(metrics, ("loss/dfl", "dfl_loss", "dfl"))
+        print("[EVAL] key metrics:",
+              {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))})
+        if box_loss is not None:
+            print(f"[EVAL] box_loss={float(box_loss):.4f} | "
+                  f"cls_loss={float(cls_loss or 0):.4f} | "
+                  f"dfl_loss={float(dfl_loss or 0):.4f}")
     except Exception:
         print("[EVAL] Finished; see run directory for detailed metrics/plots.")
 
