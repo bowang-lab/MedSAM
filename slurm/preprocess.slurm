@@ -28,7 +28,7 @@ RUNS_DIR="${PROJ_DIR}/runs/detect"
 WEIGHTS_LOCAL="${PROJ_DIR}/weights/yolo12x.pt"
 EXP_NAME="preprocess"
 
-CONFIG="${PROJ_DIR}/src/configs/preprocess.yaml"
+CONFIG="${PROJ_DIR}/src/configs/preprocess_hpc.yaml"
 
 mkdir -p "${PROJ_DIR}/logs" "${RUNS_DIR}"
 
