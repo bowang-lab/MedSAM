@@ -3,7 +3,7 @@ project_dir: "/scratch/st-ipor-1/cperez/MedSAM/"
 
 # ---- outputs ----
 outputs:
-  yolo_root: "/scratch/st-ipor-1/cperez/MedSAM//data/yolo_multiclass"
+  yolo_root: "/scratch/st-ipor-1/cperez/MedSAM/data/yolo_multiclass"
   runs_root: "/scratch/st-ipor-1/cperez/MedSAM/runs/detect"   # optional; used only if 'train:' is present
 
 # ---- datasets (one or many). 'tag' should match the per-image .dataset field set by your collector. ----

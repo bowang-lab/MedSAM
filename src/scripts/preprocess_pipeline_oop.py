@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+# src.imgpipe.preprocess_pipeline_oop.py
 from __future__ import annotations
 
 import argparse
@@ -132,8 +132,8 @@ def main():
         step_save_yolo(ds, out_yolo_split, prefer_copy=getattr(cfg, "prefer_copy", False))
 
     # 4) Augment (optional)
-    if "augment" in steps and getattr(cfg, "augment_enabled", True):
-        step_augment(cfg, ds, in_split_root=out_yolo_split, out_aug_root=out_yolo_aug)
+    # if "augment" in steps and getattr(cfg, "augment_enabled", True):
+    #     step_augment(cfg, ds, in_split_root=out_yolo_split, out_aug_root=out_yolo_aug)
 
     # 5) Disc-only derived dataset
     if "disc_only" in steps:

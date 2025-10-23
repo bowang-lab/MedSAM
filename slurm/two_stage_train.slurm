@@ -15,8 +15,6 @@
 
 set -euo pipefail
 
-
-
 # --------------------------- Paths (HPC) ---------------------------
 PROJECT_DIR="/scratch/st-ipor-1/cperez/MedSAM"
 ENV_PREFIX="/arc/project/st-ipor-1/carlosp/envs/medsam"
