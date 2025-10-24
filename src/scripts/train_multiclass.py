@@ -4,9 +4,8 @@
 Multiclass YOLO (disc=0, cup=1) trainer/evaluator with:
 - Optional train-split filtering to only keep images that contain BOTH classes
 - Robust resume logic (auto/explicit) and epoch extension
-- Eval-only mode across chosen splits (val/test/train) with summary
-- Rectangular Dice (proxy) computed from predictions/labels JSON
-- FIX: when creating a filtered YAML, keep val/test usable by writing ABSOLUTE paths
+- Eval-only mode to compute *test* metrics vs. GT by ourselves (Box Error = 1 - IoU, Rect-Dice)
+- When a filtered YAML is created, we keep val/test usable by writing ABSOLUTE paths
 """
 
 from __future__ import annotations
@@ -17,11 +16,12 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, Iterable, List
+from typing import Optional, Dict, Any, Iterable, List, Tuple
 
 import numpy as np
 import torch
 import yaml
+from PIL import Image as PILImage
 from ultralytics import YOLO
 
 from src.utils import ultralytics_device_arg  # only what we need
@@ -67,57 +67,6 @@ def _dice(a: np.ndarray, b: np.ndarray) -> float:
     inter = (a & b).sum()
     s = a.sum() + b.sum()
     return (2.0 * inter / s) if s > 0 else float("nan")
-
-
-def compute_rect_dice_from_predictions(eval_dir: Path) -> dict:
-    """
-    Compute per-class Dice between GT rectangles and predicted rectangles.
-    Requires Ultralytics 'predictions.json' and 'labels.json' (if available).
-    Saves 'dice_rect_summary.json' in eval_dir if computed.
-    """
-    pred_json = eval_dir / "predictions.json"
-    labels_json = eval_dir / "labels.json"  # not always present
-    if not pred_json.exists() or not labels_json.exists():
-        return {}
-
-    preds = json.loads(pred_json.read_text())
-    gts = json.loads(labels_json.read_text())
-
-    by_img_pred, by_img_gt = {}, {}
-    for p in preds:
-        by_img_pred.setdefault(p["image_id"], []).append(p)
-    for g in gts:
-        by_img_gt.setdefault(g["image_id"], []).append(g)
-
-    per_class: Dict[int, list[float]] = {}
-    for img_id, gboxes in by_img_gt.items():
-        H = gboxes[0].get("height")
-        W = gboxes[0].get("width")
-        if H is None or W is None:
-            continue
-        pboxes = by_img_pred.get(img_id, [])
-        used = set()
-
-        for g in gboxes:
-            gc = g["category_id"]
-            gb = g["bbox"]  # xywh
-            gmask = _rect_to_mask(H, W, gb)
-            best_dice = float("nan")
-            best_j = -1
-            for j, pr in enumerate(pboxes):
-                if j in used or pr["category_id"] != gc:
-                    continue
-                pmask = _rect_to_mask(H, W, pr["bbox"])
-                d = _dice(gmask, pmask)
-                if not np.isnan(d) and (np.isnan(best_dice) or d > best_dice):
-                    best_dice, best_j = d, j
-            if best_j >= 0:
-                used.add(best_j)
-                per_class.setdefault(gc, []).append(float(best_dice))
-
-    out = {str(k): float(np.nanmean(v)) for k, v in per_class.items() if v}
-    (eval_dir / "dice_rect_summary.json").write_text(json.dumps(out, indent=2))
-    return out
 
 
 # ---------------- helpers ----------------
@@ -242,7 +191,7 @@ def _abs_split(entry: Any, base_dir: Path) -> str:
 def _filter_train_to_both(data_yaml_path: Path, work_root: Path) -> Path:
     """
     Create a filtered data.yaml that keeps only training images with BOTH classes present.
-    CRITICAL FIX: write absolute paths for 'path', 'val', and 'test' so evaluation doesn't break.
+    CRITICAL: write absolute paths for 'path', 'val', and 'test' so evaluation doesn't break.
     """
     y = yaml.safe_load(data_yaml_path.read_text()) or {}
     ydir = data_yaml_path.parent
@@ -442,64 +391,228 @@ class TrainCfg:
         )
 
 
-# ---------------- metrics helpers ----------------
+# ---------------- basic geometry ----------------
 
-def _extract_metrics(results_obj) -> dict:
-    """Return a float-only dict from Ultralytics results."""
-    d = getattr(results_obj, "results_dict", {}) or {}
-    out = {}
-    for k, v in d.items():
-        try:
-            out[k] = float(v)
-        except Exception:
-            pass
-    # Also alias common keys if present
-    if "metrics/mAP50-95(B)" in out:
-        out["map50-95"] = out["metrics/mAP50-95(B)"]
-    if "metrics/mAP50(B)" in out:
-        out["map50"] = out["metrics/mAP50(B)"]
+def _xywhn_to_xyxy_pixels(cx_n: float, cy_n: float, w_n: float, h_n: float, W: int, H: int) -> Tuple[int, int, int, int]:
+    """YOLO-normalized center-based box → pixel xyxy (clamped)."""
+    cx = cx_n * W
+    cy = cy_n * H
+    w = w_n * W
+    h = h_n * H
+    x1 = int(round(max(0.0, cx - w / 2.0)))
+    y1 = int(round(max(0.0, cy - h / 2.0)))
+    x2 = int(round(min(float(W), cx + w / 2.0)))
+    y2 = int(round(min(float(H), cy + h / 2.0)))
+    x1 = min(x1, W - 1)
+    y1 = min(y1, H - 1)
+    x2 = max(x2, x1 + 1)
+    y2 = max(y2, y1 + 1)
+    return x1, y1, x2, y2
+
+
+def _xyxy_to_xywh(x1: int, y1: int, x2: int, y2: int) -> Tuple[int, int, int, int]:
+    return x1, y1, max(0, x2 - x1), max(0, y2 - y1)
+
+
+def _iou_xyxy(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    ua = max(0, ax2 - ax1) * max(0, ay2 - ay1) + max(0, bx2 - bx1) * max(0, by2 - by1) - inter
+    if ua <= 0:
+        return 0.0
+    return inter / ua
+
+
+# ---------------- gather split & labels ----------------
+
+def _gather_split_images(data_yaml_path: Path, split: str) -> List[Path]:
+    y = yaml.safe_load(data_yaml_path.read_text()) or {}
+    ydir = data_yaml_path.parent
+    base_field = y.get("path")
+    if base_field:
+        base = (ydir / str(base_field)).resolve() if not Path(str(base_field)).is_absolute() else Path(str(base_field))
+    else:
+        base = ydir
+
+    entry = y.get(split)
+    if not entry:
+        return []
+
+    p = Path(str(entry))
+    if not p.is_absolute():
+        p = (base / p).resolve()
+    out: List[Path] = []
+    if p.is_dir():
+        for img in _iter_images_from_dir(p):
+            out.append(img.resolve())
+    elif p.is_file() and p.suffix.lower() == ".txt":
+        for ln in p.read_text().splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            ii = Path(s)
+            out.append(ii if ii.is_absolute() else (p.parent / ii).resolve())
     return out
 
 
-def _min_train_box_loss_from_results_csv(run_dir: Path) -> tuple[Optional[float], Optional[int]]:
-    """
-    Parse Ultralytics results.csv in a run dir to get the min train box loss and its epoch.
-    """
-    csv_path = run_dir / "results.csv"
-    if not csv_path.exists():
-        return None, None
-    try:
-        rows = list(csv.DictReader(csv_path.open()))
-        best_val = None
-        best_ep = None
-        # Try a few column name variants
-        col_candidates = [
-            "train/box_loss", "box_loss", "loss/box", "giou_loss", "loss/giou"
-        ]
-        col = None
-        if rows:
-            cols = rows[0].keys()
-            for c in col_candidates:
-                if c in cols:
-                    col = c
-                    break
-        if not col:
-            return None, None
-        for r in rows:
-            try:
-                v = float(r[col])
-                ep = int(r.get("epoch", r.get("Epoch", -1)))
-            except Exception:
+def _read_gt_xyxy_for_image(img_path: Path, classes=(0, 1)) -> Dict[int, Tuple[int, int, int, int]]:
+    """Read YOLO label file mapped from image → return {cls: xyxy_pixels} for requested classes."""
+    # locate label file
+    lbl: Optional[Path] = None
+    for cand in _label_path_candidates_for_image(img_path):
+        if cand.exists():
+            lbl = cand
+            break
+    if lbl is None or not lbl.exists():
+        return {}
+
+    # image size
+    with PILImage.open(str(img_path)) as im:
+        W, H = im.size
+
+    out: Dict[int, Tuple[int, int, int, int]] = {}
+    for ln in lbl.read_text().splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        parts = s.split()
+        if len(parts) < 5:
+            continue
+        try:
+            cls = int(float(parts[0]))
+            if cls not in classes:
                 continue
-            if (best_val is None) or (v < best_val):
-                best_val = v
-                best_ep = ep
-        return best_val, best_ep
-    except Exception:
-        return None, None
+            cx, cy, w, h = map(float, parts[1:5])
+        except Exception:
+            continue
+        xyxy = _xywhn_to_xyxy_pixels(cx, cy, w, h, W, H)
+        # If multiple per class, keep the first; typical fundus has exactly one per class
+        if cls not in out:
+            out[cls] = xyxy
+    return out
 
 
-# ---------------- train & evaluate ----------------
+# ---------------- prediction & self metrics (TEST) ----------------
+
+def _predict_best_per_class(model: YOLO, img_path: Path, imgsz: int, device: str, class_ids=(0, 1)) -> Dict[int, Tuple[int, int, int, int]]:
+    """
+    Run inference on a single image and return the highest-confidence xyxy per requested class.
+    Confidence threshold is effectively disabled (very low) to ensure we *always* pick one if present.
+    """
+    res_list = model.predict(
+        source=str(img_path),
+        imgsz=imgsz,
+        device=device,
+        conf=1e-4,
+        iou=0.7,
+        max_det=50,
+        verbose=False
+    )
+    if not res_list:
+        return {}
+
+    res = res_list[0]
+    if res.boxes is None or len(res.boxes) == 0:
+        return {}
+
+    cls_np = res.boxes.cls.detach().cpu().numpy().astype(int)
+    conf_np = res.boxes.conf.detach().cpu().numpy()
+    xyxy_np = res.boxes.xyxy.detach().cpu().numpy().astype(float)
+
+    best: Dict[int, Tuple[int, int, int, int]] = {}
+    for c in class_ids:
+        idxs = np.where(cls_np == c)[0]
+        if idxs.size == 0:
+            continue
+        # pick highest confidence
+        j = int(idxs[np.argmax(conf_np[idxs])])
+        x1, y1, x2, y2 = xyxy_np[j]
+        best[c] = (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)))
+    return best
+
+
+def _rect_dice_for_pair(H: int, W: int, gt_xyxy: Tuple[int, int, int, int], pr_xyxy: Tuple[int, int, int, int]) -> float:
+    gx1, gy1, gx2, gy2 = gt_xyxy
+    px1, py1, px2, py2 = pr_xyxy
+    gxywh = _xyxy_to_xywh(gx1, gy1, gx2, gy2)
+    pxywh = _xyxy_to_xywh(px1, py1, px2, py2)
+    gm = _rect_to_mask(H, W, gxywh)
+    pm = _rect_to_mask(H, W, pxywh)
+    return _dice(gm, pm)
+
+
+def _compute_test_metrics_self(ckpt: Path, data_yaml: Path, imgsz: int, device: str) -> Dict[str, Any]:
+    """
+    Compute per-class and overall TEST metrics by running inference ourselves and comparing
+    to YOLO GT labels:
+      - box_error = 1 - IoU
+      - dice      = rectangle Dice between GT and predicted boxes
+    Returns a dict with per-class means and counts.
+    """
+    # Gather test images
+    test_images = _gather_split_images(data_yaml, "test")
+    if not test_images:
+        return {"error": "No 'test' split found or it is empty."}
+
+    model = YOLO(str(ckpt))
+
+    # Accumulators
+    per_class_iou: Dict[int, List[float]] = {0: [], 1: []}
+    per_class_dice: Dict[int, List[float]] = {0: [], 1: []}
+    matched_counts: Dict[int, int] = {0: 0, 1: 0}
+
+    for img_path in test_images:
+        # GT
+        gt = _read_gt_xyxy_for_image(img_path, classes=(0, 1))
+        if not gt:
+            continue
+
+        # W,H for Dice masks
+        with PILImage.open(str(img_path)) as im:
+            W, H = im.size
+
+        # Prediction (best box per class)
+        pr = _predict_best_per_class(model, img_path, imgsz=imgsz, device=device, class_ids=(0, 1))
+
+        for c in (0, 1):
+            if c in gt and c in pr:
+                iou = _iou_xyxy(gt[c], pr[c])
+                dice = _rect_dice_for_pair(H, W, gt[c], pr[c])
+                per_class_iou[c].append(float(iou))
+                per_class_dice[c].append(float(dice))
+                matched_counts[c] += 1
+
+    # Aggregate
+    def _mean(x: List[float]) -> Optional[float]:
+        return float(np.mean(x)) if x else None
+
+    out: Dict[str, Any] = {}
+    for c, name in [(0, "disc"), (1, "cup")]:
+        miou = _mean(per_class_iou[c])
+        mdice = _mean(per_class_dice[c])
+        out[f"{name}_n"] = matched_counts[c]
+        out[f"{name}_box_error"] = (1.0 - miou) if (miou is not None) else None
+        out[f"{name}_dice"] = mdice
+
+    # Overall macro (average over classes that have data)
+    box_errs = [out.get("disc_box_error"), out.get("cup_box_error")]
+    dices = [out.get("disc_dice"), out.get("cup_dice")]
+    box_errs = [v for v in box_errs if v is not None]
+    dices = [v for v in dices if v is not None]
+    out["macro_box_error"] = float(np.mean(box_errs)) if box_errs else None
+    out["macro_dice"] = float(np.mean(dices)) if dices else None
+    out["tested_images"] = len(test_images)
+    return out
+
+
+# ---------------- training / eval orchestration ----------------
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Train/evaluate Ultralytics multiclass (disc/cup) from a config YAML")
@@ -509,11 +622,9 @@ def parse_args() -> argparse.Namespace:
 
     # Eval-only
     ap.add_argument("--eval-only", action="store_true",
-                    help="Skip training and run evaluation only.")
+                    help="Skip training and run evaluation only (self-computed TEST metrics).")
     ap.add_argument("--eval-ckpt", default="",
                     help="Path to a .pt checkpoint. If omitted, auto-picks runs/<name>/weights/{best,last}.pt")
-    ap.add_argument("--eval-splits", default="val,test",
-                    help="Comma list from {train,val,test}. Default: val,test")
 
     return ap.parse_args()
 
@@ -531,45 +642,21 @@ def _pick_ckpt_for_eval(runs_root: Path, name: str, explicit: str) -> Optional[P
     return None
 
 
-def _run_one_eval(ckpt: Path, data_yaml: Path, split: str, imgsz: int, device: str) -> tuple[dict, Path, dict]:
-    """
-    Returns (metrics_dict, save_dir, rect_dice_dict)
-    """
-    tester = YOLO(str(ckpt))
-    res = tester.val(
-        data=str(data_yaml),
-        split=(split if split in ("train", "val", "test") else None),
-        imgsz=imgsz,
-        device=device,
-        plots=True,
-        save_json=True,
-    )
-    save_dir = Path(getattr(res, "save_dir", tester.model.yaml.get("project", ".")))
-    metrics = _extract_metrics(res)
-    rect_dice = {}
-    try:
-        rect_dice = compute_rect_dice_from_predictions(save_dir)
-    except Exception:
-        pass
-    return metrics, save_dir, rect_dice
-
-
 def main() -> None:
     args = parse_args()
     cfg_path = Path(str(args.config)).expanduser().resolve()
     train_cfg = TrainCfg.from_yaml(cfg_path)
 
-    # ------------- Eval-only -------------
+    # ---------- EVAL-ONLY ----------
     if args.eval_only:
         ckpt_path = _pick_ckpt_for_eval(train_cfg.runs_root, train_cfg.name, args.eval_ckpt)
         if ckpt_path is None:
             raise SystemExit("[ERR] --eval-only requested but no checkpoint found (and no --eval-ckpt provided).")
 
-        # Use the ORIGINAL dataset YAML for evaluation (no train filtering needed)
-        base_yaml = train_cfg.data
+        # Report dataset split sizes
         try:
-            dy = yaml.safe_load(base_yaml.read_text()) or {}
-            dy_dir = base_yaml.parent
+            dy = yaml.safe_load(train_cfg.data.read_text()) or {}
+            dy_dir = train_cfg.data.parent
             n_train = _count_images("train", dy, dy_dir)
             n_val = _count_images("val", dy, dy_dir)
             n_test = _count_images("test", dy, dy_dir)
@@ -577,38 +664,24 @@ def main() -> None:
         except Exception as e:
             print(f"[WARN] Could not summarize splits: {e}")
 
-        splits = [s.strip() for s in args.eval_splits.split(",") if s.strip()]
-        summary = {
+        # Compute TEST metrics ourselves
+        test_summary = _compute_test_metrics_self(
+            ckpt=ckpt_path,
+            data_yaml=train_cfg.data,
+            imgsz=train_cfg.imgsz,
+            device=train_cfg.device,
+        )
+        final = {
             "mode": "eval-only",
             "checkpoint": str(ckpt_path),
             "run_name": train_cfg.name,
+            "test_metrics": test_summary,
         }
-
-        # Best train box loss (if we can find the run dir next to the ckpt)
-        run_dir = ckpt_path.parent.parent  # .../runs/<name>
-        best_box_loss, best_epoch = _min_train_box_loss_from_results_csv(run_dir)
-        if best_box_loss is not None:
-            summary["best_train_box_loss"] = {"value": best_box_loss, "epoch": best_epoch}
-
-        for split in splits:
-            print(f"[EVAL] split='{split}' on ckpt: {ckpt_path}")
-            metrics, save_dir, rect_dice = _run_one_eval(
-                ckpt=ckpt_path,
-                data_yaml=base_yaml,
-                split=split,
-                imgsz=train_cfg.imgsz,
-                device=train_cfg.device,
-            )
-            summary[f"{split}_metrics"] = metrics
-            if rect_dice:
-                summary[f"{split}_rect_dice"] = rect_dice
-            summary[f"{split}_artifacts_dir"] = str(save_dir)
-
         print("===== FINAL SUMMARY =====")
-        print(json.dumps(summary, indent=2))
+        print(json.dumps(final, indent=2))
         return
 
-    # ------------- Train (with optional filter) -------------
+    # ---------- TRAIN (with optional filtered train split) ----------
     data_yaml_for_training = train_cfg.data
     work_run_root = train_cfg.runs_root / train_cfg.name
     work_run_root.mkdir(parents=True, exist_ok=True)
@@ -712,10 +785,8 @@ def main() -> None:
     model.train(**overrides)
     print("[OK] Training complete.")
 
-    # -------- Evaluate best/last on test (fallback val), plus optional train (for train Rect-Dice) --------
-    dy = yaml.safe_load(Path(data_yaml_for_training).read_text()) or {}
-    has_test = bool(dy.get("test"))
-
+    # ---------- After training: compute TEST metrics ourselves ----------
+    # Choose best or last
     best_ckpt = train_cfg.runs_root / train_cfg.name / "weights" / "best.pt"
     last_ckpt = train_cfg.runs_root / train_cfg.name / "weights" / "last.pt"
     ckpt_path = best_ckpt if best_ckpt.exists() else (last_ckpt if last_ckpt.exists() else None)
@@ -723,63 +794,21 @@ def main() -> None:
         print("[WARN] No checkpoint found for evaluation.")
         return
 
-    summary = {
-        "mode": "train-then-eval",
-        "checkpoint": str(ckpt_path),
-        "run_name": train_cfg.name,
-    }
-
-    # Best train box loss
-    run_dir = ckpt_path.parent.parent
-    best_box_loss, best_epoch = _min_train_box_loss_from_results_csv(run_dir)
-    if best_box_loss is not None:
-        summary["best_train_box_loss"] = {"value": best_box_loss, "epoch": best_epoch}
-
-    # Evaluate on 'test' if present else 'val'
-    split = "test" if has_test else "val"
-    print(f"[EVAL] Evaluating on split='{split}' …")
-    metrics, save_dir, rect_dice = _run_one_eval(
+    # Use the same YAML we trained with (it still points val/test to absolute paths if filtered)
+    test_summary = _compute_test_metrics_self(
         ckpt=ckpt_path,
-        data_yaml=Path(data_yaml_for_training),  # val/test still valid due to absolute paths fix
-        split=split,
+        data_yaml=Path(data_yaml_for_training),
         imgsz=train_cfg.imgsz,
         device=train_cfg.device,
     )
-    summary[f"{split}_metrics"] = metrics
-    if rect_dice:
-        summary[f"{split}_rect_dice"] = rect_dice
-    summary[f"{split}_artifacts_dir"] = str(save_dir)
-
-    # Also evaluate on 'val' if test already used (so you get both)
-    if split == "test" and dy.get("val"):
-        vm, vsd, vrd = _run_one_eval(
-            ckpt=ckpt_path,
-            data_yaml=Path(data_yaml_for_training),
-            split="val",
-            imgsz=train_cfg.imgsz,
-            device=train_cfg.device,
-        )
-        summary["val_metrics"] = vm
-        if vrd:
-            summary["val_rect_dice"] = vrd
-        summary["val_artifacts_dir"] = str(vsd)
-
-    # Optional: evaluate on train to compute train Rect-Dice (best ckpt on train split)
-    if dy.get("train"):
-        tm, tsd, trd = _run_one_eval(
-            ckpt=ckpt_path,
-            data_yaml=Path(data_yaml_for_training),
-            split="train",
-            imgsz=train_cfg.imgsz,
-            device=train_cfg.device,
-        )
-        summary["train_metrics"] = tm
-        if trd:
-            summary["train_rect_dice"] = trd
-        summary["train_artifacts_dir"] = str(tsd)
-
+    final = {
+        "mode": "train-then-eval",
+        "checkpoint": str(ckpt_path),
+        "run_name": train_cfg.name,
+        "test_metrics": test_summary,
+    }
     print("===== FINAL SUMMARY =====")
-    print(json.dumps(summary, indent=2))
+    print(json.dumps(final, indent=2))
 
 
 if __name__ == "__main__":

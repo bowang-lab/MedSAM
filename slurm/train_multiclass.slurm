@@ -100,4 +100,4 @@ srun -u python -m "${TRAIN_MOD}" "${ARGS[@]}"
 #BEST="${RUNS_DIR}/${EXP_NAME}/weights/best.pt"
 #[[ -f "${BEST}" ]] || { echo "[ERR] best.pt not found at ${BEST}" >&2; exit 3; }
 
-echo "[OK] best.pt → ${BEST}"
+#echo "[OK] best.pt → ${BEST}"
