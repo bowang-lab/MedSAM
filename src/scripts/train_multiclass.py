@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # src/model/train_multiclass_cfg.py
+"""
+Multiclass YOLO (disc=0, cup=1) trainer/evaluator with:
+- Optional train-split filtering to only keep images that contain BOTH classes
+- Robust resume logic (auto/explicit) and epoch extension
+- Eval-only mode across chosen splits (val/test/train) with summary
+- Rectangular Dice (proxy) computed from predictions/labels JSON
+- FIX: when creating a filtered YAML, keep val/test usable by writing ABSOLUTE paths
+"""
 
 from __future__ import annotations
 
@@ -16,20 +24,19 @@ import torch
 import yaml
 from ultralytics import YOLO
 
-from src.utils import ultralytics_device_arg  # keep only what we use
+from src.utils import ultralytics_device_arg  # only what we need
+
 
 # ------------------ checkpoint helpers ------------------
 
 def _load_ckpt_epochs(ckpt_path: Path) -> tuple[int, Optional[int]]:
     """
     Returns (trained_epochs_done, target_epochs_in_ckpt_or_None).
-    PyTorch 2.6+: torch.load defaults to weights_only=True, which breaks Ultralytics ckpts.
-    We force weights_only=False for trusted local checkpoints.
+    PyTorch 2.6+: torch.load defaults to weights_only=True; we need the full object.
     """
     try:
         ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)  # PyTorch 2.6+
-    except TypeError:
-        # Older PyTorch (no weights_only kw)
+    except TypeError:  # older PyTorch
         ckpt = torch.load(str(ckpt_path), map_location="cpu")
 
     trained = int(ckpt.get("epoch", -1)) + 1  # convert 0-based to count
@@ -66,7 +73,6 @@ def compute_rect_dice_from_predictions(eval_dir: Path) -> dict:
     """
     Compute per-class Dice between GT rectangles and predicted rectangles.
     Requires Ultralytics 'predictions.json' and 'labels.json' (if available).
-    If 'labels.json' is absent, returns {} and does nothing.
     Saves 'dice_rect_summary.json' in eval_dir if computed.
     """
     pred_json = eval_dir / "predictions.json"
@@ -155,6 +161,14 @@ def _count_images(path_key: str, data_yaml: Dict[str, Any], data_yaml_dir: Path)
 
     if split_path.is_dir():
         return sum(1 for p in split_path.rglob("*") if p.suffix.lower() in IMG_EXTS)
+    if split_path.is_file() and split_path.suffix.lower() == ".txt":
+        try:
+            return sum(
+                1 for ln in split_path.read_text().splitlines()
+                if ln.strip() and Path(ln.strip()).exists()
+            )
+        except Exception:
+            return 0
     return 0
 
 
@@ -167,12 +181,10 @@ def _iter_images_from_dir(images_dir: Path) -> Iterable[Path]:
 
 
 def _label_path_candidates_for_image(img_path: Path) -> List[Path]:
-    """
-    Best-effort mapping from an image path to its label .txt path, trying common YOLO layouts.
-    """
+    """Map an image path to likely label .txt paths (common YOLO layouts)."""
     cands: List[Path] = []
 
-    # Case A: replace first 'images' segment with 'labels'
+    # Case A: replace first 'images' with 'labels'
     parts = list(img_path.parts)
     if "images" in parts:
         i = parts.index("images")
@@ -188,20 +200,18 @@ def _label_path_candidates_for_image(img_path: Path) -> List[Path]:
     # Case C: labels folder next to current folder
     cands.append(img_path.parent.parent / "labels" / (img_path.stem + ".txt"))
 
-    # Deduplicate while preserving order
+    # Deduplicate
     seen = set()
-    uniq: List[Path] = []
+    out: List[Path] = []
     for p in cands:
         if p not in seen:
             seen.add(p)
-            uniq.append(p)
-    return uniq
+            out.append(p)
+    return out
 
 
 def _label_has_both_classes(lbl_path: Path) -> bool:
-    """
-    Return True if label file exists and contains at least one line with class 0 and one with class 1.
-    """
+    """True if label file exists and contains at least one class 0 and one class 1 line."""
     if not lbl_path.exists():
         return False
     try:
@@ -217,17 +227,27 @@ def _label_has_both_classes(lbl_path: Path) -> bool:
         return False
 
 
+def _abs_split(entry: Any, base_dir: Path) -> str:
+    """
+    Return an absolute path for a split entry (dir or list.txt) given a base_dir.
+    """
+    if entry is None:
+        return ""
+    p = Path(str(entry))
+    if not p.is_absolute():
+        p = (base_dir / p).resolve()
+    return str(p)
+
+
 def _filter_train_to_both(data_yaml_path: Path, work_root: Path) -> Path:
     """
     Create a filtered data.yaml that keeps only training images with BOTH classes present.
-    Returns the path to the new YAML. Only 'train' is changed; 'val' and 'test' remain as-is.
-
-    The filtered 'train' entry is a *.txt list file with absolute image paths.
+    CRITICAL FIX: write absolute paths for 'path', 'val', and 'test' so evaluation doesn't break.
     """
     y = yaml.safe_load(data_yaml_path.read_text()) or {}
     ydir = data_yaml_path.parent
 
-    # Resolve base 'path' if present (relative to data.yaml)
+    # Resolve base 'path' (relative to YAML file dir)
     base_field = y.get("path")
     if base_field:
         base_path = Path(str(base_field))
@@ -237,14 +257,14 @@ def _filter_train_to_both(data_yaml_path: Path, work_root: Path) -> Path:
 
     train_entry = y.get("train")
     if not train_entry:
-        print("[FILTER] No 'train' entry found in data.yaml; skipping filter.")
+        print("[FILTER] No 'train' entry found; skipping filter.")
         return data_yaml_path
 
     train_path = Path(str(train_entry))
     if not train_path.is_absolute():
         train_path = (base / train_path).resolve()
 
-    # Collect candidate image list from either dir or file list
+    # Collect candidate images
     images: List[Path] = []
     if train_path.is_dir():
         images = list(_iter_images_from_dir(train_path))
@@ -262,7 +282,7 @@ def _filter_train_to_both(data_yaml_path: Path, work_root: Path) -> Path:
         print(f"[FILTER] Unsupported 'train' entry: {train_path} (must be folder or .txt). Skipping filter.")
         return data_yaml_path
 
-    # Decide which images to keep by testing corresponding label files
+    # Keep only images whose labels contain BOTH classes
     keep: List[Path] = []
     drop = 0
     for img in images:
@@ -276,21 +296,27 @@ def _filter_train_to_both(data_yaml_path: Path, work_root: Path) -> Path:
         else:
             drop += 1
 
-    # If nothing filtered, return original
     if not keep:
-        print("[FILTER] No training images containing both classes were found. Using original 'train'.")
+        print("[FILTER] No training images with both classes were found. Using original 'train'.")
         return data_yaml_path
 
-    # Prepare output structure
+    # Output filtered YAML + list file
     out_dir = work_root / "_filtered_data"
     out_dir.mkdir(parents=True, exist_ok=True)
     train_list = out_dir / "train_require_both.txt"
     train_list.write_text("\n".join(str(p) for p in keep) + "\n")
 
-    # New YAML: clone original but set 'train' to the list file (absolute path).
     new_y = dict(y)
+    # Make base 'path' ABSOLUTE so val/test keep working even though YAML moved
+    new_y["path"] = str(base.resolve())
     new_y["train"] = str(train_list.resolve())
-    # keep 'path', 'val', 'test', 'names' as-is
+
+    # Force absolute val/test (dirs or list files)
+    if "val" in y and y["val"]:
+        new_y["val"] = _abs_split(y["val"], base)
+    if "test" in y and y["test"]:
+        new_y["test"] = _abs_split(y["test"], base)
+
     new_yaml = out_dir / "data_filtered.yaml"
     new_yaml.write_text(yaml.safe_dump(new_y, sort_keys=False))
 
@@ -328,15 +354,15 @@ class TrainCfg:
     family: str
     size: str
     # training
-    resume: Optional[str]            # "", "auto", or path to last.pt
-    extend_epochs: Optional[int]     # if set and resuming: total_epochs = trained + extend_epochs
+    resume: Optional[str]
+    extend_epochs: Optional[int]
     name: str
     epochs: int
     imgsz: int
     batch: int
     workers: int
     seed: int
-    device: Optional[str]            # "auto" | None means auto; or "0", "0,1", "cpu"
+    device: Optional[str]
     amp: bool
     freeze: int
     optimizer: str
@@ -350,7 +376,6 @@ class TrainCfg:
 
     @staticmethod
     def from_yaml(path: Path) -> "TrainCfg":
-        # read & validate
         if not path.exists():
             raise SystemExit(f"[ERR] config YAML not found: {path}")
         cfg = yaml.safe_load(path.read_text()) or {}
@@ -382,7 +407,6 @@ class TrainCfg:
             erasing=float(aug.get("erasing", 0.40)),
         )
 
-        # device: "auto" → pick at runtime
         dev = cfg.get("device", "auto")
         if dev in (None, "", "auto"):
             dev = ultralytics_device_arg()
@@ -418,124 +442,116 @@ class TrainCfg:
         )
 
 
-# ---------------- metrics IO helpers ----------------
+# ---------------- metrics helpers ----------------
 
-def _metrics_from_valres(res) -> Dict[str, float]:
-    """
-    Robustly extract a flat dict of numeric metrics from a Ultralytics val() result.
-    Falls back to box.map / box.map50 when results_dict is sparse.
-    """
-    out: Dict[str, float] = {}
-    try:
-        rd = getattr(res, "results_dict", None) or {}
-        for k, v in rd.items():
-            if isinstance(v, (int, float)) and np.isfinite(v):
-                out[k] = float(v)
-    except Exception:
-        pass
-
-    # add common box maps if not present
-    try:
-        box = getattr(res, "box", None)
-        if box is not None:
-            if "map50-95" not in out and hasattr(box, "map"):
-                out["map50-95"] = float(box.map)
-            if "map50" not in out and hasattr(box, "map50"):
-                out["map50"] = float(box.map50)
-    except Exception:
-        pass
+def _extract_metrics(results_obj) -> dict:
+    """Return a float-only dict from Ultralytics results."""
+    d = getattr(results_obj, "results_dict", {}) or {}
+    out = {}
+    for k, v in d.items():
+        try:
+            out[k] = float(v)
+        except Exception:
+            pass
+    # Also alias common keys if present
+    if "metrics/mAP50-95(B)" in out:
+        out["map50-95"] = out["metrics/mAP50-95(B)"]
+    if "metrics/mAP50(B)" in out:
+        out["map50"] = out["metrics/mAP50(B)"]
     return out
 
 
-def _read_best_train_box_loss(run_dir: Path) -> Optional[tuple[float, int]]:
+def _min_train_box_loss_from_results_csv(run_dir: Path) -> tuple[Optional[float], Optional[int]]:
     """
-    Parse runs/<name>/results.csv and return (min_train_box_loss, epoch_index).
-    We search several possible column names to be robust across versions.
+    Parse Ultralytics results.csv in a run dir to get the min train box loss and its epoch.
     """
     csv_path = run_dir / "results.csv"
     if not csv_path.exists():
-        return None
-
-    # plausible train-box-loss column names
-    candidates = [
-        "train/box_loss", "loss/box", "box_loss", "metrics/loss_box", "loss_box",
-        "train/loss/box", "train/box"
-    ]
-    best_val = None
-    best_epoch = None
-
-    with csv_path.open("r", newline="") as f:
-        reader = csv.DictReader(f)
-        # discover matching column
-        cols = reader.fieldnames or []
+        return None, None
+    try:
+        rows = list(csv.DictReader(csv_path.open()))
+        best_val = None
+        best_ep = None
+        # Try a few column name variants
+        col_candidates = [
+            "train/box_loss", "box_loss", "loss/box", "giou_loss", "loss/giou"
+        ]
         col = None
-        for c in candidates:
-            if c in cols:
-                col = c
-                break
-        if col is None:
-            # try any column containing both 'box' and 'loss'
-            for c in cols:
-                lc = c.lower()
-                if "box" in lc and "loss" in lc:
+        if rows:
+            cols = rows[0].keys()
+            for c in col_candidates:
+                if c in cols:
                     col = c
                     break
-        if col is None:
-            return None
-
-        # find epoch column if present
-        epoch_col = "epoch" if "epoch" in cols else None
-        for i, row in enumerate(reader):
+        if not col:
+            return None, None
+        for r in rows:
             try:
-                v = float(row[col])
+                v = float(r[col])
+                ep = int(r.get("epoch", r.get("Epoch", -1)))
             except Exception:
                 continue
             if (best_val is None) or (v < best_val):
                 best_val = v
-                ep = int(row[epoch_col]) if epoch_col and row.get(epoch_col, "").strip() else i
-                best_epoch = ep
-
-    if best_val is None:
-        return None
-    return float(best_val), int(best_epoch if best_epoch is not None else -1)
-
-
-def _eval_split_collect(tester: YOLO, split: str, imgsz: int, device: str | None) -> tuple[Dict[str, float], dict, Path]:
-    """
-    Run tester.val() on a split and return (metrics_dict, rect_dice_dict, save_dir).
-    """
-    res = tester.val(
-        split=split if split in ("train", "val", "test") else None,
-        imgsz=imgsz,
-        device=device,
-        plots=True,
-        save_json=True,  # writes predictions.json (+ labels.json if available)
-    )
-    metrics = _metrics_from_valres(res)
-    save_dir = Path(getattr(res, "save_dir", tester.overrides.get("project", ".")))
-    rect_dice = {}
-    try:
-        rect_dice = compute_rect_dice_from_predictions(save_dir)
+                best_ep = ep
+        return best_val, best_ep
     except Exception:
-        rect_dice = {}
-    return metrics, rect_dice, save_dir
+        return None, None
 
 
 # ---------------- train & evaluate ----------------
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Train Ultralytics multiclass (disc/cup) from a config YAML")
+    ap = argparse.ArgumentParser(description="Train/evaluate Ultralytics multiclass (disc/cup) from a config YAML")
     ap.add_argument("--config", required=True, help="Path to YAML config.")
     ap.add_argument("--no-filter-both", action="store_true",
                     help="Disable filtering of training images to those containing BOTH classes.")
-    # NEW:
+
+    # Eval-only
     ap.add_argument("--eval-only", action="store_true",
                     help="Skip training and run evaluation only.")
     ap.add_argument("--eval-ckpt", default="",
                     help="Path to a .pt checkpoint. If omitted, auto-picks runs/<name>/weights/{best,last}.pt")
     ap.add_argument("--eval-splits", default="val,test",
                     help="Comma list from {train,val,test}. Default: val,test")
+
     return ap.parse_args()
+
+
+def _pick_ckpt_for_eval(runs_root: Path, name: str, explicit: str) -> Optional[Path]:
+    if explicit:
+        p = Path(explicit).expanduser().resolve()
+        return p if p.exists() else None
+    best = runs_root / name / "weights" / "best.pt"
+    last = runs_root / name / "weights" / "last.pt"
+    if best.exists():
+        return best
+    if last.exists():
+        return last
+    return None
+
+
+def _run_one_eval(ckpt: Path, data_yaml: Path, split: str, imgsz: int, device: str) -> tuple[dict, Path, dict]:
+    """
+    Returns (metrics_dict, save_dir, rect_dice_dict)
+    """
+    tester = YOLO(str(ckpt))
+    res = tester.val(
+        data=str(data_yaml),
+        split=(split if split in ("train", "val", "test") else None),
+        imgsz=imgsz,
+        device=device,
+        plots=True,
+        save_json=True,
+    )
+    save_dir = Path(getattr(res, "save_dir", tester.model.yaml.get("project", ".")))
+    metrics = _extract_metrics(res)
+    rect_dice = {}
+    try:
+        rect_dice = compute_rect_dice_from_predictions(save_dir)
+    except Exception:
+        pass
+    return metrics, save_dir, rect_dice
 
 
 def main() -> None:
@@ -543,49 +559,56 @@ def main() -> None:
     cfg_path = Path(str(args.config)).expanduser().resolve()
     train_cfg = TrainCfg.from_yaml(cfg_path)
 
-    # -------- EVAL-ONLY MODE (no training) --------
+    # ------------- Eval-only -------------
     if args.eval_only:
-        # Choose checkpoint
-        if args.eval_ckpt:
-            ckpt_path = Path(args.eval_ckpt).expanduser().resolve()
-            if not ckpt_path.exists():
-                raise SystemExit(f"[ERR] --eval-ckpt not found: {ckpt_path}")
-        else:
-            run_dir = train_cfg.runs_root / train_cfg.name / "weights"
-            best = run_dir / "best.pt"
-            last = run_dir / "last.pt"
-            ckpt_path = best if best.exists() else (last if last.exists() else None)
-            if ckpt_path is None:
-                raise SystemExit(f"[ERR] No checkpoint found under {run_dir} (expected best.pt or last.pt). "
-                                 f"Provide --eval-ckpt.")
+        ckpt_path = _pick_ckpt_for_eval(train_cfg.runs_root, train_cfg.name, args.eval_ckpt)
+        if ckpt_path is None:
+            raise SystemExit("[ERR] --eval-only requested but no checkpoint found (and no --eval-ckpt provided).")
 
-        tester = YOLO(str(ckpt_path))
-        tester.overrides = tester.overrides or {}
-        tester.overrides["data"] = str(train_cfg.data)
+        # Use the ORIGINAL dataset YAML for evaluation (no train filtering needed)
+        base_yaml = train_cfg.data
+        try:
+            dy = yaml.safe_load(base_yaml.read_text()) or {}
+            dy_dir = base_yaml.parent
+            n_train = _count_images("train", dy, dy_dir)
+            n_val = _count_images("val", dy, dy_dir)
+            n_test = _count_images("test", dy, dy_dir)
+            print(f"[DATA] (eval-only) train={n_train} | val={n_val} | test={n_test}")
+        except Exception as e:
+            print(f"[WARN] Could not summarize splits: {e}")
 
-        splits = [s.strip() for s in str(args.eval_splits).split(",") if s.strip()]
-        final = {"mode": "eval-only", "checkpoint": str(ckpt_path), "run_name": train_cfg.name}
+        splits = [s.strip() for s in args.eval_splits.split(",") if s.strip()]
+        summary = {
+            "mode": "eval-only",
+            "checkpoint": str(ckpt_path),
+            "run_name": train_cfg.name,
+        }
+
+        # Best train box loss (if we can find the run dir next to the ckpt)
+        run_dir = ckpt_path.parent.parent  # .../runs/<name>
+        best_box_loss, best_epoch = _min_train_box_loss_from_results_csv(run_dir)
+        if best_box_loss is not None:
+            summary["best_train_box_loss"] = {"value": best_box_loss, "epoch": best_epoch}
 
         for split in splits:
-            print(f"[EVAL] Evaluating split='{split}' …")
-            metrics, rect_dice, save_dir = _eval_split_collect(tester, split, train_cfg.imgsz, train_cfg.device)
-            final[f"{split}_metrics"] = {k: round(v, 6) for k, v in metrics.items()}
+            print(f"[EVAL] split='{split}' on ckpt: {ckpt_path}")
+            metrics, save_dir, rect_dice = _run_one_eval(
+                ckpt=ckpt_path,
+                data_yaml=base_yaml,
+                split=split,
+                imgsz=train_cfg.imgsz,
+                device=train_cfg.device,
+            )
+            summary[f"{split}_metrics"] = metrics
             if rect_dice:
-                final[f"{split}_rect_dice_per_class"] = {k: round(v, 6) for k, v in rect_dice.items()}
-            final[f"{split}_artifacts_dir"] = str(save_dir)
+                summary[f"{split}_rect_dice"] = rect_dice
+            summary[f"{split}_artifacts_dir"] = str(save_dir)
 
-        # Best training box loss (if results.csv exists in the run dir alongside weights)
-        run_dir = train_cfg.runs_root / train_cfg.name
-        best_train_box = _read_best_train_box_loss(run_dir)
-        if best_train_box:
-            final["best_train_box_loss"] = {"value": round(best_train_box[0], 6), "epoch": int(best_train_box[1])}
-
-        print("\n===== FINAL SUMMARY =====")
-        print(json.dumps(final, indent=2))
-        print("=====================================\n")
+        print("===== FINAL SUMMARY =====")
+        print(json.dumps(summary, indent=2))
         return
 
-    # -------- Optionally filter training split to 'require both classes' --------
+    # ------------- Train (with optional filter) -------------
     data_yaml_for_training = train_cfg.data
     work_run_root = train_cfg.runs_root / train_cfg.name
     work_run_root.mkdir(parents=True, exist_ok=True)
@@ -598,10 +621,9 @@ def main() -> None:
         except Exception as e:
             print(f"[FILTER] Failed to build filtered train list ({e}). Proceeding with original data.yaml.")
 
-    # -------- Resolve resume / model init --------
+    # Resolve resume/init
     resume_flag = False
     resume_ckpt: Optional[Path] = None
-
     if train_cfg.resume:
         if str(train_cfg.resume).lower() == "auto":
             cand = train_cfg.runs_root / train_cfg.name / "weights" / "last.pt"
@@ -610,7 +632,7 @@ def main() -> None:
                 resume_flag = True
                 print(f"[RESUME] auto → {resume_ckpt}")
             else:
-                print(f"[RESUME] auto requested but not found: {cand}  → starting fresh.")
+                print(f"[RESUME] auto requested but not found: {cand} → starting fresh.")
         else:
             cand = Path(str(train_cfg.resume)).expanduser().resolve()
             if cand.exists():
@@ -618,14 +640,12 @@ def main() -> None:
                 resume_flag = True
                 print(f"[RESUME] explicit → {resume_ckpt}")
             else:
-                print(f"[RESUME] explicit path not found: {cand}  → starting fresh.")
+                print(f"[RESUME] explicit path not found: {cand} → starting fresh.")
 
-    # If resuming, load model from the checkpoint; else from chosen base weights
     if resume_flag and resume_ckpt is not None:
         trained_done, planned_in_ckpt = _load_ckpt_epochs(resume_ckpt)
         print(f"[RESUME] checkpoint epochs: done={trained_done} planned={planned_in_ckpt}")
 
-        # Decide final target epochs
         if train_cfg.extend_epochs is not None:
             target_epochs = trained_done + int(train_cfg.extend_epochs)
             print(f"[RESUME] extend_epochs={train_cfg.extend_epochs} → target_epochs={target_epochs}")
@@ -633,8 +653,8 @@ def main() -> None:
             target_epochs = int(train_cfg.epochs)
             if target_epochs <= trained_done:
                 raise SystemExit(
-                    f"[ERR] Resume requested but YAML epochs={target_epochs} ≤ completed={trained_done}. "
-                    f"Increase 'epochs' to > {trained_done} OR set 'extend_epochs: N' to continue."
+                    f"[ERR] YAML epochs={target_epochs} ≤ completed={trained_done}. "
+                    f"Increase 'epochs' or set 'extend_epochs: N'."
                 )
 
         model = YOLO(str(resume_ckpt))
@@ -643,17 +663,13 @@ def main() -> None:
     else:
         weights = _resolve_weights(train_cfg.family, train_cfg.size, train_cfg.weights)
         model = YOLO(weights)
-        print(f"[INIT ] starting from weights: {weights}")
+        print(f"[INIT] starting from weights: {weights}")
         is_resume = False
         effective_epochs = int(train_cfg.epochs)
 
-    # -------- Info & split counts --------
     print(f"[CFG] {cfg_path}")
     print(f"[INFO] data={data_yaml_for_training} | device={train_cfg.device} | "
           f"epochs={effective_epochs} | imgsz={train_cfg.imgsz} | batch={train_cfg.batch}")
-    print(f"[AUG ] scale={train_cfg.aug.scale} translate={train_cfg.aug.translate} "
-          f"mosaic={train_cfg.aug.mosaic} mixup={train_cfg.aug.mixup} erasing={train_cfg.aug.erasing}")
-    print(f"[RUN ] project={train_cfg.runs_root} name={train_cfg.name}")
 
     try:
         dy = yaml.safe_load(Path(data_yaml_for_training).read_text()) or {}
@@ -665,7 +681,6 @@ def main() -> None:
     except Exception as e:
         print(f"[WARN] Could not summarize splits: {e}")
 
-    # -------- Train --------
     overrides: Dict[str, Any] = dict(
         data=str(data_yaml_for_training),
         epochs=effective_epochs,
@@ -691,13 +706,13 @@ def main() -> None:
         flipud=train_cfg.aug.flipud, fliplr=train_cfg.aug.fliplr,
         mosaic=train_cfg.aug.mosaic, mixup=train_cfg.aug.mixup,
         copy_paste=train_cfg.aug.copy_paste, erasing=train_cfg.aug.erasing,
-        resume=is_resume,  # boolean only; model was constructed from ckpt if resuming
+        resume=is_resume,
     )
 
     model.train(**overrides)
     print("[OK] Training complete.")
 
-    # -------- Evaluate on test (fallback to val) --------
+    # -------- Evaluate best/last on test (fallback val), plus optional train (for train Rect-Dice) --------
     dy = yaml.safe_load(Path(data_yaml_for_training).read_text()) or {}
     has_test = bool(dy.get("test"))
 
@@ -708,52 +723,63 @@ def main() -> None:
         print("[WARN] No checkpoint found for evaluation.")
         return
 
-    tester = YOLO(str(ckpt_path))
-    tester.overrides = tester.overrides or {}
-    tester.overrides["data"] = str(train_cfg.data)  # use full/original YAML for eval
-
-    # Evaluate: train (for dice), val, test
-    final = {
+    summary = {
         "mode": "train-then-eval",
         "checkpoint": str(ckpt_path),
         "run_name": train_cfg.name,
     }
 
-    # TRAIN split dice + metrics (if available)
-    print("[EVAL] Evaluating split='train' …")
-    tr_metrics, tr_rect_dice, tr_dir = _eval_split_collect(tester, "train", train_cfg.imgsz, train_cfg.device)
-    if tr_metrics:
-        final["train_metrics"] = {k: round(v, 6) for k, v in tr_metrics.items()}
-    if tr_rect_dice:
-        final["train_rect_dice_per_class"] = {k: round(v, 6) for k, v in tr_rect_dice.items()}
-    final["train_artifacts_dir"] = str(tr_dir)
+    # Best train box loss
+    run_dir = ckpt_path.parent.parent
+    best_box_loss, best_epoch = _min_train_box_loss_from_results_csv(run_dir)
+    if best_box_loss is not None:
+        summary["best_train_box_loss"] = {"value": best_box_loss, "epoch": best_epoch}
 
-    # VAL split (always)
-    print("[EVAL] Evaluating split='val' …")
-    va_metrics, va_rect_dice, va_dir = _eval_split_collect(tester, "val", train_cfg.imgsz, train_cfg.device)
-    final["val_metrics"] = {k: round(v, 6) for k, v in va_metrics.items()}
-    if va_rect_dice:
-        final["val_rect_dice_per_class"] = {k: round(v, 6) for k, v in va_rect_dice.items()}
-    final["val_artifacts_dir"] = str(va_dir)
+    # Evaluate on 'test' if present else 'val'
+    split = "test" if has_test else "val"
+    print(f"[EVAL] Evaluating on split='{split}' …")
+    metrics, save_dir, rect_dice = _run_one_eval(
+        ckpt=ckpt_path,
+        data_yaml=Path(data_yaml_for_training),  # val/test still valid due to absolute paths fix
+        split=split,
+        imgsz=train_cfg.imgsz,
+        device=train_cfg.device,
+    )
+    summary[f"{split}_metrics"] = metrics
+    if rect_dice:
+        summary[f"{split}_rect_dice"] = rect_dice
+    summary[f"{split}_artifacts_dir"] = str(save_dir)
 
-    # TEST split if present
-    if has_test:
-        print("[EVAL] Evaluating split='test' …")
-        te_metrics, te_rect_dice, te_dir = _eval_split_collect(tester, "test", train_cfg.imgsz, train_cfg.device)
-        final["test_metrics"] = {k: round(v, 6) for k, v in te_metrics.items()}
-        if te_rect_dice:
-            final["test_rect_dice_per_class"] = {k: round(v, 6) for k, v in te_rect_dice.items()}
-        final["test_artifacts_dir"] = str(te_dir)
+    # Also evaluate on 'val' if test already used (so you get both)
+    if split == "test" and dy.get("val"):
+        vm, vsd, vrd = _run_one_eval(
+            ckpt=ckpt_path,
+            data_yaml=Path(data_yaml_for_training),
+            split="val",
+            imgsz=train_cfg.imgsz,
+            device=train_cfg.device,
+        )
+        summary["val_metrics"] = vm
+        if vrd:
+            summary["val_rect_dice"] = vrd
+        summary["val_artifacts_dir"] = str(vsd)
 
-    # Best training box loss from results.csv
-    run_dir = train_cfg.runs_root / train_cfg.name
-    best_train_box = _read_best_train_box_loss(run_dir)
-    if best_train_box:
-        final["best_train_box_loss"] = {"value": round(best_train_box[0], 6), "epoch": int(best_train_box[1])}
+    # Optional: evaluate on train to compute train Rect-Dice (best ckpt on train split)
+    if dy.get("train"):
+        tm, tsd, trd = _run_one_eval(
+            ckpt=ckpt_path,
+            data_yaml=Path(data_yaml_for_training),
+            split="train",
+            imgsz=train_cfg.imgsz,
+            device=train_cfg.device,
+        )
+        summary["train_metrics"] = tm
+        if trd:
+            summary["train_rect_dice"] = trd
+        summary["train_artifacts_dir"] = str(tsd)
 
-    print("\n===== FINAL SUMMARY =====")
-    print(json.dumps(final, indent=2))
-    print("=====================================\n")
+    print("===== FINAL SUMMARY =====")
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
