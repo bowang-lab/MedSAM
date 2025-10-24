@@ -1,46 +1,15 @@
 #!/usr/bin/env python3
 # src/model/train_multiclass_cfg.py
-"""
-Train a multiclass (disc=0, cup=1) YOLO detector from a YAML config, with:
-- Robust resume logic (supports 'resume: auto' or explicit path, and 'extend_epochs')
-- Automatic device selection ("auto" honors YOLO_DEVICES / CUDA_VISIBLE_DEVICES)
-- Strong augment defaults (configurable)
-- **Training-split filtering** to require both classes present (disc & cup)
-- Always evaluates on test (falls back to val) and saves plots + predictions.json
-- Optional rectangle-based Dice proxy computed from predictions/labels JSON
-
-Minimal YAML keys:
-  data: /abs/path/to/data.yaml
-  runs_root: /abs/path/to/runs/detect
-  name: "multiclass_disc_cup"
-  epochs: 200
-  batch: 16
-  imgsz: 640
-  resume: "auto" | "/abs/path/to/last.pt" | "" (fresh)
-  extend_epochs: 100   # (optional) if resuming, adds N to completed epochs
-  optimizer: "AdamW"
-  patience: 50
-  multi_scale: true
-  close_mosaic: 10
-  augment: { ... }     # see AugCfg below for full list
-
-Optional:
-  require_both_train: true   # default True; filter train split to images with BOTH classes
-
-Notes:
-- If you finished 200 epochs and want to continue to 300:
-    either set epochs: 300 with resume: auto
-    or set extend_epochs: 100 with resume: auto
-"""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, Iterable, List, Tuple
+from typing import Optional, Dict, Any, Iterable, List
 
 import numpy as np
 import torch
@@ -48,7 +17,6 @@ import yaml
 from ultralytics import YOLO
 
 from src.utils import ultralytics_device_arg  # keep only what we use
-
 
 # ------------------ checkpoint helpers ------------------
 
@@ -450,6 +418,109 @@ class TrainCfg:
         )
 
 
+# ---------------- metrics IO helpers ----------------
+
+def _metrics_from_valres(res) -> Dict[str, float]:
+    """
+    Robustly extract a flat dict of numeric metrics from a Ultralytics val() result.
+    Falls back to box.map / box.map50 when results_dict is sparse.
+    """
+    out: Dict[str, float] = {}
+    try:
+        rd = getattr(res, "results_dict", None) or {}
+        for k, v in rd.items():
+            if isinstance(v, (int, float)) and np.isfinite(v):
+                out[k] = float(v)
+    except Exception:
+        pass
+
+    # add common box maps if not present
+    try:
+        box = getattr(res, "box", None)
+        if box is not None:
+            if "map50-95" not in out and hasattr(box, "map"):
+                out["map50-95"] = float(box.map)
+            if "map50" not in out and hasattr(box, "map50"):
+                out["map50"] = float(box.map50)
+    except Exception:
+        pass
+    return out
+
+
+def _read_best_train_box_loss(run_dir: Path) -> Optional[tuple[float, int]]:
+    """
+    Parse runs/<name>/results.csv and return (min_train_box_loss, epoch_index).
+    We search several possible column names to be robust across versions.
+    """
+    csv_path = run_dir / "results.csv"
+    if not csv_path.exists():
+        return None
+
+    # plausible train-box-loss column names
+    candidates = [
+        "train/box_loss", "loss/box", "box_loss", "metrics/loss_box", "loss_box",
+        "train/loss/box", "train/box"
+    ]
+    best_val = None
+    best_epoch = None
+
+    with csv_path.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        # discover matching column
+        cols = reader.fieldnames or []
+        col = None
+        for c in candidates:
+            if c in cols:
+                col = c
+                break
+        if col is None:
+            # try any column containing both 'box' and 'loss'
+            for c in cols:
+                lc = c.lower()
+                if "box" in lc and "loss" in lc:
+                    col = c
+                    break
+        if col is None:
+            return None
+
+        # find epoch column if present
+        epoch_col = "epoch" if "epoch" in cols else None
+        for i, row in enumerate(reader):
+            try:
+                v = float(row[col])
+            except Exception:
+                continue
+            if (best_val is None) or (v < best_val):
+                best_val = v
+                ep = int(row[epoch_col]) if epoch_col and row.get(epoch_col, "").strip() else i
+                best_epoch = ep
+
+    if best_val is None:
+        return None
+    return float(best_val), int(best_epoch if best_epoch is not None else -1)
+
+
+def _eval_split_collect(tester: YOLO, split: str, imgsz: int, device: str | None) -> tuple[Dict[str, float], dict, Path]:
+    """
+    Run tester.val() on a split and return (metrics_dict, rect_dice_dict, save_dir).
+    """
+    res = tester.val(
+        split=split if split in ("train", "val", "test") else None,
+        imgsz=imgsz,
+        device=device,
+        plots=True,
+        save_json=True,  # writes predictions.json (+ labels.json if available)
+    )
+    metrics = _metrics_from_valres(res)
+    save_dir = Path(getattr(res, "save_dir", tester.overrides.get("project", ".")))
+    rect_dice = {}
+    try:
+        rect_dice = compute_rect_dice_from_predictions(save_dir)
+    except Exception:
+        rect_dice = {}
+    return metrics, rect_dice, save_dir
+
+
 # ---------------- train & evaluate ----------------
 
 def parse_args() -> argparse.Namespace:
@@ -457,6 +528,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--config", required=True, help="Path to YAML config.")
     ap.add_argument("--no-filter-both", action="store_true",
                     help="Disable filtering of training images to those containing BOTH classes.")
+    # NEW:
+    ap.add_argument("--eval-only", action="store_true",
+                    help="Skip training and run evaluation only.")
+    ap.add_argument("--eval-ckpt", default="",
+                    help="Path to a .pt checkpoint. If omitted, auto-picks runs/<name>/weights/{best,last}.pt")
+    ap.add_argument("--eval-splits", default="val,test",
+                    help="Comma list from {train,val,test}. Default: val,test")
     return ap.parse_args()
 
 
@@ -464,6 +542,48 @@ def main() -> None:
     args = parse_args()
     cfg_path = Path(str(args.config)).expanduser().resolve()
     train_cfg = TrainCfg.from_yaml(cfg_path)
+
+    # -------- EVAL-ONLY MODE (no training) --------
+    if args.eval_only:
+        # Choose checkpoint
+        if args.eval_ckpt:
+            ckpt_path = Path(args.eval_ckpt).expanduser().resolve()
+            if not ckpt_path.exists():
+                raise SystemExit(f"[ERR] --eval-ckpt not found: {ckpt_path}")
+        else:
+            run_dir = train_cfg.runs_root / train_cfg.name / "weights"
+            best = run_dir / "best.pt"
+            last = run_dir / "last.pt"
+            ckpt_path = best if best.exists() else (last if last.exists() else None)
+            if ckpt_path is None:
+                raise SystemExit(f"[ERR] No checkpoint found under {run_dir} (expected best.pt or last.pt). "
+                                 f"Provide --eval-ckpt.")
+
+        tester = YOLO(str(ckpt_path))
+        tester.overrides = tester.overrides or {}
+        tester.overrides["data"] = str(train_cfg.data)
+
+        splits = [s.strip() for s in str(args.eval_splits).split(",") if s.strip()]
+        final = {"mode": "eval-only", "checkpoint": str(ckpt_path), "run_name": train_cfg.name}
+
+        for split in splits:
+            print(f"[EVAL] Evaluating split='{split}' …")
+            metrics, rect_dice, save_dir = _eval_split_collect(tester, split, train_cfg.imgsz, train_cfg.device)
+            final[f"{split}_metrics"] = {k: round(v, 6) for k, v in metrics.items()}
+            if rect_dice:
+                final[f"{split}_rect_dice_per_class"] = {k: round(v, 6) for k, v in rect_dice.items()}
+            final[f"{split}_artifacts_dir"] = str(save_dir)
+
+        # Best training box loss (if results.csv exists in the run dir alongside weights)
+        run_dir = train_cfg.runs_root / train_cfg.name
+        best_train_box = _read_best_train_box_loss(run_dir)
+        if best_train_box:
+            final["best_train_box_loss"] = {"value": round(best_train_box[0], 6), "epoch": int(best_train_box[1])}
+
+        print("\n===== FINAL SUMMARY =====")
+        print(json.dumps(final, indent=2))
+        print("=====================================\n")
+        return
 
     # -------- Optionally filter training split to 'require both classes' --------
     data_yaml_for_training = train_cfg.data
@@ -502,7 +622,6 @@ def main() -> None:
 
     # If resuming, load model from the checkpoint; else from chosen base weights
     if resume_flag and resume_ckpt is not None:
-        # Check how many epochs have completed
         trained_done, planned_in_ckpt = _load_ckpt_epochs(resume_ckpt)
         print(f"[RESUME] checkpoint epochs: done={trained_done} planned={planned_in_ckpt}")
 
@@ -586,51 +705,55 @@ def main() -> None:
     last_ckpt = train_cfg.runs_root / train_cfg.name / "weights" / "last.pt"
     ckpt_path = best_ckpt if best_ckpt.exists() else (last_ckpt if last_ckpt.exists() else None)
     if ckpt_path is None:
-        print("[WARN] No checkpoint found for test evaluation.")
+        print("[WARN] No checkpoint found for evaluation.")
         return
 
     tester = YOLO(str(ckpt_path))
-    split = "test" if has_test else "val"
-    print(f"[EVAL] Evaluating checkpoint on split='{split}' …")
-    val_res = tester.val(
-        data=str(data_yaml_for_training),
-        split=split,
-        imgsz=train_cfg.imgsz,
-        device=train_cfg.device,
-        plots=True,       # PR curves, confusion, etc.
-        save_json=True,   # writes predictions.json (+ labels.json if available)
-    )
+    tester.overrides = tester.overrides or {}
+    tester.overrides["data"] = str(train_cfg.data)  # use full/original YAML for eval
 
-    # Rectangle-Dice (proxy). Writes dice_rect_summary.json if GT JSON present.
-    save_dir = Path(getattr(val_res, "save_dir", train_cfg.runs_root / train_cfg.name / "eval_tmp"))
-    try:
-        rect_dice = compute_rect_dice_from_predictions(save_dir)
-        if rect_dice:
-            print("[EVAL] Rectangle-Dice (per class):", rect_dice)
-    except Exception as e:
-        print(f"[WARN] Dice metric computation failed: {e}")
+    # Evaluate: train (for dice), val, test
+    final = {
+        "mode": "train-then-eval",
+        "checkpoint": str(ckpt_path),
+        "run_name": train_cfg.name,
+    }
 
-    # Print core losses/metrics robustly
-    try:
-        metrics = getattr(val_res, "results_dict", {}) or {}
+    # TRAIN split dice + metrics (if available)
+    print("[EVAL] Evaluating split='train' …")
+    tr_metrics, tr_rect_dice, tr_dir = _eval_split_collect(tester, "train", train_cfg.imgsz, train_cfg.device)
+    if tr_metrics:
+        final["train_metrics"] = {k: round(v, 6) for k, v in tr_metrics.items()}
+    if tr_rect_dice:
+        final["train_rect_dice_per_class"] = {k: round(v, 6) for k, v in tr_rect_dice.items()}
+    final["train_artifacts_dir"] = str(tr_dir)
 
-        def pick(d: dict, keys: tuple[str, ...]):
-            for k in keys:
-                if k in d:
-                    return d[k]
-            return None
+    # VAL split (always)
+    print("[EVAL] Evaluating split='val' …")
+    va_metrics, va_rect_dice, va_dir = _eval_split_collect(tester, "val", train_cfg.imgsz, train_cfg.device)
+    final["val_metrics"] = {k: round(v, 6) for k, v in va_metrics.items()}
+    if va_rect_dice:
+        final["val_rect_dice_per_class"] = {k: round(v, 6) for k, v in va_rect_dice.items()}
+    final["val_artifacts_dir"] = str(va_dir)
 
-        box_loss = pick(metrics, ("loss/box", "box_loss", "box"))
-        cls_loss = pick(metrics, ("loss/cls", "cls_loss", "cls"))
-        dfl_loss = pick(metrics, ("loss/dfl", "dfl_loss", "dfl"))
-        printable = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
-        print("[EVAL] key metrics:", printable)
-        if box_loss is not None:
-            print(f"[EVAL] box_loss={float(box_loss):.4f} | "
-                  f"cls_loss={float(cls_loss or 0):.4f} | "
-                  f"dfl_loss={float(dfl_loss or 0):.4f}")
-    except Exception:
-        print("[EVAL] Finished; see run directory for detailed metrics/plots.")
+    # TEST split if present
+    if has_test:
+        print("[EVAL] Evaluating split='test' …")
+        te_metrics, te_rect_dice, te_dir = _eval_split_collect(tester, "test", train_cfg.imgsz, train_cfg.device)
+        final["test_metrics"] = {k: round(v, 6) for k, v in te_metrics.items()}
+        if te_rect_dice:
+            final["test_rect_dice_per_class"] = {k: round(v, 6) for k, v in te_rect_dice.items()}
+        final["test_artifacts_dir"] = str(te_dir)
+
+    # Best training box loss from results.csv
+    run_dir = train_cfg.runs_root / train_cfg.name
+    best_train_box = _read_best_train_box_loss(run_dir)
+    if best_train_box:
+        final["best_train_box_loss"] = {"value": round(best_train_box[0], 6), "epoch": int(best_train_box[1])}
+
+    print("\n===== FINAL SUMMARY =====")
+    print(json.dumps(final, indent=2))
+    print("=====================================\n")
 
 
 if __name__ == "__main__":

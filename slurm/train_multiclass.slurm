@@ -88,6 +88,8 @@ nvidia-smi -L || true
 # -------- Build args safely --------
 ARGS=(
   --config "${CONFIG}"
+  --eval-only
+  --eval-ckpt "/scratch/st-ipor-1/cperez/MedSAM/runs/detect/multiclass_disc_cup4/weights/best.pt"
 )
 
 # -------- Train --------

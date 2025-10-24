@@ -21,9 +21,6 @@ from src.utils import ensure_dir, stem_map_by_first_match
 from src.model.MedSAM_infer import (
     MedSAMModel, medsam_infer, embed_image_1024, load_medsam, pick_device
 )
-
-# NEW: import your multiclass predictor
-from src.model.predict_bb_multi import MultiClassPredictor
 from src.utils import (
     overlay_masks_and_boxes, cdr_from_masks, make_side_by_side, load_image_bgr,
     shrink_box_to_fit_mask, tight_bbox_from_mask, save_mask_png, expand, dice
@@ -35,9 +32,10 @@ def _save_viz_image(path: Path, bgr: np.ndarray) -> None:
     ensure_dir(path.parent)
     cv2.imwrite(str(path), bgr)
 
-def _best_box_from_result(result, conf_thres: float) -> Optional[Tuple[Tuple[int, int, int, int], float]]:
+def _best_box_from_result_any(result) -> Optional[Tuple[Tuple[int, int, int, int], float]]:
     """
-    From one Ultralytics result, return (xyxy_int, conf) for the highest-confidence box >= conf_thres.
+    Return the single highest-confidence box from one Ultralytics result (any class).
+    No confidence thresholding; returns (xyxy_int, conf) or None if no boxes.
     """
     if result is None or result.boxes is None or len(result.boxes) == 0:
         return None
@@ -45,10 +43,25 @@ def _best_box_from_result(result, conf_thres: float) -> Optional[Tuple[Tuple[int
     conf = boxes.conf.detach().cpu().numpy()
     xyxy = boxes.xyxy.detach().cpu().numpy()
     i = int(np.argmax(conf))
-    if conf[i] < conf_thres:
-        return None
     x1, y1, x2, y2 = map(float, xyxy[i])
     return (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))), float(conf[i])
+
+def _best_box_for_class(result, cls_id: int) -> Optional[Tuple[Tuple[int,int,int,int], float]]:
+    """
+    Return the highest-confidence box for a specific class id, ignoring thresholds.
+    """
+    if result is None or result.boxes is None or len(result.boxes) == 0:
+        return None
+    boxes = result.boxes
+    conf = boxes.conf.detach().cpu().numpy()
+    xyxy = boxes.xyxy.detach().cpu().numpy()
+    cls  = boxes.cls.detach().cpu().numpy() if boxes.cls is not None else np.zeros_like(conf)
+    idxs = np.where(cls.astype(int) == int(cls_id))[0]
+    if idxs.size == 0:
+        return None
+    best_i = int(idxs[np.argmax(conf[idxs])])
+    x1, y1, x2, y2 = map(float, xyxy[best_i])
+    return (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))), float(conf[best_i])
 
 def _square_crop_bounds(cx: float, cy: float, side: float, W: int, H: int) -> Tuple[int, int, int, int]:
     half = side / 2.0
@@ -227,7 +240,7 @@ def build_cup_box_from_disc_mask(disc_mask: np.ndarray,
 
 def _process_one_image(
     img: Image,
-    mc_pred: MultiClassPredictor,
+    mc_model: YOLO,
     msam: MedSAMModel,
     out_labels_dir: Path,
     images_root: Path,
@@ -241,7 +254,7 @@ def _process_one_image(
     # Optional cup-on-ROI model + ROI pad
     cup_yolo_model: Optional[YOLO] = None,
     roi_pad_frac: float = 0,
-    conf: float = 0.25,
+    conf: float = 0.25,   # kept for signature compat; we ignore thresholding logic
     iou: float = 0.50,
     overwrite: bool = True,
 ) -> Tuple[
@@ -251,35 +264,44 @@ def _process_one_image(
     Optional[float], Optional[float],           # disc_box_iou, cup_box_iou
     Optional[float], Optional[float],           # disc_dice, cup_dice
 ]:
-    # A) Predict disc & cup bounding boxes via MULTICLASS detector (best per class)
-    preds = mc_pred.predict_one_image_to_imageobj(img)   # attaches best disc/cup boxes to Image
-    best = preds.best_per_class()
-
-    disc_box_bb: Optional[BoundingBox] = None
-    if 0 in best:
-        x1, y1, x2, y2 = best[0].xyxy
-        disc_box_bb = BoundingBox(float(x1), float(y1), float(x2), float(y2))
-        img.set_box(Structure.DISC, LabelType.PRED, disc_box_bb)
-    else:
-        # no disc → cannot proceed
+    # A) Predict disc & cup bounding boxes via MULTICLASS detector with conf=0.0 (no threshold)
+    img_bgr = load_image_bgr(img.image_path)
+    mc_res = mc_model.predict(source=img_bgr, conf=0.0, iou=iou, device=msam.device, verbose=False)
+    if not mc_res:
+        # no detections at all → cannot proceed
         return None, None, None, None, None, None, None, None, None, None
+    mc_res0 = mc_res[0]
 
-    # Optionally attach initial cup from MC detector
+    # Always take the best per class (disc=0, cup=1), ignoring conf thresholds
+    disc_best = _best_box_for_class(mc_res0, cls_id=0)
+    cup_best  = _best_box_for_class(mc_res0, cls_id=1)
+
+    # Require a disc box to proceed (MedSAM needs a prompt)
+    if disc_best is None:
+        # fallback: best box of any class (rare edge); use as disc proxy
+        disc_best = _best_box_from_result_any(mc_res0)
+        if disc_best is None:
+            return None, None, None, None, None, None, None, None, None, None
+
+    (dx1, dy1, dx2, dy2), _disc_conf = disc_best
+    disc_bb = BoundingBox(float(dx1), float(dy1), float(dx2), float(dy2))
+    img.set_box(Structure.DISC, LabelType.PRED, disc_bb)
+
+    # Optionally attach initial cup candidate (may be None)
     cup_det_xyxy: Optional[Tuple[int,int,int,int]] = None
-    if 1 in best:
-        c1, c2, c3, c4 = best[1].xyxy
-        cup_det_xyxy = (int(c1), int(c2), int(c3), int(c4))
+    if cup_best is not None:
+        (cx1, cy1, cx2, cy2), _ = cup_best
+        cup_det_xyxy = (int(cx1), int(cy1), int(cx2), int(cy2))
 
-    # Write current predicted labels (may be disc-only at this point)
+    # Write current predicted labels (disc present; cup maybe later)
     _write_pred_labels_for_image(out_labels_dir, images_root, img, overwrite=overwrite, require_both=False)
 
     # B) MedSAM disc → mask
-    img_bgr = load_image_bgr(img.image_path)
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     emb, H, W, _ = embed_image_1024(msam, img_rgb)
 
-    dxyxy = (int(round(disc_box_bb.x1)), int(round(disc_box_bb.y1)),
-             int(round(disc_box_bb.x2)), int(round(disc_box_bb.y2)))
+    dxyxy = (int(round(disc_bb.x1)), int(round(disc_bb.y1)),
+             int(round(disc_bb.x2)), int(round(disc_bb.y2)))
     pred_disc_mask = medsam_infer(msam, emb, dxyxy, H, W)
     img.set_mask(Structure.DISC, LabelType.PRED, BinaryMaskRef(array=pred_disc_mask))
     seg_disc_path = out_disc_dir / f"{img.image_path.stem}.png"
@@ -288,27 +310,25 @@ def _process_one_image(
     # C1) Cup from disc mask (fallback/“larger”)
     cup_from_mask_xyxy = build_cup_box_from_disc_mask(pred_disc_mask, dxyxy)
 
-    # C2) Optional: Cup YOLO on disc ROI (candidate, often smaller)
+    # C2) Optional: Cup YOLO on disc ROI (candidate, often smaller) — run with conf=0.0, ignore thresholds
     cup_from_roi_xyxy: Optional[Tuple[int,int,int,int]] = None
     if cup_yolo_model is not None:
         rx0, ry0, rx1, ry1 = _roi_from_disc_mask(pred_disc_mask, dxyxy, pad_frac=roi_pad_frac, W=W, H=H)
         roi = img_bgr[ry0:ry1, rx0:rx1].copy()
-        det = cup_yolo_model.predict(source=roi, conf=conf, iou=iou, device=msam.device, verbose=False)
+        det = cup_yolo_model.predict(source=roi, conf=0.0, iou=iou, device=msam.device, verbose=False)
         if det:
-            best_cup = _best_box_from_result(det[0], conf_thres=conf)
-            if best_cup is not None:
-                (cx1, cy1, cx2, cy2), _ = best_cup
+            best_cup_any = _best_box_from_result_any(det[0])
+            if best_cup_any is not None:
+                (cx1, cy1, cx2, cy2), _ = best_cup_any
                 cup_from_roi_xyxy = (rx0 + cx1, ry0 + cy1, rx0 + cx2, ry0 + cy2)
 
     # D) Choose final cup box:
-    # Candidate set: {MC detector cup, ROI detector cup, mask-derived cup} → pick the smallest area.
+    # Candidates: {MC cup (if any), ROI cup (if any), mask-derived cup (if any)} → pick the smallest area.
     candidates: List[Tuple[int,int,int,int]] = []
     for c in (cup_det_xyxy, cup_from_roi_xyxy, cup_from_mask_xyxy):
         if c is not None:
             candidates.append(c)
-    final_cup_xyxy: Optional[Tuple[int,int,int,int]] = None
-    if candidates:
-        final_cup_xyxy = min(candidates, key=_box_area)
+    final_cup_xyxy: Optional[Tuple[int,int,int,int]] = min(candidates, key=_box_area) if candidates else None
 
     # If still no cup: output disc-only results
     if final_cup_xyxy is None:
@@ -438,7 +458,7 @@ class _CLI:
 
 def _parse_args() -> _CLI:
     ap = argparse.ArgumentParser(
-        description="Multiclass YOLO (disc+cup) → optional cup-on-ROI YOLO → MedSAM disc/cup → CDR."
+        description="Multiclass YOLO (disc+cup) → optional cup-on-ROI YOLO → MedSAM disc/cup → CDR (always pick best one per class)."
     )
     ap.add_argument("--images-root", required=True)
     ap.add_argument("--weights", required=True, help="Multiclass YOLO weights (disc=0, cup=1)")
@@ -454,7 +474,7 @@ def _parse_args() -> _CLI:
     ap.add_argument("--recursive", action="store_true")
     ap.add_argument("--subset-n", type=int, default=0)
     ap.add_argument("--subset-seed", type=int, default=43)
-    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--conf", type=float, default=0.25)  # kept for API symmetry; not used for thresholding
     ap.add_argument("--iou",  type=float, default=0.50)
     ap.add_argument("--device", default=None)
     ap.add_argument("--no-overwrite", action="store_true")
@@ -527,14 +547,14 @@ def main() -> None:
     if not images:
         raise SystemExit("[ERR] No images collected.")
 
-    # Multiclass predictor (disc+cup in one model)
-    mc_pred = MultiClassPredictor(weights=args.weights, conf=args.conf, iou=args.iou, device=args.device, classes=None)
+    # Multiclass YOLO model (disc+cup). We always run with conf=0.0 and pick top per class.
+    mc_model = YOLO(str(args.weights))
 
     # MedSAM
     dev = pick_device(args.device)
     msam = load_medsam(args.medsam_ckpt, dev, variant="vit_b")
 
-    # Optional cup YOLO model (loaded once)
+    # Optional cup YOLO model (loaded once) — also run with conf=0.0
     cup_yolo_model = YOLO(str(args.cup_weights)) if args.cup_weights else None
 
     # Aggregates
@@ -549,7 +569,7 @@ def main() -> None:
     for img in images:
         (pred_cd_ratio, gt_cd_ratio, seg_disc_path, seg_cup_path, viz_path, viz_compare_path,
          disc_box_iou, cup_box_iou, disc_dice, cup_dice) = _process_one_image(
-            img, mc_pred, msam,
+            img, mc_model, msam,
             out_labels_dir=args.out_labels, images_root=args.images_root,
             out_disc_dir=args.out_disc, out_cup_dir=args.out_cup,
             out_viz_dir=args.out_viz, out_viz_compare_dir=args.out_viz_compare,
