@@ -4,14 +4,19 @@
 Multiclass YOLO (disc=0, cup=1) trainer/evaluator with:
 - Optional train-split filtering to only keep images that contain BOTH classes
 - Robust resume logic (auto/explicit) and epoch extension
-- Eval-only mode to compute *test* metrics vs. GT by ourselves (Box Error = 1 - IoU, Rect-Dice)
-- When a filtered YAML is created, we keep val/test usable by writing ABSOLUTE paths
+- Eval-only mode that computes TEST metrics *against GT labels* by ourselves:
+    * box_error = 1 - IoU
+    * rect_dice = Dice on filled rectangles from GT & predicted boxes
+- Filtered YAML writes absolute val/test so evaluation never breaks
+
+Notes:
+- If GT exists but the model doesn't predict that class, we count IoU=0 and Dice=0.
+- We always pick the highest-confidence prediction per class (no conf gate).
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import sys
 from dataclasses import dataclass
@@ -432,7 +437,11 @@ def _iou_xyxy(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> flo
 
 # ---------------- gather split & labels ----------------
 
-def _gather_split_images(data_yaml_path: Path, split: str) -> List[Path]:
+def _gather_split_images(data_yaml_path: Path, split: str) -> Tuple[List[Path], Path, Path]:
+    """
+    Return (image_paths, base_dir, images_root_dir).
+    base_dir is YAML 'path' (or YAML dir), images_root_dir = base_dir/'images'.
+    """
     y = yaml.safe_load(data_yaml_path.read_text()) or {}
     ydir = data_yaml_path.parent
     base_field = y.get("path")
@@ -443,7 +452,7 @@ def _gather_split_images(data_yaml_path: Path, split: str) -> List[Path]:
 
     entry = y.get(split)
     if not entry:
-        return []
+        return [], base, base / "images"
 
     p = Path(str(entry))
     if not p.is_absolute():
@@ -459,43 +468,88 @@ def _gather_split_images(data_yaml_path: Path, split: str) -> List[Path]:
                 continue
             ii = Path(s)
             out.append(ii if ii.is_absolute() else (p.parent / ii).resolve())
-    return out
+    return out, base, base / "images"
 
 
-def _read_gt_xyxy_for_image(img_path: Path, classes=(0, 1)) -> Dict[int, Tuple[int, int, int, int]]:
-    """Read YOLO label file mapped from image → return {cls: xyxy_pixels} for requested classes."""
-    # locate label file
-    lbl: Optional[Path] = None
-    for cand in _label_path_candidates_for_image(img_path):
+def _build_label_index(labels_root: Path) -> Dict[str, Path]:
+    """
+    Build {stem: label_path} index recursively under labels_root.
+    """
+    idx: Dict[str, Path] = {}
+    if not labels_root.exists():
+        return idx
+    for p in labels_root.rglob("*.txt"):
+        stem = p.stem
+        # prefer first hit; test labels_root should be specific enough
+        if stem not in idx:
+            idx[stem] = p.resolve()
+    return idx
+
+
+def _read_gt_xyxy_for_image(img_path: Path,
+                            base_dir: Path,
+                            images_root: Path,
+                            labels_index: Dict[str, Path],
+                            classes=(0, 1)) -> Dict[int, Tuple[int, int, int, int]]:
+    """
+    Read YOLO label for image via (a) canonical mapping using base_dir/images -> base_dir/labels,
+    then (b) local heuristics, then (c) stem index fallback. Return {cls: xyxy_pixels}.
+    """
+    # A) canonical mapping via base_dir
+    labels_root = base_dir / "labels"
+    try:
+        rel = img_path.resolve().relative_to(images_root.resolve())
+        cand = (labels_root / rel).with_suffix(".txt")
         if cand.exists():
             lbl = cand
-            break
-    if lbl is None or not lbl.exists():
+        else:
+            lbl = None
+    except Exception:
+        lbl = None
+
+    # B) heuristics if needed
+    if lbl is None:
+        for cand in _label_path_candidates_for_image(img_path):
+            if cand.exists():
+                lbl = cand
+                break
+
+    # C) stem index fallback
+    if lbl is None:
+        lbl = labels_index.get(img_path.stem)
+
+    if lbl is None or not Path(lbl).exists():
         return {}
 
     # image size
-    with PILImage.open(str(img_path)) as im:
-        W, H = im.size
+    try:
+        with PILImage.open(str(img_path)) as im:
+            W, H = im.size
+    except Exception:
+        return {}
 
     out: Dict[int, Tuple[int, int, int, int]] = {}
-    for ln in lbl.read_text().splitlines():
-        s = ln.strip()
-        if not s:
-            continue
-        parts = s.split()
-        if len(parts) < 5:
-            continue
-        try:
-            cls = int(float(parts[0]))
-            if cls not in classes:
+    try:
+        for ln in Path(lbl).read_text().splitlines():
+            s = ln.strip()
+            if not s:
                 continue
-            cx, cy, w, h = map(float, parts[1:5])
-        except Exception:
-            continue
-        xyxy = _xywhn_to_xyxy_pixels(cx, cy, w, h, W, H)
-        # If multiple per class, keep the first; typical fundus has exactly one per class
-        if cls not in out:
-            out[cls] = xyxy
+            parts = s.split()
+            if len(parts) < 5:
+                continue
+            try:
+                cls = int(float(parts[0]))
+                if cls not in classes:
+                    continue
+                cx, cy, w, h = map(float, parts[1:5])
+            except Exception:
+                continue
+            xyxy = _xywhn_to_xyxy_pixels(cx, cy, w, h, W, H)
+            # If multiple per class, keep the first
+            if cls not in out:
+                out[cls] = xyxy
+    except Exception:
+        return {}
     return out
 
 
@@ -504,7 +558,7 @@ def _read_gt_xyxy_for_image(img_path: Path, classes=(0, 1)) -> Dict[int, Tuple[i
 def _predict_best_per_class(model: YOLO, img_path: Path, imgsz: int, device: str, class_ids=(0, 1)) -> Dict[int, Tuple[int, int, int, int]]:
     """
     Run inference on a single image and return the highest-confidence xyxy per requested class.
-    Confidence threshold is effectively disabled (very low) to ensure we *always* pick one if present.
+    Confidence threshold is set very low to ensure we *always* pick one if present.
     """
     res_list = model.predict(
         source=str(img_path),
@@ -512,7 +566,7 @@ def _predict_best_per_class(model: YOLO, img_path: Path, imgsz: int, device: str
         device=device,
         conf=1e-4,
         iou=0.7,
-        max_det=50,
+        max_det=100,
         verbose=False
     )
     if not res_list:
@@ -531,8 +585,7 @@ def _predict_best_per_class(model: YOLO, img_path: Path, imgsz: int, device: str
         idxs = np.where(cls_np == c)[0]
         if idxs.size == 0:
             continue
-        # pick highest confidence
-        j = int(idxs[np.argmax(conf_np[idxs])])
+        j = int(idxs[np.argmax(conf_np[idxs])])  # highest-confidence for that class
         x1, y1, x2, y2 = xyxy_np[j]
         best[c] = (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)))
     return best
@@ -552,42 +605,57 @@ def _compute_test_metrics_self(ckpt: Path, data_yaml: Path, imgsz: int, device: 
     """
     Compute per-class and overall TEST metrics by running inference ourselves and comparing
     to YOLO GT labels:
-      - box_error = 1 - IoU
-      - dice      = rectangle Dice between GT and predicted boxes
+      - box_error = 1 - IoU  (if no prediction, IoU=0)
+      - dice      = rectangle Dice between GT and predicted boxes (if no prediction, Dice=0)
     Returns a dict with per-class means and counts.
     """
-    # Gather test images
-    test_images = _gather_split_images(data_yaml, "test")
+    # Gather test images + roots
+    test_images, base_dir, images_root = _gather_split_images(data_yaml, "test")
     if not test_images:
         return {"error": "No 'test' split found or it is empty."}
+
+    # Build label index (prefer labels/test, then all labels)
+    labels_test = base_dir / "labels" / "test"
+    if labels_test.exists():
+        idx = _build_label_index(labels_test)
+    else:
+        idx = _build_label_index(base_dir / "labels")
 
     model = YOLO(str(ckpt))
 
     # Accumulators
     per_class_iou: Dict[int, List[float]] = {0: [], 1: []}
     per_class_dice: Dict[int, List[float]] = {0: [], 1: []}
-    matched_counts: Dict[int, int] = {0: 0, 1: 0}
+    gt_counts: Dict[int, int] = {0: 0, 1: 0}
 
     for img_path in test_images:
-        # GT
-        gt = _read_gt_xyxy_for_image(img_path, classes=(0, 1))
+        # GT (per class, first instance)
+        gt = _read_gt_xyxy_for_image(img_path, base_dir=base_dir, images_root=images_root, labels_index=idx, classes=(0, 1))
+        # Skip if no GT at all
         if not gt:
             continue
 
         # W,H for Dice masks
-        with PILImage.open(str(img_path)) as im:
-            W, H = im.size
+        try:
+            with PILImage.open(str(img_path)) as im:
+                W, H = im.size
+        except Exception:
+            continue
 
         # Prediction (best box per class)
         pr = _predict_best_per_class(model, img_path, imgsz=imgsz, device=device, class_ids=(0, 1))
 
         for c in (0, 1):
-            if c in gt and c in pr:
-                iou = _iou_xyxy(gt[c], pr[c])
-                dice = _rect_dice_for_pair(H, W, gt[c], pr[c])
+            if c in gt:
+                gt_counts[c] += 1
+                if c in pr:
+                    iou = _iou_xyxy(gt[c], pr[c])
+                    dice = _rect_dice_for_pair(H, W, gt[c], pr[c])
+                else:
+                    iou = 0.0
+                    dice = 0.0
                 per_class_iou[c].append(float(iou))
                 per_class_dice[c].append(float(dice))
-                matched_counts[c] += 1
 
     # Aggregate
     def _mean(x: List[float]) -> Optional[float]:
@@ -597,7 +665,7 @@ def _compute_test_metrics_self(ckpt: Path, data_yaml: Path, imgsz: int, device: 
     for c, name in [(0, "disc"), (1, "cup")]:
         miou = _mean(per_class_iou[c])
         mdice = _mean(per_class_dice[c])
-        out[f"{name}_n"] = matched_counts[c]
+        out[f"{name}_n"] = int(gt_counts[c])
         out[f"{name}_box_error"] = (1.0 - miou) if (miou is not None) else None
         out[f"{name}_dice"] = mdice
 
@@ -794,7 +862,7 @@ def main() -> None:
         print("[WARN] No checkpoint found for evaluation.")
         return
 
-    # Use the same YAML we trained with (it still points val/test to absolute paths if filtered)
+    # Use the same YAML we trained with (it points val/test to absolute paths if filtered)
     test_summary = _compute_test_metrics_self(
         ckpt=ckpt_path,
         data_yaml=Path(data_yaml_for_training),
