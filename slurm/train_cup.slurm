@@ -127,7 +127,7 @@ else
     --weights   "${WEIGHTS_LOCAL}"
     --family    auto
     --size      x
-    --epochs    200
+    --epochs    400
     --imgsz     512
     --batch     16
     --freeze    5

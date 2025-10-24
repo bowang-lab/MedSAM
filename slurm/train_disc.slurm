@@ -106,7 +106,7 @@ if [[ "${DO_EVAL_ONLY}" == "0" ]]; then
     --weights     "${WEIGHTS_LOCAL}"   # local yolo12x.pt (offline)
     --family      auto
     --size        x
-    --epochs      200
+    --epochs      400
     --imgsz       640
     --batch       16
     --name        "${EXP_NAME}"
