@@ -253,41 +253,68 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--config", required=True, help="Path to YAML config.")
     return ap.parse_args()
 
+# ... (imports, dataclasses, helpers unchanged above)
 
 def main() -> None:
     args = parse_args()
     cfg_path = Path(str(args.config)).expanduser().resolve()
     train_cfg = TrainCfg.from_yaml(cfg_path)
 
-    weights = _resolve_weights(train_cfg.family, train_cfg.size, train_cfg.weights)
+    # -------- Resolve resume / model init --------
+    resume_flag = False
+    resume_ckpt: Optional[Path] = None
 
+    if train_cfg.resume:
+        if str(train_cfg.resume).lower() == "auto":
+            cand = train_cfg.runs_root / train_cfg.name / "weights" / "last.pt"
+            if cand.exists():
+                resume_ckpt = cand
+                resume_flag = True
+                print(f"[RESUME] auto → {resume_ckpt}")
+            else:
+                print(f"[RESUME] auto requested but not found: {cand}  → starting fresh.")
+        else:
+            cand = Path(str(train_cfg.resume)).expanduser().resolve()
+            if cand.exists():
+                resume_ckpt = cand
+                resume_flag = True
+                print(f"[RESUME] explicit → {resume_ckpt}")
+            else:
+                print(f"[RESUME] explicit path not found: {cand}  → starting fresh.")
+
+    # If resuming, load model from the checkpoint; else from chosen base weights
+    if resume_flag and resume_ckpt is not None:
+        model = YOLO(str(resume_ckpt))
+    else:
+        weights = _resolve_weights(train_cfg.family, train_cfg.size, train_cfg.weights)
+        model = YOLO(weights)
+        print(f"[INIT ] starting from weights: {weights}")
+
+    # -------- Info & split counts --------
     print(f"[CFG] {cfg_path}")
-    print(f"[INFO] data={train_cfg.data} | weights={weights} | device={train_cfg.device} | "
+    print(f"[INFO] data={train_cfg.data} | device={train_cfg.device} | "
           f"epochs={train_cfg.epochs} | imgsz={train_cfg.imgsz} | batch={train_cfg.batch}")
     print(f"[AUG ] scale={train_cfg.aug.scale} translate={train_cfg.aug.translate} "
           f"mosaic={train_cfg.aug.mosaic} mixup={train_cfg.aug.mixup} erasing={train_cfg.aug.erasing}")
     print(f"[RUN ] project={train_cfg.runs_root} name={train_cfg.name}")
 
-    # Quick split counts
     try:
         dy = yaml.safe_load(train_cfg.data.read_text()) or {}
         dy_dir = train_cfg.data.parent
         n_train = _count_images("train", dy, dy_dir)
-        n_val = _count_images("val", dy, dy_dir)
-        n_test = _count_images("test", dy, dy_dir)
+        n_val   = _count_images("val",   dy, dy_dir)
+        n_test  = _count_images("test",  dy, dy_dir)
         print(f"[DATA] train={n_train} | val={n_val} | test={n_test}")
     except Exception as e:
         print(f"[WARN] Could not summarize splits: {e}")
 
-    model = YOLO(weights)
-
+    # -------- Train (resume=True|False) --------
     overrides: Dict[str, Any] = dict(
-        # core
         data=str(train_cfg.data),
         epochs=train_cfg.epochs,
         imgsz=train_cfg.imgsz,
         batch=train_cfg.batch,
-        device=train_cfg.device,  # e.g., "0,1,2,3" → DDP
+        device=train_cfg.device,
         project=str(train_cfg.runs_root),
         name=train_cfg.name,
         workers=train_cfg.workers,
@@ -299,51 +326,21 @@ def main() -> None:
         patience=train_cfg.patience,
         amp=train_cfg.amp,
         freeze=train_cfg.freeze,
-
-        # scheduling helpers
         multi_scale=train_cfg.multi_scale,
         close_mosaic=train_cfg.close_mosaic,
-
-        # color
-        hsv_h=train_cfg.aug.hsv_h,
-        hsv_s=train_cfg.aug.hsv_s,
-        hsv_v=train_cfg.aug.hsv_v,
-
-        # geometric
-        degrees=train_cfg.aug.degrees,
-        translate=train_cfg.aug.translate,
-        scale=train_cfg.aug.scale,  # ROI crop/zoom robustness
-        shear=train_cfg.aug.shear,
-        perspective=train_cfg.aug.perspective,
-
-        # flips
-        flipud=train_cfg.aug.flipud,
-        fliplr=train_cfg.aug.fliplr,
-
-        # mixing / occlusion
-        mosaic=train_cfg.aug.mosaic,
-        mixup=train_cfg.aug.mixup,
-        copy_paste=train_cfg.aug.copy_paste,
-        erasing=train_cfg.aug.erasing,
+        hsv_h=train_cfg.aug.hsv_h, hsv_s=train_cfg.aug.hsv_s, hsv_v=train_cfg.aug.hsv_v,
+        degrees=train_cfg.aug.degrees, translate=train_cfg.aug.translate, scale=train_cfg.aug.scale,
+        shear=train_cfg.aug.shear, perspective=train_cfg.aug.perspective,
+        flipud=train_cfg.aug.flipud, fliplr=train_cfg.aug.fliplr,
+        mosaic=train_cfg.aug.mosaic, mixup=train_cfg.aug.mixup,
+        copy_paste=train_cfg.aug.copy_paste, erasing=train_cfg.aug.erasing,
+        resume=resume_flag,   # <-- boolean only
     )
 
-    # Resume wiring
-    resume_arg: bool | str = False
-    if train_cfg.resume:
-        if str(train_cfg.resume).lower() == "auto":
-            last = train_cfg.runs_root / train_cfg.name / "weights" / "last.pt"
-            resume_arg = str(last) if last.exists() else True  # let Ultralytics locate latest
-            print(f"[RESUME] Using: {resume_arg}")
-        else:
-            resume_arg = str(expand(train_cfg.resume))
-            print(f"[RESUME] Using explicit: {resume_arg}")
-    overrides["resume"] = resume_arg
-
-    # Train
     model.train(**overrides)
     print("[OK] Training complete.")
 
-    # --- Evaluate on test split (if present), else val ---
+    # -------- Evaluate on test (fallback to val) --------
     dy = yaml.safe_load(train_cfg.data.read_text()) or {}
     has_test = bool(dy.get("test"))
 
@@ -362,11 +359,10 @@ def main() -> None:
         split=split,
         imgsz=train_cfg.imgsz,
         device=train_cfg.device,
-        plots=True,       # PR curves, confusion, etc.
-        save_json=True,   # writes predictions.json (+ labels.json if available)
+        plots=True,
+        save_json=True,
     )
 
-    # Rectangle-Dice (proxy). Writes dice_rect_summary.json if GT JSON present.
     save_dir = Path(getattr(val_res, "save_dir", train_cfg.runs_root / train_cfg.name / "eval_tmp"))
     try:
         rect_dice = compute_rect_dice_from_predictions(save_dir)
@@ -375,7 +371,6 @@ def main() -> None:
     except Exception as e:
         print(f"[WARN] Dice metric computation failed: {e}")
 
-    # Print core losses/metrics robustly
     try:
         metrics = getattr(val_res, "results_dict", {}) or {}
 

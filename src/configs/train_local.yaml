@@ -15,6 +15,7 @@ imgsz: 640
 batch: 16
 workers: 8
 seed: 1337
+resume: "/Users/carlosperez/PycharmProjects/MedSAM/runs/detect/multiclass_disc_cup2/weights/last.pt"
 device: "auto"      # "auto" → YOLO_DEVICES or CUDA "0", else "cpu"
 amp: true
 freeze: 10
