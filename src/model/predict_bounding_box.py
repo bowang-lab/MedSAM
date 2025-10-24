@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
-# predict_bounding_box.py
-"""
-Single-stage bounding-box prediction with a pretrained Ultralytics YOLO model.
-
-NEW OOP API (for predict_segment.py)
-------------------------------------
-from predict_bounding_box import BoundingBoxPredictor, LabelWriter
-
-bb = BoundingBoxPredictor(weights="/path/best.pt", conf=0.25, iou=0.5, device="mps")
-box: Optional[BoundingBox] = bb.predict_one_image_to_box(img)  # img is src.imgpipe.image.Image
-if box:
-    img.set_box(Structure.DISC, LabelType.PRED, box)
-    LabelWriter(out_root, images_root, overwrite=True).write(img)
-
-Legacy API kept for compatibility
----------------------------------
-from predict_bounding_box import predict_bounding_box, run_on_config
-
-CLI
----
-python predict_bounding_box.py one --image img.png --weights best.pt --out annot.jpg
-python predict_bounding_box.py dataset --config ./configs/pipeline_local.yaml --weights best.pt \
-  --subset-n 50 --subset-seed 43 --save-labels ./pred_labels --save-annot ./pred_viz
-"""
+# src.modelpredict_bounding_box.py
 
 from __future__ import annotations
 
