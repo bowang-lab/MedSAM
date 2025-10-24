@@ -1,19 +1,69 @@
 #!/usr/bin/env python3
 # src/model/train_multiclass_cfg.py
+"""
+Train a multiclass (disc=0, cup=1) YOLO detector from a YAML config, with:
+- Robust resume logic (supports 'resume: auto' or explicit path, and 'extend_epochs')
+- Automatic device selection ("auto" honors YOLO_DEVICES / CUDA_VISIBLE_DEVICES)
+- Strong augment defaults (configurable)
+- Always evaluates on test (falls back to val) and saves plots + predictions.json
+- Optional rectangle-based Dice proxy computed from predictions/labels JSON
+
+YAML keys (minimal):
+  data: /abs/path/to/data.yaml
+  runs_root: /abs/path/to/runs/detect
+  name: "multiclass_disc_cup"
+  epochs: 200
+  batch: 16
+  imgsz: 640
+  resume: "auto" | "/abs/path/to/last.pt" | "" (fresh)
+  extend_epochs: 100   # (optional) if resuming, adds N to completed epochs
+  optimizer: "AdamW"
+  patience: 50
+  multi_scale: true
+  close_mosaic: 10
+  augment: { ... }     # see AugCfg below for full list
+
+Notes:
+- If you finished 200 epochs and want to continue to 300:
+    either set epochs: 300 with resume: auto
+    or set extend_epochs: 100 with resume: auto
+"""
+
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-import json
 import numpy as np
+import torch
 import yaml
 from ultralytics import YOLO
 
-from src.utils import ultralytics_device_arg, expand  # keep only what we use
+from src.utils import ultralytics_device_arg  # keep only what we use
+
+
+# ------------------ checkpoint helpers ------------------
+
+def _load_ckpt_epochs(ckpt_path: Path) -> tuple[int, Optional[int]]:
+    """
+    Returns (trained_epochs_done, target_epochs_in_ckpt_or_None).
+    Ultralytics checkpoints usually store:
+      - 'epoch' (0-based index of last completed epoch)
+      - 'train_args' or 'args' with 'epochs' total planned
+    """
+    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    trained = int(ckpt.get("epoch", -1)) + 1  # convert 0-based to count
+    targs = ckpt.get("train_args") or ckpt.get("args") or {}
+    planned = targs.get("epochs")
+    try:
+        planned = int(planned) if planned is not None else None
+    except Exception:
+        planned = None
+    return trained, planned
 
 
 # ---------------- Rectangle-based Dice (proxy) ----------------
@@ -48,8 +98,8 @@ def compute_rect_dice_from_predictions(eval_dir: Path) -> dict:
     if not pred_json.exists() or not labels_json.exists():
         return {}
 
-    preds = json.loads(pred_json.read_text())   # list[dict]
-    gts = json.loads(labels_json.read_text())   # list[dict]
+    preds = json.loads(pred_json.read_text())
+    gts = json.loads(labels_json.read_text())
 
     by_img_pred, by_img_gt = {}, {}
     for p in preds:
@@ -59,7 +109,6 @@ def compute_rect_dice_from_predictions(eval_dir: Path) -> dict:
 
     per_class: Dict[int, list[float]] = {}
     for img_id, gboxes in by_img_gt.items():
-        # Expect width/height stored alongside each GT item
         H = gboxes[0].get("height")
         W = gboxes[0].get("width")
         if H is None or W is None:
@@ -116,7 +165,6 @@ def _count_images(path_key: str, data_yaml: Dict[str, Any], data_yaml_dir: Path)
         return 0
 
     split_path = Path(str(split_entry))
-    # base: either data_yaml['path'] (interpreted relative to YAML's folder) or that folder itself
     base_field = data_yaml.get("path")
     if base_field:
         base_path = Path(str(base_field))
@@ -164,14 +212,15 @@ class TrainCfg:
     family: str
     size: str
     # training
-    resume: Optional[str]  # "", "auto", or path to last.pt
+    resume: Optional[str]            # "", "auto", or path to last.pt
+    extend_epochs: Optional[int]     # if set and resuming: total_epochs = trained + extend_epochs
     name: str
     epochs: int
     imgsz: int
     batch: int
     workers: int
     seed: int
-    device: Optional[str]  # "auto" | None means auto; or "0", "0,1", "cpu"
+    device: Optional[str]            # "auto" | None means auto; or "0", "0,1", "cpu"
     amp: bool
     freeze: int
     optimizer: str
@@ -242,6 +291,11 @@ class TrainCfg:
             multi_scale=bool(cfg.get("multi_scale", True)),
             close_mosaic=int(cfg.get("close_mosaic", 10)),
             resume=(str(cfg.get("resume") or "") or None),
+            extend_epochs=(
+                int(cfg["extend_epochs"])
+                if "extend_epochs" in cfg and cfg["extend_epochs"] not in ("", None)
+                else None
+            ),
             aug=aug_cfg,
         )
 
@@ -253,7 +307,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--config", required=True, help="Path to YAML config.")
     return ap.parse_args()
 
-# ... (imports, dataclasses, helpers unchanged above)
 
 def main() -> None:
     args = parse_args()
@@ -284,16 +337,36 @@ def main() -> None:
 
     # If resuming, load model from the checkpoint; else from chosen base weights
     if resume_flag and resume_ckpt is not None:
+        # Check how many epochs have completed
+        trained_done, planned_in_ckpt = _load_ckpt_epochs(resume_ckpt)
+        print(f"[RESUME] checkpoint epochs: done={trained_done} planned={planned_in_ckpt}")
+
+        # Decide final target epochs
+        if train_cfg.extend_epochs is not None:
+            target_epochs = trained_done + int(train_cfg.extend_epochs)
+            print(f"[RESUME] extend_epochs={train_cfg.extend_epochs} → target_epochs={target_epochs}")
+        else:
+            target_epochs = int(train_cfg.epochs)
+            if target_epochs <= trained_done:
+                raise SystemExit(
+                    f"[ERR] Resume requested but YAML epochs={target_epochs} ≤ completed={trained_done}. "
+                    f"Increase 'epochs' to > {trained_done} OR set 'extend_epochs: N' to continue."
+                )
+
         model = YOLO(str(resume_ckpt))
+        is_resume = True
+        effective_epochs = target_epochs
     else:
         weights = _resolve_weights(train_cfg.family, train_cfg.size, train_cfg.weights)
         model = YOLO(weights)
         print(f"[INIT ] starting from weights: {weights}")
+        is_resume = False
+        effective_epochs = int(train_cfg.epochs)
 
     # -------- Info & split counts --------
     print(f"[CFG] {cfg_path}")
     print(f"[INFO] data={train_cfg.data} | device={train_cfg.device} | "
-          f"epochs={train_cfg.epochs} | imgsz={train_cfg.imgsz} | batch={train_cfg.batch}")
+          f"epochs={effective_epochs} | imgsz={train_cfg.imgsz} | batch={train_cfg.batch}")
     print(f"[AUG ] scale={train_cfg.aug.scale} translate={train_cfg.aug.translate} "
           f"mosaic={train_cfg.aug.mosaic} mixup={train_cfg.aug.mixup} erasing={train_cfg.aug.erasing}")
     print(f"[RUN ] project={train_cfg.runs_root} name={train_cfg.name}")
@@ -302,16 +375,16 @@ def main() -> None:
         dy = yaml.safe_load(train_cfg.data.read_text()) or {}
         dy_dir = train_cfg.data.parent
         n_train = _count_images("train", dy, dy_dir)
-        n_val   = _count_images("val",   dy, dy_dir)
-        n_test  = _count_images("test",  dy, dy_dir)
+        n_val = _count_images("val", dy, dy_dir)
+        n_test = _count_images("test", dy, dy_dir)
         print(f"[DATA] train={n_train} | val={n_val} | test={n_test}")
     except Exception as e:
         print(f"[WARN] Could not summarize splits: {e}")
 
-    # -------- Train (resume=True|False) --------
+    # -------- Train --------
     overrides: Dict[str, Any] = dict(
         data=str(train_cfg.data),
-        epochs=train_cfg.epochs,
+        epochs=effective_epochs,
         imgsz=train_cfg.imgsz,
         batch=train_cfg.batch,
         device=train_cfg.device,
@@ -334,7 +407,7 @@ def main() -> None:
         flipud=train_cfg.aug.flipud, fliplr=train_cfg.aug.fliplr,
         mosaic=train_cfg.aug.mosaic, mixup=train_cfg.aug.mixup,
         copy_paste=train_cfg.aug.copy_paste, erasing=train_cfg.aug.erasing,
-        resume=resume_flag,   # <-- boolean only
+        resume=is_resume,  # boolean only; model was constructed from ckpt if resuming
     )
 
     model.train(**overrides)
@@ -359,10 +432,11 @@ def main() -> None:
         split=split,
         imgsz=train_cfg.imgsz,
         device=train_cfg.device,
-        plots=True,
-        save_json=True,
+        plots=True,       # PR curves, confusion, etc.
+        save_json=True,   # writes predictions.json (+ labels.json if available)
     )
 
+    # Rectangle-Dice (proxy). Writes dice_rect_summary.json if GT JSON present.
     save_dir = Path(getattr(val_res, "save_dir", train_cfg.runs_root / train_cfg.name / "eval_tmp"))
     try:
         rect_dice = compute_rect_dice_from_predictions(save_dir)
@@ -371,6 +445,7 @@ def main() -> None:
     except Exception as e:
         print(f"[WARN] Dice metric computation failed: {e}")
 
+    # Print core losses/metrics robustly
     try:
         metrics = getattr(val_res, "results_dict", {}) or {}
 
