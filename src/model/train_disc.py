@@ -9,17 +9,22 @@ New:
 - After training, always evaluates on the 'test' split when present (else 'val')
   and writes metrics/plots into runs/<exp_name>/eval_<split>/<timestamp>/ with
   a 'latest' symlink.
+- Evaluation now also saves:
+    * box_loss / cls_loss / dfl_loss (robustly keyed across YOLO versions)
+    * rectangle-based Dice vs GT (mean + per-class) from predictions.json/labels.json
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Dict
 
+import numpy as np
 import yaml
 from ultralytics import YOLO
 
@@ -33,6 +38,90 @@ def _expand(p: str | Path) -> Path:
 
 def _timestamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
+
+def _pick(d: dict, keys: Tuple[str, ...]):
+    for k in keys:
+        if k in d:
+            return d[k]
+    return None
+
+# ---------------- Rectangle-based Dice (proxy) ----------------
+def _rect_to_mask(H: int, W: int, bbox_xywh) -> np.ndarray:
+    x, y, w, h = bbox_xywh
+    x1 = max(0, int(round(x)))
+    y1 = max(0, int(round(y)))
+    x2 = min(W, int(round(x + w)))
+    y2 = min(H, int(round(y + h)))
+    m = np.zeros((H, W), dtype=np.uint8)
+    if x2 > x1 and y2 > y1:
+        m[y1:y2, x1:x2] = 1
+    return m
+
+def _dice(a: np.ndarray, b: np.ndarray) -> float:
+    inter = (a & b).sum()
+    s = a.sum() + b.sum()
+    return (2.0 * inter / s) if s > 0 else float("nan")
+
+def _compute_rect_dice_from_eval_dir(eval_dir: Path) -> Tuple[Optional[float], Dict[str, float]]:
+    """
+    Compute mean rectangle-Dice and per-class from Ultralytics eval artifacts.
+    Requires predictions.json + labels.json in eval_dir. If unavailable, returns (None, {}).
+    """
+    pred_json = eval_dir / "predictions.json"
+    labels_json = eval_dir / "labels.json"
+    if not pred_json.exists() or not labels_json.exists():
+        return None, {}
+
+    preds = json.loads(pred_json.read_text())
+    gts   = json.loads(labels_json.read_text())
+
+    by_img_pred, by_img_gt = {}, {}
+    for p in preds:
+        by_img_pred.setdefault(p["image_id"], []).append(p)
+    for g in gts:
+        by_img_gt.setdefault(g["image_id"], []).append(g)
+
+    per_class: Dict[int, List[float]] = {}
+    for img_id, gboxes in by_img_gt.items():
+        if not gboxes:
+            continue
+        H = gboxes[0].get("height")
+        W = gboxes[0].get("width")
+        if H is None or W is None:
+            continue
+        pboxes = by_img_pred.get(img_id, [])
+        used = set()
+        for g in gboxes:
+            gc = g["category_id"]
+            gb = g["bbox"]  # xywh
+            gmask = _rect_to_mask(H, W, gb)
+            best_dice = float("nan")
+            best_j = -1
+            for j, pr in enumerate(pboxes):
+                if j in used or pr["category_id"] != gc:
+                    continue
+                pmask = _rect_to_mask(H, W, pr["bbox"])
+                d = _dice(gmask, pmask)
+                if not np.isnan(d) and (np.isnan(best_dice) or d > best_dice):
+                    best_dice, best_j = d, j
+            if best_j >= 0:
+                used.add(best_j)
+                per_class.setdefault(gc, []).append(float(best_dice))
+
+    per_class_mean = {str(k): float(np.nanmean(v)) for k, v in per_class.items() if v}
+    all_vals: List[float] = []
+    for v in per_class.values():
+        all_vals.extend([x for x in v if np.isfinite(x)])
+    mean_dice = float(np.mean(all_vals)) if all_vals else None
+
+    # Sidecar summary
+    try:
+        (eval_dir / "dice_rect_summary.json").write_text(json.dumps(
+            {"mean": mean_dice, "per_class": per_class_mean}, indent=2))
+    except Exception:
+        pass
+
+    return mean_dice, per_class_mean
 
 # ============================================================
 # Config & simple utilities
@@ -256,7 +345,8 @@ class YoloTrainer:
     def _eval_to_dir(self, data_yaml: Path, split: str, plots: bool) -> Path:
         """
         Run model.val() writing to runs/<exp_name>/eval_<split>/<timestamp>/,
-        and update runs/<exp_name>/eval_<split>/latest symlink.
+        compute & save metrics (including losses + rectangle-Dice), and
+        update runs/<exp_name>/eval_<split>/latest symlink.
         """
         assert self.model is not None
         ts = _timestamp()
@@ -266,7 +356,7 @@ class YoloTrainer:
 
         print(f"[EVAL] split={split} → {out}")
         # Ultralytics will write under project/name
-        self.model.val(
+        res = self.model.val(
             data=str(data_yaml),
             split=split if split in ("val", "test") else None,
             imgsz=self.cfg.imgsz,
@@ -274,7 +364,39 @@ class YoloTrainer:
             project=str(base),
             name=ts,
             plots=bool(plots),
+            save_json=True,  # ensure predictions.json (and labels.json when available)
         )
+
+        # Extract YOLO metrics dict (robustly cast to float)
+        try:
+            metrics = getattr(res, "results_dict", None) or {}
+            metrics = {k: float(v) for k, v in metrics.items()}
+        except Exception:
+            metrics = {}
+
+        # Add robustly-parsed losses
+        bl = _pick(metrics, ("loss/box", "box_loss", "box"))
+        cl = _pick(metrics, ("loss/cls", "cls_loss", "cls"))
+        dl = _pick(metrics, ("loss/dfl", "dfl_loss", "dfl"))
+        if bl is not None: metrics["box_loss"] = float(bl)
+        if cl is not None: metrics["cls_loss"] = float(cl)
+        if dl is not None: metrics["dfl_loss"] = float(dl)
+
+        # Compute rectangle-based Dice from eval artifacts
+        try:
+            dice_mean, dice_per_class = _compute_rect_dice_from_eval_dir(out)
+            if dice_mean is not None:
+                metrics["dice_rect_mean"] = float(dice_mean)
+            if dice_per_class:
+                metrics["dice_rect_per_class"] = {k: float(v) for k, v in dice_per_class.items()}
+        except Exception as e:
+            print(f"[WARN] Dice metric computation failed: {e}")
+
+        # Save metrics.json in eval folder
+        try:
+            (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        except Exception as e:
+            print(f"[WARN] Failed to write metrics.json: {e}")
 
         # Refresh 'latest' symlink
         latest = base / "latest"
@@ -288,6 +410,19 @@ class YoloTrainer:
         except Exception:
             # Fallback: create a small marker file with the absolute path
             (base / "_latest_path.txt").write_text(str(out.resolve()))
+
+        # Console summary
+        if metrics:
+            printable = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+            print("[EVAL] Summary metrics:", printable)
+            parts = []
+            if "box_loss" in metrics: parts.append(f"box_loss={metrics['box_loss']:.4f}")
+            if "cls_loss" in metrics: parts.append(f"cls_loss={metrics['cls_loss']:.4f}")
+            if "dfl_loss" in metrics: parts.append(f"dfl_loss={metrics['dfl_loss']:.4f}")
+            if "dice_rect_mean" in metrics: parts.append(f"dice_rect_mean={metrics['dice_rect_mean']:.4f}")
+            if parts:
+                print("[EVAL]", " | ".join(parts))
+
         return out
 
     def validate_after_train(self, data_yaml: Path) -> None:

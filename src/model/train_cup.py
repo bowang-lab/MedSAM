@@ -3,16 +3,107 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
+import numpy as np
 import yaml
 from ultralytics import YOLO
 
 from src.utils import ensure_dir, need, expand, ultralytics_device_arg
+
+
+# ---------------- Rectangle-based Dice (proxy) ----------------
+
+def _rect_to_mask(H: int, W: int, bbox_xywh) -> np.ndarray:
+    x, y, w, h = bbox_xywh
+    x1 = max(0, int(round(x)))
+    y1 = max(0, int(round(y)))
+    x2 = min(W, int(round(x + w)))
+    y2 = min(H, int(round(y + h)))
+    m = np.zeros((H, W), dtype=np.uint8)
+    if x2 > x1 and y2 > y1:
+        m[y1:y2, x1:x2] = 1
+    return m
+
+
+def _dice(a: np.ndarray, b: np.ndarray) -> float:
+    inter = (a & b).sum()
+    s = a.sum() + b.sum()
+    return (2.0 * inter / s) if s > 0 else float("nan")
+
+
+def _compute_rect_dice_from_eval_dir(eval_dir: Path) -> Tuple[Optional[float], Dict[str, float]]:
+    """
+    Computes mean rectangle-based Dice (and per-class) from Ultralytics eval artifacts.
+    Requires 'predictions.json' and 'labels.json' in eval_dir.
+    Returns (mean_dice, per_class_dict). If unavailable, returns (None, {}).
+    """
+    pred_json = eval_dir / "predictions.json"
+    labels_json = eval_dir / "labels.json"
+    if not pred_json.exists() or not labels_json.exists():
+        return None, {}
+
+    preds = json.loads(pred_json.read_text())
+    gts = json.loads(labels_json.read_text())
+
+    by_img_pred, by_img_gt = {}, {}
+    for p in preds:
+        by_img_pred.setdefault(p["image_id"], []).append(p)
+    for g in gts:
+        by_img_gt.setdefault(g["image_id"], []).append(g)
+
+    per_class: Dict[int, List[float]] = {}
+    for img_id, gboxes in by_img_gt.items():
+        H = gboxes[0].get("height")
+        W = gboxes[0].get("width")
+        if H is None or W is None:
+            continue
+        pboxes = by_img_pred.get(img_id, [])
+        used = set()
+
+        for g in gboxes:
+            gc = g["category_id"]
+            gb = g["bbox"]  # xywh
+            gmask = _rect_to_mask(H, W, gb)
+            best_dice = float("nan")
+            best_j = -1
+            for j, pr in enumerate(pboxes):
+                if j in used or pr["category_id"] != gc:
+                    continue
+                pmask = _rect_to_mask(H, W, pr["bbox"])
+                d = _dice(gmask, pmask)
+                if not np.isnan(d) and (np.isnan(best_dice) or d > best_dice):
+                    best_dice, best_j = d, j
+            if best_j >= 0:
+                used.add(best_j)
+                per_class.setdefault(gc, []).append(float(best_dice))
+
+    per_class_mean = {str(k): float(np.nanmean(v)) for k, v in per_class.items() if v}
+    all_vals: List[float] = []
+    for v in per_class.values():
+        all_vals.extend([x for x in v if np.isfinite(x)])
+    mean_dice = float(np.mean(all_vals)) if all_vals else None
+
+    # Also write a sidecar summary if desired
+    try:
+        (eval_dir / "dice_rect_summary.json").write_text(json.dumps(
+            {"mean": mean_dice, "per_class": per_class_mean}, indent=2))
+    except Exception:
+        pass
+
+    return mean_dice, per_class_mean
+
+
+def _pick(d: dict, keys: Tuple[str, ...]):
+    for k in keys:
+        if k in d:
+            return d[k]
+    return None
 
 
 # --- config ---
@@ -143,6 +234,9 @@ class CupROITrainer:
         """
         Run YOLO val() on the given checkpoint and split, copy plots into the run directory,
         and return a metrics dict. Also writes metrics JSON to out_root.
+        Additionally computes:
+          - box_loss/cls_loss/dfl_loss (robust key matching)
+          - rectangle-based Dice vs GT using predictions.json + labels.json
         """
         tester = YOLO(str(ckpt))
         print(f"[EVAL] Evaluating '{ckpt.name}' on split='{split}' …")
@@ -155,15 +249,38 @@ class CupROITrainer:
             save_json=True,  # COCO json (per-class metrics-friendly)
         )
 
-        # metrics
+        # metrics from Ultralytics
         try:
-            metrics = getattr(res, "results_dict", None) or {}
-            metrics = {k: float(v) for k, v in metrics.items()}
+            base_metrics = getattr(res, "results_dict", None) or {}
+            base_metrics = {k: float(v) for k, v in base_metrics.items()}
         except Exception:
-            metrics = {}
+            base_metrics = {}
 
-        # Where Ultralytics saved its plots
+        # Add robustly-parsed losses (keys differ across versions)
+        box_loss = _pick(base_metrics, ("loss/box", "box_loss", "box"))
+        cls_loss = _pick(base_metrics, ("loss/cls", "cls_loss", "cls"))
+        dfl_loss = _pick(base_metrics, ("loss/dfl", "dfl_loss", "dfl"))
+        if box_loss is not None:
+            base_metrics["box_loss"] = float(box_loss)
+        if cls_loss is not None:
+            base_metrics["cls_loss"] = float(cls_loss)
+        if dfl_loss is not None:
+            base_metrics["dfl_loss"] = float(dfl_loss)
+
+        # Where Ultralytics saved eval artifacts (plots, predictions.json, etc.)
         eval_save_dir = Path(getattr(res, "save_dir", out_root / f"{split}_eval_tmp"))
+
+        # Compute rectangle-based Dice summary from eval artifacts
+        try:
+            dice_mean, dice_per_class = _compute_rect_dice_from_eval_dir(eval_save_dir)
+            if dice_mean is not None:
+                base_metrics["dice_rect_mean"] = float(dice_mean)
+            if dice_per_class:
+                # add as nested dict
+                base_metrics["dice_rect_per_class"] = {k: float(v) for k, v in dice_per_class.items()}
+        except Exception as e:
+            print(f"[WARN] Dice metric computation failed: {e}")
+
         # Consolidate within this run directory under a split-specific folder
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         target_dir = out_root / f"eval_{split}" / stamp
@@ -182,8 +299,7 @@ class CupROITrainer:
         # Write metrics JSON alongside the plots
         metrics_json = target_dir / "metrics.json"
         try:
-            import json
-            metrics_json.write_text(json.dumps(metrics, indent=2))
+            metrics_json.write_text(json.dumps(base_metrics, indent=2))
             print(f"[EVAL] Metrics JSON → {metrics_json}")
         except Exception as e:
             print(f"[WARN] Failed to write metrics.json: {e}")
@@ -197,13 +313,26 @@ class CupROITrainer:
         except Exception:
             pass
 
-        # Console summary
-        if metrics:
-            print("[EVAL] Summary metrics:", metrics)
+        # Console summary (including losses + dice if present)
+        if base_metrics:
+            printable = {k: v for k, v in base_metrics.items() if isinstance(v, (int, float))}
+            print("[EVAL] Summary metrics:", printable)
+            if "box_loss" in base_metrics or "dice_rect_mean" in base_metrics:
+                bl = base_metrics.get("box_loss", None)
+                cl = base_metrics.get("cls_loss", None)
+                dl = base_metrics.get("dfl_loss", None)
+                dm = base_metrics.get("dice_rect_mean", None)
+                parts = []
+                if bl is not None: parts.append(f"box_loss={bl:.4f}")
+                if cl is not None: parts.append(f"cls_loss={cl:.4f}")
+                if dl is not None: parts.append(f"dfl_loss={dl:.4f}")
+                if dm is not None: parts.append(f"dice_rect_mean={dm:.4f}")
+                if parts:
+                    print("[EVAL] " + " | ".join(parts))
         else:
             print("[EVAL] Finished; see plots/metrics in:", target_dir)
 
-        return metrics
+        return base_metrics
 
     def validate_and_save(self, ckpt: Optional[Path] = None, split: Optional[str] = None) -> None:
         """Evaluate (default to TEST if present) and save artifacts/metrics under the same run dir."""
@@ -238,7 +367,7 @@ class CupROITrainer:
 # --- CLI ---
 def parse_args() -> CupROITrainCfg:
     ap = argparse.ArgumentParser(
-        description="Train cup-only YOLO on ROI crops and/or evaluate checkpoints with test metrics & curves."
+        description="Train cup-only YOLO on ROI crops and/or evaluate checkpoints with test metrics, PR curves, and Dice."
     )
 
     # required-ish
@@ -323,7 +452,7 @@ def parse_args() -> CupROITrainCfg:
         flipud=args.flipud, fliplr=args.fliplr,
         mosaic=args.mosaic, mixup=args.mixup, copy_paste=args.copy_paste, erasing=args.erasing,
         optimizer=args.optimizer, cos_lr=bool(args.cos_lr),
-        patience=args.patience, pretrained=bool(args.pretrained),
+        patience=args.patience, pretrained=not (not args.pretrained),  # keep boolean
         device=args.device,
         eval_ckpt=eval_ckpt,
         eval_split=args.eval_split,
