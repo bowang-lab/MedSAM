@@ -10,12 +10,12 @@ size: "x"           # n | s | m | l | x
 
 # ------------------ training core -------------------
 name: "multiclass_disc_cup"
-epochs: 205
+epochs: 300
 imgsz: 640
 batch: 16
 workers: 8
 seed: 1337
-resume: "/scratch/st-ipor-1/cperez/MedSAM/runs/detect/multiclass_disc_cup2/weights/last.pt"         # "auto" | "" | "/abs/path/to/last.pt"
+resume: ""         # "auto" | "" | "/abs/path/to/last.pt"
 device: "auto"      # "auto" → YOLO_DEVICES or CUDA "0", else "cpu"
 amp: true
 freeze: 10
