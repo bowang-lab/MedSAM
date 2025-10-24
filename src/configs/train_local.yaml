@@ -10,7 +10,7 @@ size: "x"           # n | s | m | l | x
 
 # ------------------ training core -------------------
 name: "multiclass_disc_cup"
-epochs: 200
+epochs: 205
 imgsz: 640
 batch: 16
 workers: 8

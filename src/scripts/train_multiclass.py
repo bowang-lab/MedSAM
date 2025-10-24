@@ -5,10 +5,11 @@ Train a multiclass (disc=0, cup=1) YOLO detector from a YAML config, with:
 - Robust resume logic (supports 'resume: auto' or explicit path, and 'extend_epochs')
 - Automatic device selection ("auto" honors YOLO_DEVICES / CUDA_VISIBLE_DEVICES)
 - Strong augment defaults (configurable)
+- **Training-split filtering** to require both classes present (disc & cup)
 - Always evaluates on test (falls back to val) and saves plots + predictions.json
 - Optional rectangle-based Dice proxy computed from predictions/labels JSON
 
-YAML keys (minimal):
+Minimal YAML keys:
   data: /abs/path/to/data.yaml
   runs_root: /abs/path/to/runs/detect
   name: "multiclass_disc_cup"
@@ -23,6 +24,9 @@ YAML keys (minimal):
   close_mosaic: 10
   augment: { ... }     # see AugCfg below for full list
 
+Optional:
+  require_both_train: true   # default True; filter train split to images with BOTH classes
+
 Notes:
 - If you finished 200 epochs and want to continue to 300:
     either set epochs: 300 with resume: auto
@@ -36,7 +40,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Iterable, List, Tuple
 
 import numpy as np
 import torch
@@ -51,11 +55,15 @@ from src.utils import ultralytics_device_arg  # keep only what we use
 def _load_ckpt_epochs(ckpt_path: Path) -> tuple[int, Optional[int]]:
     """
     Returns (trained_epochs_done, target_epochs_in_ckpt_or_None).
-    Ultralytics checkpoints usually store:
-      - 'epoch' (0-based index of last completed epoch)
-      - 'train_args' or 'args' with 'epochs' total planned
+    PyTorch 2.6+: torch.load defaults to weights_only=True, which breaks Ultralytics ckpts.
+    We force weights_only=False for trusted local checkpoints.
     """
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    try:
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)  # PyTorch 2.6+
+    except TypeError:
+        # Older PyTorch (no weights_only kw)
+        ckpt = torch.load(str(ckpt_path), map_location="cpu")
+
     trained = int(ckpt.get("epoch", -1)) + 1  # convert 0-based to count
     targs = ckpt.get("train_args") or ckpt.get("args") or {}
     planned = targs.get("epochs")
@@ -182,6 +190,146 @@ def _count_images(path_key: str, data_yaml: Dict[str, Any], data_yaml_dir: Path)
     return 0
 
 
+# ---------------- train-split "require both classes" filter ----------------
+
+def _iter_images_from_dir(images_dir: Path) -> Iterable[Path]:
+    for p in images_dir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in IMG_EXTS:
+            yield p
+
+
+def _label_path_candidates_for_image(img_path: Path) -> List[Path]:
+    """
+    Best-effort mapping from an image path to its label .txt path, trying common YOLO layouts.
+    """
+    cands: List[Path] = []
+
+    # Case A: replace first 'images' segment with 'labels'
+    parts = list(img_path.parts)
+    if "images" in parts:
+        i = parts.index("images")
+        lbl_parts = parts[:]
+        lbl_parts[i] = "labels"
+        cands.append(Path(*lbl_parts).with_suffix(".txt"))
+
+    # Case B: sibling labels/<split>/file.txt
+    if img_path.parent.name.lower() in {"train", "val", "test"}:
+        split = img_path.parent.name
+        cands.append(img_path.parent.parent / "labels" / split / (img_path.stem + ".txt"))
+
+    # Case C: labels folder next to current folder
+    cands.append(img_path.parent.parent / "labels" / (img_path.stem + ".txt"))
+
+    # Deduplicate while preserving order
+    seen = set()
+    uniq: List[Path] = []
+    for p in cands:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def _label_has_both_classes(lbl_path: Path) -> bool:
+    """
+    Return True if label file exists and contains at least one line with class 0 and one with class 1.
+    """
+    if not lbl_path.exists():
+        return False
+    try:
+        cls_ids = set()
+        for ln in lbl_path.read_text().splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            c0 = int(float(ln.split()[0]))
+            cls_ids.add(c0)
+        return (0 in cls_ids) and (1 in cls_ids)
+    except Exception:
+        return False
+
+
+def _filter_train_to_both(data_yaml_path: Path, work_root: Path) -> Path:
+    """
+    Create a filtered data.yaml that keeps only training images with BOTH classes present.
+    Returns the path to the new YAML. Only 'train' is changed; 'val' and 'test' remain as-is.
+
+    The filtered 'train' entry is a *.txt list file with absolute image paths.
+    """
+    y = yaml.safe_load(data_yaml_path.read_text()) or {}
+    ydir = data_yaml_path.parent
+
+    # Resolve base 'path' if present (relative to data.yaml)
+    base_field = y.get("path")
+    if base_field:
+        base_path = Path(str(base_field))
+        base = base_path if base_path.is_absolute() else (ydir / base_path).resolve()
+    else:
+        base = ydir
+
+    train_entry = y.get("train")
+    if not train_entry:
+        print("[FILTER] No 'train' entry found in data.yaml; skipping filter.")
+        return data_yaml_path
+
+    train_path = Path(str(train_entry))
+    if not train_path.is_absolute():
+        train_path = (base / train_path).resolve()
+
+    # Collect candidate image list from either dir or file list
+    images: List[Path] = []
+    if train_path.is_dir():
+        images = list(_iter_images_from_dir(train_path))
+    elif train_path.is_file() and train_path.suffix.lower() == ".txt":
+        try:
+            for ln in train_path.read_text().splitlines():
+                s = ln.strip()
+                if not s:
+                    continue
+                p = Path(s)
+                images.append(p if p.is_absolute() else (train_path.parent / p).resolve())
+        except Exception as e:
+            print(f"[FILTER] Could not read {train_path}: {e}")
+    else:
+        print(f"[FILTER] Unsupported 'train' entry: {train_path} (must be folder or .txt). Skipping filter.")
+        return data_yaml_path
+
+    # Decide which images to keep by testing corresponding label files
+    keep: List[Path] = []
+    drop = 0
+    for img in images:
+        ok = False
+        for cand in _label_path_candidates_for_image(img):
+            if _label_has_both_classes(cand):
+                ok = True
+                break
+        if ok:
+            keep.append(img.resolve())
+        else:
+            drop += 1
+
+    # If nothing filtered, return original
+    if not keep:
+        print("[FILTER] No training images containing both classes were found. Using original 'train'.")
+        return data_yaml_path
+
+    # Prepare output structure
+    out_dir = work_root / "_filtered_data"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    train_list = out_dir / "train_require_both.txt"
+    train_list.write_text("\n".join(str(p) for p in keep) + "\n")
+
+    # New YAML: clone original but set 'train' to the list file (absolute path).
+    new_y = dict(y)
+    new_y["train"] = str(train_list.resolve())
+    # keep 'path', 'val', 'test', 'names' as-is
+    new_yaml = out_dir / "data_filtered.yaml"
+    new_yaml.write_text(yaml.safe_dump(new_y, sort_keys=False))
+
+    print(f"[FILTER] Train images: kept={len(keep)} dropped={drop} → {train_list}")
+    return new_yaml
+
+
 # ---------------- config objects ----------------
 
 @dataclass
@@ -228,6 +376,7 @@ class TrainCfg:
     patience: int
     multi_scale: bool
     close_mosaic: int
+    require_both_train: bool
     # augmentations
     aug: AugCfg
 
@@ -296,6 +445,7 @@ class TrainCfg:
                 if "extend_epochs" in cfg and cfg["extend_epochs"] not in ("", None)
                 else None
             ),
+            require_both_train=bool(cfg.get("require_both_train", True)),
             aug=aug_cfg,
         )
 
@@ -305,6 +455,8 @@ class TrainCfg:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Train Ultralytics multiclass (disc/cup) from a config YAML")
     ap.add_argument("--config", required=True, help="Path to YAML config.")
+    ap.add_argument("--no-filter-both", action="store_true",
+                    help="Disable filtering of training images to those containing BOTH classes.")
     return ap.parse_args()
 
 
@@ -312,6 +464,19 @@ def main() -> None:
     args = parse_args()
     cfg_path = Path(str(args.config)).expanduser().resolve()
     train_cfg = TrainCfg.from_yaml(cfg_path)
+
+    # -------- Optionally filter training split to 'require both classes' --------
+    data_yaml_for_training = train_cfg.data
+    work_run_root = train_cfg.runs_root / train_cfg.name
+    work_run_root.mkdir(parents=True, exist_ok=True)
+
+    apply_filter = train_cfg.require_both_train and (not args.no_filter_both)
+    if apply_filter:
+        try:
+            filtered_yaml = _filter_train_to_both(train_cfg.data, work_run_root)
+            data_yaml_for_training = filtered_yaml
+        except Exception as e:
+            print(f"[FILTER] Failed to build filtered train list ({e}). Proceeding with original data.yaml.")
 
     # -------- Resolve resume / model init --------
     resume_flag = False
@@ -365,15 +530,15 @@ def main() -> None:
 
     # -------- Info & split counts --------
     print(f"[CFG] {cfg_path}")
-    print(f"[INFO] data={train_cfg.data} | device={train_cfg.device} | "
+    print(f"[INFO] data={data_yaml_for_training} | device={train_cfg.device} | "
           f"epochs={effective_epochs} | imgsz={train_cfg.imgsz} | batch={train_cfg.batch}")
     print(f"[AUG ] scale={train_cfg.aug.scale} translate={train_cfg.aug.translate} "
           f"mosaic={train_cfg.aug.mosaic} mixup={train_cfg.aug.mixup} erasing={train_cfg.aug.erasing}")
     print(f"[RUN ] project={train_cfg.runs_root} name={train_cfg.name}")
 
     try:
-        dy = yaml.safe_load(train_cfg.data.read_text()) or {}
-        dy_dir = train_cfg.data.parent
+        dy = yaml.safe_load(Path(data_yaml_for_training).read_text()) or {}
+        dy_dir = Path(data_yaml_for_training).parent
         n_train = _count_images("train", dy, dy_dir)
         n_val = _count_images("val", dy, dy_dir)
         n_test = _count_images("test", dy, dy_dir)
@@ -383,7 +548,7 @@ def main() -> None:
 
     # -------- Train --------
     overrides: Dict[str, Any] = dict(
-        data=str(train_cfg.data),
+        data=str(data_yaml_for_training),
         epochs=effective_epochs,
         imgsz=train_cfg.imgsz,
         batch=train_cfg.batch,
@@ -414,7 +579,7 @@ def main() -> None:
     print("[OK] Training complete.")
 
     # -------- Evaluate on test (fallback to val) --------
-    dy = yaml.safe_load(train_cfg.data.read_text()) or {}
+    dy = yaml.safe_load(Path(data_yaml_for_training).read_text()) or {}
     has_test = bool(dy.get("test"))
 
     best_ckpt = train_cfg.runs_root / train_cfg.name / "weights" / "best.pt"
@@ -428,7 +593,7 @@ def main() -> None:
     split = "test" if has_test else "val"
     print(f"[EVAL] Evaluating checkpoint on split='{split}' …")
     val_res = tester.val(
-        data=str(train_cfg.data),
+        data=str(data_yaml_for_training),
         split=split,
         imgsz=train_cfg.imgsz,
         device=train_cfg.device,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# src/model/predict_bounding_box.py
+# src/model/predict_bb_multi.py
 from __future__ import annotations
 
 import argparse
