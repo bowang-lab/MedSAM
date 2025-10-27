@@ -1,0 +1,58 @@
+# Top-level controls
+out_ext: ".jpg"
+multiplier: 2
+include_images_without_labels: false
+seed: 1337
+write_yaml: true
+
+# Unified object inclusion policy
+#   full        → require at least one FULLY contained object per crop; keep only fully contained boxes
+#   partial     → allow partial boxes; require at least one with visibility ≥ min_visibility
+#   negative_ok → allow crops with no objects; (negatives will be emitted)
+object_policy: partial
+min_visibility: 0.20
+
+# Albumentations transform
+transform:
+  hflip_p: 0.5
+  vflip_p: 0.0
+  affine:
+    p: 0.7
+    scale: [0.9, 1.1]
+    translate_percent: [-0.05, 0.05]
+    rotate: [-15, 15]
+    shear: [-5, 5]
+  random_resized_crop:
+    p: 0.5
+    scale: [0.9, 1.0]
+    ratio: [0.9, 1.1]
+  color_jitter:
+    p: 0.5
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.2
+    hue: 0.1
+
+# Tiling
+tiling:
+  enable: true
+  tile_size: 512
+  overlap: 0.40
+  from_aug: false
+
+# Object-centric zoom crops
+zoom_crops:
+  enable: true
+  scales: [0.35, 0.5, 0.7]
+  per_obj: 2
+  on: "both"      # disc | cup | both | any
+  out_size: 640
+  jitter: 0.05
+
+# Multi-scale zoom sweep
+zoom_sweep:
+  enable: true
+  scales: [0.35, 0.5, 0.7]
+  overlap: 0.25
+  out_size: 640
+  from_aug: false

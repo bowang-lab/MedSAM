@@ -11,6 +11,7 @@
 *.png
 data/
 work_dir/
+runs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

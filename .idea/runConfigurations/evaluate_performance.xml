@@ -1,0 +1,25 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="evaluate_performance" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+    <module name="MedSAM" />
+    <option name="ENV_FILES" value="" />
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="PARENT_ENVS" value="true" />
+    <envs>
+      <env name="PYTHONUNBUFFERED" value="1" />
+    </envs>
+    <option name="SDK_HOME" value="" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/src/scripts" />
+    <option name="IS_MODULE_SDK" value="true" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+    <option name="SCRIPT_NAME" value="$PROJECT_DIR$/src/scripts/evaluate_performance.py" />
+    <option name="PARAMETERS" value="--images-root $USER_HOME$/OneDrive_UBC/Ipek_Carlos/GlaucomaDatasets/SMDG-19/full-fundus/full-fundus --gt-disc-masks $USER_HOME$/OneDrive_UBC/Ipek_Carlos/GlaucomaDatasets/SMDG-19/optic-disc/optic-disc --gt-cup-masks $USER_HOME$/OneDrive_UBC/Ipek_Carlos/GlaucomaDatasets/SMDG-19/optic-cup/optic-cup --pred-labels results/preds/labels --include PAPILA --loss l1 --out-csv results/papila_eval.csv" />
+    <option name="SHOW_COMMAND_LINE" value="false" />
+    <option name="EMULATE_TERMINAL" value="false" />
+    <option name="MODULE_MODE" value="false" />
+    <option name="REDIRECT_INPUT" value="false" />
+    <option name="INPUT_FILE" value="" />
+    <method v="2" />
+  </configuration>
+</component>

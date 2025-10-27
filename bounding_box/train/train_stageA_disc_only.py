@@ -3,41 +3,15 @@
 """
 Train a disc-only detector from an existing 2-class YOLO dataset (0=disc, 1=cup).
 
-What this script does
----------------------
-A) If a precomputed disc-only dataset already exists at <data_root>/od_only.yaml,
-   it uses that directly.
+Adds resume support:
+  --resume auto      -> uses runs/detect/<name>/weights/last.pt if present
+  --resume /path/to/last.pt
 
-B) Otherwise, it builds a derived disc-only YOLO dataset next to <data_root>:
-   <data_root>_disc_only/
-     - Images are symlinked (default) or copied.
-     - Labels are filtered to keep only class 0 (disc).
-     - Optionally drop images whose filtered label becomes empty (--drop_empty).
-     - Writes "od_only.yaml" with names: ["disc"].
+Behavior:
+- If resume is found, loads that checkpoint and calls model.train(resume=True).
+- Otherwise starts from --model weights and trains from scratch.
 
-Then it trains Ultralytics YOLO (unless --train 0) and validates on test if present, else val.
-
-Default project layout (can be overridden)
-------------------------------------------
-PROJECT_DIR/
-  data/yolo_split/              # input YOLO dataset root (images/{train,val,test}, labels/{...})
-  weights/yolov8n.pt            # local weights
-  bounding_box/runs/detect/     # Ultralytics output root
-
-Usage examples
---------------
-# Basic
-python train_stageA_disc_only.py --project_dir /path/to/MedSAM
-
-# Custom data/weights and copy images instead of symlink
-python train_stageA_disc_only.py \
-  --project_dir /path/to/MedSAM \
-  --data_root   /scratch/.../yolo_split \
-  --model       /scratch/.../weights/yolov8n.pt \
-  --copy_images
-
-# Validate only (uses precomputed disc-only if present; otherwise builds it)
-python train_stageA_disc_only.py --train 0
+The rest (building disc-only, validating, etc.) is unchanged.
 """
 
 from __future__ import annotations
@@ -80,6 +54,9 @@ class DiscOnlyConfig:
     exp_name: str               # Experiment name (Ultralytics subfolder)
     do_train: bool              # Whether to train or just validate
 
+    # Resume
+    resume: Optional[str]       # "", "auto", or path to last.pt
+
 
 # ----------------------------- Small utils --------------------------
 
@@ -113,14 +90,11 @@ def _split_has_data(root: Path, split: str) -> bool:
 
 def _disc_yaml_in(root: Path) -> Path:
     """Return the expected disc-only YAML path inside a dataset root."""
-    return root / "od_only.yaml"
+    return root / "data.yaml"
 
 def _has_precomputed_disc_only(root: Path) -> bool:
     """True if root looks like a disc-only dataset (has od_only.yaml)."""
     return _disc_yaml_in(root).exists()
-
-
-# ----------------------------- Label I/O -----------------------------
 
 def _filter_label_lines_to_disc(lines: Iterable[str]) -> List[str]:
     """Keep only class-0 lines from a YOLO .txt file."""
@@ -154,9 +128,6 @@ def filter_labels_dir_to_disc(src_lbl_dir: Path, dst_lbl_dir: Path, drop_empty: 
         (dst_lbl_dir / lbl.name).write_text("\n".join(kept) + ("\n" if kept else ""))
         written += 1
     return written
-
-
-# ----------------------------- Disc-only dataset build --------------
 
 def build_disc_only_dataset(
     base_root: Path,
@@ -213,7 +184,11 @@ def build_model(weights: Path) -> YOLO:
         raise SystemExit(f"[ERR] Model weights not found at: {weights}")
     return YOLO(str(weights))
 
-def train_model(model: YOLO, data_yaml: Path, cfg: DiscOnlyConfig, device: str) -> None:
+def find_last_ckpt(runs_root: Path, exp_name: str) -> Optional[Path]:
+    p = runs_root / exp_name / "weights" / "last.pt"
+    return p if p.exists() else None
+
+def train_model(model: YOLO, data_yaml: Path, cfg: DiscOnlyConfig, device: str, resume: bool) -> None:
     """Train the model if cfg.do_train is True."""
     if not cfg.do_train:
         return
@@ -227,9 +202,10 @@ def train_model(model: YOLO, data_yaml: Path, cfg: DiscOnlyConfig, device: str) 
         name=cfg.exp_name,
         cos_lr=True,
         optimizer="AdamW",
-        pretrained=True,
+        pretrained=not resume,   # don't re-init pretraining when resuming
         patience=50,
         single_cls=True,
+        resume=resume,           # <— key flag
     )
 
 def validate_model(model: YOLO, data_yaml: Path, imgsz: int, device: str) -> None:
@@ -270,6 +246,9 @@ def build_config_from_cli() -> DiscOnlyConfig:
     ap.add_argument("--name", default="stageA_disc_only",
                     help="Ultralytics experiment name (runs subfolder).")
     ap.add_argument("--train", type=int, default=1, help="1=train+val, 0=val-only")
+
+    # Resume
+    ap.add_argument("--resume", default="", help="Path to last.pt OR 'auto' to use runs/<name>/weights/last.pt")
 
     # Data curation (used if we need to build the disc-only dataset)
     ap.add_argument("--copy_images", action="store_true",
@@ -313,6 +292,7 @@ def build_config_from_cli() -> DiscOnlyConfig:
         batch=int(args.batch),
         exp_name=str(args.name),
         do_train=bool(args.train),
+        resume=str(args.resume) if args.resume else "",
     )
 
 
@@ -338,14 +318,30 @@ def main() -> None:
         print(f"[OK] Disc-only dataset: {out_root}")
         print(f"[OK] Dataset YAML:      {od_yaml}")
 
-    # 2) Build model & device
+    # 2) Build model & device (+ resume)
     device = ultralytics_device_arg()  # "0" or "cpu"
-    model = build_model(cfg.model_path)
+
+    resume_flag = False
+    last_ckpt: Optional[Path] = None
+    if cfg.resume:
+        if str(cfg.resume).lower() == "auto":
+            last_ckpt = find_last_ckpt(cfg.runs_root, cfg.exp_name)
+        else:
+            last_ckpt = _expand(cfg.resume)
+
+    if last_ckpt and last_ckpt.exists():
+        print(f"[INFO] Resuming from: {last_ckpt}")
+        model = YOLO(str(last_ckpt))
+        resume_flag = True
+    else:
+        if cfg.resume:
+            print(f"[WARN] --resume requested but checkpoint not found. Starting fresh. (Searched: {last_ckpt})")
+        model = build_model(cfg.model_path)
 
     # 3) Train (optional) and Validate
     if cfg.do_train:
-        print(f"[INFO] Training… (epochs={cfg.epochs}, imgsz={cfg.imgsz}, batch={cfg.batch})")
-    train_model(model, od_yaml, cfg, device)
+        print(f"[INFO] Training… (epochs={cfg.epochs}, imgsz={cfg.imgsz}, batch={cfg.batch}, resume={resume_flag})")
+    train_model(model, od_yaml, cfg, device, resume=resume_flag)
 
     print("[INFO] Validating…")
     validate_model(model, od_yaml, cfg.imgsz, device)

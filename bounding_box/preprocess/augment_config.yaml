@@ -23,7 +23,7 @@ transform:
     scale: [0.9, 1.0]
     ratio: [0.9, 1.1]
   color_jitter:
-    p: 0.5
+    p: 0.8
     brightness: 0.2
     contrast: 0.2
     saturation: 0.2
@@ -35,7 +35,7 @@ tiling:
   tile_size: 512
   tile_overlap: 0.40
   min_tile_vis: 0.05
-  keep_empty_tiles: true
+  keep_empty_tiles: false
   from_aug: false
 
 # --- zoom crops (object-centric) — copied from your pipeline values ---
@@ -48,7 +48,7 @@ zoom_crops:
   jitter: 0.05
   min_vis: 0.10
   from_aug: false
-  keep_empty: true
+  keep_empty: false
 
 # --- multi-scale sliding zoom sweep — copied from your pipeline values ---
 zoom_sweep:
@@ -56,6 +56,6 @@ zoom_sweep:
   scales: [0.35, 0.5, 0.7]
   overlap: 0.25
   min_vis: 0.10
-  keep_empty: true
+  keep_empty: false
   out_size: 640
   from_aug: false

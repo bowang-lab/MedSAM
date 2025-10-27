@@ -127,12 +127,22 @@ run_stageA() {
   echo "[STAGE A] DISC_ROOT=${DISC_ROOT}"
   echo "[STAGE A] DATA_ROOT=${DATA_ROOT} | AUG_ROOT=${AUG_ROOT}"
 
+  # auto-resume if a previous run exists
+  local last_ckpt="${RUNS_DIR}/${STAGEA_NAME}/weights/last.pt"
+  local RESUME_SWITCH=""
+  if [[ -f "${last_ckpt}" ]]; then
+    echo "[STAGE A] Found previous checkpoint → ${last_ckpt}"
+    RESUME_SWITCH="--resume auto"
+  fi
+
   if [[ -d "${DISC_ROOT}" && -f "${DISC_ROOT}/od_only.yaml" ]]; then
     echo "[STAGE A] Using PREBUILT disc-only dataset at ${DISC_ROOT}"
     python "${BB_DIR}/train/train_stageA_disc_only.py" \
       --project_dir "${PROJECT_DIR}" \
       --data_root   "${DISC_ROOT}" \
-      --model       "${YOLO_WEIGHTS}"
+      --model       "${YOLO_WEIGHTS}" \
+      --name        "${STAGEA_NAME}" \
+      ${RESUME_SWITCH}
   else
     echo "[STAGE A] Prebuilt disc-only dataset NOT found; building from clean+aug."
     check_dir "${DATA_ROOT}" "Clean YOLO split"
@@ -142,12 +152,37 @@ run_stageA() {
       --data_root   "${DATA_ROOT}" \
       --aug_root    "${AUG_ROOT}" \
       --train_splits train \
-      --model       "${YOLO_WEIGHTS}"
+      --model       "${YOLO_WEIGHTS}" \
+      --name        "${STAGEA_NAME}" \
+      ${RESUME_SWITCH}
   fi
 
   local best="${RUNS_DIR}/${STAGEA_NAME}/weights/best.pt"
   check_file "${best}" "Stage A best checkpoint"
   echo "[STAGE A] Best checkpoint: ${best}"
+}
+
+# ========================= Stage B =========================
+run_stageB() {
+  echo "[STAGE B] Train cup-only detector on prebuilt ROI dataset…"
+  echo "[STAGE B] ROI_OUT=${ROI_OUT}"
+  check_dir "${ROI_OUT}" "ROI dataset"
+
+  local last_ckpt="${RUNS_DIR}/${STAGEB_NAME}/weights/last.pt"
+  local RESUME_SWITCH=""
+  if [[ -f "${last_ckpt}" ]]; then
+    echo "[STAGE B] Found previous checkpoint → ${last_ckpt}"
+    RESUME_SWITCH="--resume auto"
+  fi
+
+  python "${BB_DIR}/train/train_stageB_cup_roi.py" \
+    --project_dir "${PROJECT_DIR}" \
+    --name        "${STAGEB_NAME}" \
+    ${RESUME_SWITCH}
+
+  local best="${RUNS_DIR}/${STAGEB_NAME}/weights/best.pt"
+  check_file "${best}" "Stage B best checkpoint"
+  echo "[STAGE B] Best checkpoint: ${best}"
 }
 
 # ========================= Stage B =========================

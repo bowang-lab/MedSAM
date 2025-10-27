@@ -1,0 +1,17 @@
+# configs/datasets.yaml
+# A standalone multi-dataset definition for the OOP pipeline.
+# Paste this 'datasets:' block into your main config or load/merge at parse time.
+
+datasets:
+  - tag: smdg19
+    images_root: "/Users/carlosperez/OneDrive_UBC/Ipek_Carlos/GlaucomaDatasets/SMDG-19/full-fundus/full-fundus"
+    disc_masks:  "/Users/carlosperez/OneDrive_UBC/Ipek_Carlos/GlaucomaDatasets/SMDG-19/optic-disc/optic-disc"
+    cup_masks:   "/Users/carlosperez/OneDrive_UBC/Ipek_Carlos/GlaucomaDatasets/SMDG-19/optic-cup/optic-cup"
+    recursive: false
+    exclude_name_contains: ["PAPILA"]
+
+  - tag: rimone
+    images_root: "/Users/carlosperez/OneDrive_UBC/Ipek_Carlos/GlaucomaDatasets/Rim-One/Organized_Rim-One/fundus"
+    disc_masks:  "/Users/carlosperez/OneDrive_UBC/Ipek_Carlos/GlaucomaDatasets/Rim-One/Organized_Rim-One/optic-disc"
+    cup_masks:   "/Users/carlosperez/OneDrive_UBC/Ipek_Carlos/GlaucomaDatasets/Rim-One/Organized_Rim-One/optic-cup"
+    recursive: true
