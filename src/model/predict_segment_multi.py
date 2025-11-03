@@ -15,7 +15,7 @@ from ultralytics import YOLO
 from src.imgpipe.binary_mask_ref import BinaryMaskRef
 from src.imgpipe.enums import LabelType, Structure
 from src.imgpipe.image import Image
-from src.imgpipe.bounding_box import BoundingBox
+from src.imgpipe.normalized_box import BoundingBox
 from src.imgpipe.collector import DatasetCollector, group_by_subject
 from src.utils import ensure_dir, stem_map_by_first_match
 from src.model.MedSAM_infer import (

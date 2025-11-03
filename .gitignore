@@ -12,6 +12,7 @@
 data/
 work_dir/
 runs/
+results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.imgpipe.bounding_box import BoundingBox
+from src.imgpipe.normalized_box import BoundingBox
 from src.imgpipe.enums import LabelType, Structure
 from src.imgpipe.image import Image
 

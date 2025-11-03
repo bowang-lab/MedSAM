@@ -19,7 +19,7 @@ from src.utils import ensure_dir
 
 # OOP classes used by the new API
 from src.imgpipe.image import Image as ImageRec
-from src.imgpipe.bounding_box import BoundingBox
+from src.imgpipe.normalized_box import BoundingBox
 from src.imgpipe.enums import LabelType, Structure
 
 

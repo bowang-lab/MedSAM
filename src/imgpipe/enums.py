@@ -10,3 +10,11 @@ class Structure(str, Enum):
 class LabelType(str, Enum):
     GT = "gt"
     PRED = "pred"
+
+class Eye(str, Enum):
+    OS = "os"
+    OD = "od"
+
+class Ethnicity(str, Enum):
+    CHINESE = "chinese"
+    SPANISH = "spanish"

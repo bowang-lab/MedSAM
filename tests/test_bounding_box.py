@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.imgpipe.bounding_box import BoundingBox
+from src.imgpipe.normalized_box import BoundingBox
 
 
 def test_from_mask_none():

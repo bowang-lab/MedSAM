@@ -31,7 +31,7 @@ from ultralytics import YOLO
 
 from src.imgpipe.image_factory import ImageFactory
 from  src.imgpipe.image import Image
-from  src.imgpipe.bounding_box import BoundingBox
+from  src.imgpipe.normalized_box import BoundingBox
 from  src.imgpipe.enums import LabelType, Structure
 
 

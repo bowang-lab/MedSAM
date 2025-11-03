@@ -1,12 +1,5 @@
-# src/device_utils.py
+# src/device.py
 from __future__ import annotations
-
-"""
-Utility helpers for device selection, paths, image I/O, simple geometry/metrics,
-and light YAML config loading (path resolution).
-
-Designed to be importable on HPC and local environments.
-"""
 
 import os
 import uuid
@@ -174,6 +167,16 @@ def save_viz(path: Path, viz_bgr: np.ndarray) -> None:
     """Save a BGR visualization image."""
     ensure_dir(path.parent)
     cv2.imwrite(str(path), viz_bgr)
+
+def list_images(folder: Path) -> List[Path]:
+    return sorted([p for p in folder.glob("*") if p.suffix.lower() in IMG_EXTS])
+
+def read_image(path: Path) -> Optional["cv2.Mat"]:
+    return cv2.imread(str(path), cv2.IMREAD_COLOR)
+
+def write_image(path: Path, image: "cv2.Mat") -> None:
+    ensure_dir(path.parent)
+    cv2.imwrite(str(path), image)
 
 
 # ======================================================================
