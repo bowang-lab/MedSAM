@@ -51,7 +51,7 @@ cd "${REPO_DIR}"
 srun -u python -m ${PYTHON_MODULE} \
   --train \
   --device "cuda:0" \
-  --data-root "$DATA_ROOT" \
+  --data-root "$DATA_DIR" \
   --ckpt "$CKPT" \
   --out-dir "$OUT_DIR" \
   --run-dir "$RUN_DIR" \
