@@ -459,7 +459,7 @@ def set_logging(name="LOGGING_NAME", verbose=True):
 
 
 # Set logger
-LOGGER = set_logging(LOGGING_NAME, verbose=VERBOSE)  # define globally (used in train.py, val.py, predict.py, etc.)
+LOGGER = set_logging(LOGGING_NAME, verbose=VERBOSE)  # define globally (used in train_yolo.py, val.py, predict.py, etc.)
 logging.getLogger("sentry_sdk").setLevel(logging.CRITICAL + 1)
 
 

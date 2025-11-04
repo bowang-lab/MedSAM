@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-Preprocess and train/tune/test a multi-class YOLO detector (disc=0, cup=1).
-
-This script is designed to work with the Slurm array submission script you showed.
-"""
+#src.scripts.train_yolo.py
 
 from __future__ import annotations
 
