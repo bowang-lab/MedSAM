@@ -21,13 +21,13 @@ set -euo pipefail
 REPO_DIR="/scratch/st-ipor-1/cperez/MedSAM"
 OUT_DIR="/scratch/st-ipor-1/cperez/MedSAM/TRAINING_DS"
 DATA_DIR="/arc/project/st-ipor-1/carlosp/fundus_data/All_Datasets_Organized"
-#CKPT="${REPO_DIR}/weights/medsam_vit_b.pth"
-CKPT="${REPO_DIR}/runs/FineTune_MedSAM/weights/last.pth"
+CKPT="${REPO_DIR}/weights/medsam_vit_b.pth"
+RESUME="${REPO_DIR}/runs/FineTune_MedSAM/weights/last.pth"
 
 
 DEVICE="cuda:0"
 BATCH=8
-
+batch
 # Python module entrypoint
 PYTHON_MODULE="src.scripts.finetune_medsam"
 
@@ -61,3 +61,4 @@ srun -u python -m ${PYTHON_MODULE} \
   --batch 8 \
   --imgsz 1024 \
   --pad-jitter 0.3
+  --resume "${RESUME}"
