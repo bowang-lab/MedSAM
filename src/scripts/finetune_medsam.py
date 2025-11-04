@@ -10,11 +10,6 @@
 #   torch, torchvision, numpy, pillow
 #   segment-anything (pip install git+https://github.com/facebookresearch/segment-anything.git)
 # Optional for LoRA: peft (pip install peft)
-#
-# Notes:
-# - By default, image & prompt encoders are frozen; only mask decoder trains (safe for small data).
-# - Set --lora to enable LoRA on the image encoder (in addition to the decoder).
-# - If your Image dataclass uses different attribute names, adjust _extract_paths().
 
 from __future__ import annotations
 
@@ -26,6 +21,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
+import inspect
 
 import numpy as np
 from PIL import Image as PILImage
@@ -36,7 +32,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from src.imgpipe.image_factory import ImageFactory
-from src.imgpipe.enums import Structure  # DISC / CUP
+# from src.imgpipe.enums import Structure  # not required in this script
 
 # Try SAM imports
 try:
@@ -49,10 +45,10 @@ except Exception as e:
 # Defaults (parallel to your YOLO script)
 # =========================
 DEFAULT_DATA_ROOT = Path("/Users/carlosperez/Library/CloudStorage/OneDrive-UBC/Ipek_Carlos/GlaucomaDatasets/All_Datasets_Organized")
-DEFAULT_OUT_DIR   = Path("/Users/carlosperez/PycharmProjects/MedSAM/TRAINING_DS_TOY")
-DEFAULT_RUN_DIR   = Path("/Users/carlosperez/PycharmProjects/MedSAM/runs_medsam")
+DEFAULT_OUT_DIR   = Path("/Users/carlosperez/PycharmProjects/MedSAM/MEDSAM_TRAIN")
+DEFAULT_RUN_DIR   = Path("/Users/carlosperez/PycharmProjects/MedSAM/runs/runs_medsam")
 DEFAULT_MODEL     = "vit_b"  # SAM backbone key for registry; MedSAM is ViT-B
-DEFAULT_CKPT      = Path("/Users/carlosperez/PycharmProjects/MedSAM/checkpoints/medsam_vit_b.pth")  # <- set to your MedSAM checkpoint
+DEFAULT_CKPT      = Path("/Users/carlosperez/PycharmProjects/MedSAM/work_dir/MedSAM/medsam_vit_b.pth")  # <- set to your MedSAM checkpoint
 
 DEFAULT_DEVICE: Optional[str | int] = "mps"
 DEFAULT_IMGSZ = 1024
@@ -105,61 +101,54 @@ class Sample:
     mask_path: Path
     structure: str  # "disc" or "cup"
 
-def _extract_paths(img_obj) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
-    """
-    Best-effort extraction from your Image dataclass.
-    Adjust if your attribute names differ.
-    Returns: (fundus_path, disc_mask_path, cup_mask_path)
-    """
-    # Common field names
-    candidates_img  = ["fundus_path", "image_path", "rgb_path", "path"]
-    candidates_disc = ["disc_mask_path", "mask_disc_path", "disc_path", "od_mask_path"]
-    candidates_cup  = ["cup_mask_path", "mask_cup_path", "cup_path", "oc_mask_path"]
-
-    def _first(attr_list):
-        for a in attr_list:
-            if hasattr(img_obj, a):
-                p = getattr(img_obj, a)
-                if p:
-                    return Path(p)
-        # Try mapping dicts if present
-        if hasattr(img_obj, "masks") and isinstance(img_obj.masks, dict):
-            # keys may be enums or strings
-            for key, val in img_obj.masks.items():
-                key_str = str(key).lower()
-                if "disc" in key_str and "disc" in attr_list[0]:
-                    return Path(val)
-                if "cup" in key_str and "cup" in attr_list[0]:
-                    return Path(val)
-        return None
-
-    img_p  = _first(candidates_img)
-    disc_p = _first(candidates_disc)
-    cup_p  = _first(candidates_cup)
-    return img_p, disc_p, cup_p
-
 def gather_samples_via_imagefactory(root: Path, exclude: Optional[List[str]] = None) -> List[Sample]:
+    """
+    Build samples strictly from persisted paths in src/imgpipe/image.Image:
+      - image_path
+      - gt_disc_mask.path
+      - gt_cup_mask.path
+    Skips any item where a required on-disk mask path is missing.
+    """
     print("[INFO] Scanning datasets with ImageFactory…")
     fac = ImageFactory(root=root, auto_scan=True)
     fac.filter_empty_masks()
-    if exclude:
-        fac.filter_datasets(exclude=exclude)
+    fac.filter_datasets(exclude=["PAPILA"])
+    # fac.filter_random_subset(100)
     images = fac.make_images()
     if not images:
         raise RuntimeError("No images available after filtering.")
-    print(f"[INFO] Found {len(images)} images with masks.")
+    print(f"[INFO] Found {len(images)} images with masks (pre-split).")
+
     samples: List[Sample] = []
+    missing_paths = 0
+
     for im in images:
-        img_p, disc_p, cup_p = _extract_paths(im)
-        if img_p is None:
-            continue
-        if disc_p and Path(disc_p).exists():
-            samples.append(Sample(img_p, Path(disc_p), "disc"))
-        if cup_p and Path(cup_p).exists():
-            samples.append(Sample(img_p, Path(cup_p), "cup"))
+        img_p: Path = im.image_path
+
+        # Disc
+        disc_ref = im.gt_disc_mask
+        if disc_ref is not None and getattr(disc_ref, "path", None):
+            dp = Path(disc_ref.path)
+            if dp.exists():
+                samples.append(Sample(img_p, dp, "disc"))
+            else:
+                missing_paths += 1
+
+        # Cup
+        cup_ref = im.gt_cup_mask
+        if cup_ref is not None and getattr(cup_ref, "path", None):
+            cp = Path(cup_ref.path)
+            if cp.exists():
+                samples.append(Sample(img_p, cp, "cup"))
+            else:
+                missing_paths += 1
+
     if not samples:
-        raise RuntimeError("No (image,mask) pairs formed. Check your Image dataclass path extraction.")
-    print(f"[INFO] Formed {len(samples)} segmentation samples (disc+cup).")
+        raise RuntimeError("No (image, mask) pairs with valid on-disk paths. Check your serialized Image records.")
+    if missing_paths:
+        print(f"[WARN] {missing_paths} mask references were present but their files were missing; skipped.")
+
+    print(f"[INFO] Formed {len(samples)} segmentation samples (disc+cup) from persisted paths.")
     return samples
 
 def split_samples(samples: List[Sample], train=0.8, val=0.1, test=0.1, seed=42) -> Tuple[List[Sample], List[Sample], List[Sample]]:
@@ -277,9 +266,14 @@ class MedSAMDataset(Dataset):
 
         # tensors
         x = preprocess_for_sam(img_r)
-        y = torch.from_numpy(np.array(mask_r > 0, dtype=np.float32))[None, :, :]  # (1,H,W)
-        b = torch.from_numpy(box_t.astype(np.float32))  # (4,)
+        # BEFORE (raises TypeError: Image > int)
+        # y = torch.from_numpy(np.array(mask_r > 0, dtype=np.float32))[None, :, :]  # (1,H,W)
 
+        # AFTER (convert to array first, then threshold)
+        mask_arr = np.array(mask_r, dtype=np.uint8)  # (H,W) 0..255
+        y = torch.from_numpy((mask_arr > 0).astype(np.float32)).unsqueeze(0)  # (1,H,W)
+
+        b = torch.from_numpy(box_t.astype(np.float32))  # (4,)
         return {"image": x, "mask": y, "box": b}
 
 # =========================
@@ -359,33 +353,53 @@ class MedSAMFinetuner(nn.Module):
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass that returns (logits_1024, iou_pred).
-        batch keys: image (3,1024,1024), mask (1,1024,1024), box (4,)
+        batch keys: image (B,3,1024,1024), mask (B,1,1024,1024), box (B,4)
         """
-        x = batch["image"]  # (B,3,1024,1024), SAM-normalized
-        b = batch["box"]    # (B,4) in 1024 coords
-
-        # Encode image (grad on/off depending on freeze)
-        image_embeddings = self.sam.image_encoder(x)
-        # Dense positional encoding
-        dense_pe = self.sam.prompt_encoder.get_dense_pe()
-        # Prepare boxes (B,1,4)
-        boxes = b[:, None, :]  # (B,1,4)
-        sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(points=None, boxes=boxes, masks=None)
-
-        # Zero mask input (no previous mask)
+        x = batch["image"]  # (B,3,1024,1024) SAM-normalized
+        b = batch["box"]  # (B,4) in 1024 coords
         B = x.shape[0]
-        mask_input = torch.zeros((B, 1, 256, 256), device=x.device, dtype=image_embeddings.dtype)
 
-        low_res_masks, iou_pred = self.sam.mask_decoder(
+        # Encode image
+        image_embeddings = self.sam.image_encoder(x)  # (B,256,64,64)
+        dense_pe = self.sam.prompt_encoder.get_dense_pe()  # positional enc
+
+        # Prepare box prompts
+        boxes = b[:, None, :]  # (B,1,4)
+        sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(
+            points=None, boxes=boxes, masks=None
+        )
+
+        # Some SAM builds accept an optional prior mask under different names.
+        # Build kwargs compatibly.
+        md = self.sam.mask_decoder
+        sig = inspect.signature(md.forward)
+        params = set(sig.parameters.keys())
+
+        md_kwargs = dict(
             image_embeddings=image_embeddings,
             image_pe=dense_pe,
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
             multimask_output=False,
-            mask_input=mask_input,
         )
+
+        # If a prior/low-res mask is supported, pass a zero prior.
+        zero_prior = torch.zeros((B, 1, 256, 256), device=x.device, dtype=image_embeddings.dtype)
+        if "mask_input" in params:
+            md_kwargs["mask_input"] = zero_prior
+        elif "low_res_mask" in params:
+            md_kwargs["low_res_mask"] = zero_prior
+        elif "low_res_masks" in params:
+            md_kwargs["low_res_masks"] = zero_prior
+        # If "high_res_features" exists in the signature, it is optional and defaults to None; omit safely.
+
+        low_res_masks, iou_pred = md(**md_kwargs)
+
         # Upsample to 1024 for loss
-        logits_1024 = F.interpolate(low_res_masks, size=(x.shape[2], x.shape[3]), mode="bilinear", align_corners=False)
+        logits_1024 = F.interpolate(
+            low_res_masks, size=(x.shape[2], x.shape[3]),
+            mode="bilinear", align_corners=False
+        )
         return logits_1024, iou_pred
 
 # =========================
@@ -513,7 +527,7 @@ def main():
     print(f"[INFO] IMGSZ     = {args.imgsz}")
     print(f"[INFO] MODES     = train={args.train}, test={'yes' if args.test_weights else 'no'}")
 
-    # Gather samples
+    # Gather samples strictly from persisted paths
     samples = gather_samples_via_imagefactory(args.data_root, exclude=["PAPILA"])
     train_s, val_s, test_s = split_samples(samples, args.train_ratio, args.val_ratio, args.test_ratio, SEED)
     print(f"[INFO] Split sizes -> train={len(train_s)} val={len(val_s)} test={len(test_s)}")

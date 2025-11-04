@@ -7,8 +7,13 @@ across padding levels.
 
 Outputs (under --out-dir):
   pad_000/, pad_010/, ... each with:
-    pred_disc/, pred_cup/, viz/, details.csv, stats.json, top10/, bottom10/
+    pred_disc/, pred_cup/, [viz/ if --save-viz], details.csv, stats.json, [top10/, bottom10/ if --save-viz]
   details_all.csv, summary_by_pad.csv, metrics_vs_pad.png
+
+Notes
+-----
+- Visualizations (overlay JPEGs) are now optional and DISABLED by default.
+  Enable with:  --save-viz
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ from src.utils import (
     load_image_bgr,
     save_mask_png,
     dice,
-    overlay_masks_and_boxes,  # NEW: use simple overlay that accepts a text block
+    overlay_masks_and_boxes,  # overlay helper for viz (used only if --save-viz)
 )
 
 # =============================
@@ -129,82 +134,24 @@ def _write_csv(rows: List[dict], path: Path) -> None:
         w.writeheader()
         w.writerows(rows)
 
-def _plot_vs_pad(ax, pad_fracs, values, label, ylabel, title):
-    """
-    Plot metric vs. pad fraction and annotate each point with its y-value.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-        Target axes.
-    pad_fracs : Sequence[float]
-        Padding fractions (x-axis).
-    values : Sequence[float]
-        Metric values corresponding to pad_fracs (y-axis).
-    label : str
-        Line label for the legend.
-    ylabel : str
-        Y-axis label.
-    title : str
-        Plot title.
-
-    Returns
-    -------
-    matplotlib.lines.Line2D | None
-        The plotted line, or None if no finite data points exist.
-    """
-    import math
-
-    # Pair up and keep only finite points; sort by pad for a clean line.
-    pts = []
-    for x, y in zip(pad_fracs, values):
-        if y is None:
-            continue
-        try:
-            xf = float(x)
-            yf = float(y)
-        except Exception:
-            continue
-        if math.isfinite(xf) and math.isfinite(yf):
-            pts.append((xf, yf))
-
-    if not pts:
-        return None
-
-    pts.sort(key=lambda t: t[0])
-    xs, ys = zip(*pts)
-
-    # Plot line with markers (no explicit colors/styles to keep defaults).
-    line, = ax.plot(xs, ys, marker="o", linestyle="-", label=label)
-
-    # Always annotate: y-value above each point.
-    for x, y in zip(xs, ys):
-        ax.annotate(
-            f"{y:.3f}",
-            xy=(x, y),
-            xytext=(0, 4),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-            clip_on=True,
-        )
-
-    # Axes cosmetics.
-    ax.set_xlabel("Pad fraction")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-
-    # Small horizontal padding for aesthetics.
-    xmin, xmax = min(xs), max(xs)
-    if xmin == xmax:
-        ax.set_xlim(xmin - 0.05, xmax + 0.05)
-    else:
-        span = xmax - xmin
-        ax.set_xlim(xmin - 0.02 * span, xmax + 0.02 * span)
-
-    return line
+def _plot_vs_pad(pads: List[float], metrics: Dict[str, List[float]], out_path: Path) -> None:
+    """Simple multi-line plot for Dice/MAE vs pad fraction; saved unconditionally."""
+    ensure_dir(out_path.parent)
+    plt.figure(figsize=(8, 5))
+    if "disc_dice_mean" in metrics:
+        plt.plot(pads, metrics["disc_dice_mean"], marker="o", label="Disc Dice (mean)")
+    if "cup_dice_mean" in metrics:
+        plt.plot(pads, metrics["cup_dice_mean"], marker="o", label="Cup Dice (mean)")
+    if "cdr_mae" in metrics:
+        plt.plot(pads, metrics["cdr_mae"], marker="o", label="CDR MAE")
+    plt.xlabel("Padding fraction")
+    plt.ylabel("Metric value")
+    plt.title("MedSAM performance vs padding")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(str(out_path), dpi=150)
+    plt.close()
 
 def _rank_best_worst(rows: List[dict], k: int = 10) -> Tuple[List[dict], List[dict]]:
     with_err = [r for r in rows if r.get("cdr_abs_error") is not None]
@@ -221,7 +168,7 @@ def _copy_best_worst(rows: List[dict], out_pad_dir: Path, k: int = 10) -> None:
         tgt = out_pad_dir / tag
         ensure_dir(tgt)
         for r in subset:
-            src = Path(r["viz_path"])
+            src = Path(r.get("viz_path") or "")
             if src.exists():
                 img = cv2.imread(str(src))
                 if img is not None:
@@ -241,6 +188,8 @@ class CLI:
     subset_n: int
     subset_seed: int
     exclude: List[str]
+    save_viz: bool
+    topk: int
 
 def _parse_args() -> CLI:
     p = argparse.ArgumentParser(description="Evaluate MedSAM with GT disc/cup boxes across padding levels.")
@@ -252,6 +201,9 @@ def _parse_args() -> CLI:
     p.add_argument("--subset-n", type=int, default=0, help="Optionally evaluate on N images.")
     p.add_argument("--subset-seed", type=int, default=43, help="Subset RNG seed.")
     p.add_argument("--exclude", nargs="*", default=["PAPILA"], help="Dataset names to exclude.")
+    # NEW: control visualization saving (default: False)
+    p.add_argument("--save-viz", action="store_true", help="Save overlay visualizations (default: off).")
+    p.add_argument("--topk", type=int, default=10, help="If saving viz, copy top/bottom K examples (default: 10).")
     a = p.parse_args()
     return CLI(
         data_root=a.data_root,
@@ -262,6 +214,8 @@ def _parse_args() -> CLI:
         subset_n=int(a.subset_n),
         subset_seed=int(a.subset_seed),
         exclude=list(a.exclude),
+        save_viz=bool(a.save_viz),
+        topk=int(a.topk),
     )
 
 # =============================
@@ -273,7 +227,8 @@ def _gather_images(data_root: Path, exclude: List[str], subset_n: int, subset_se
     print("[INFO] Scanning datasets…")
     fac = ImageFactory(root=data_root, auto_scan=True)
     fac.filter_empty_masks()
-    fac.filter_datasets(include=["PAPILA"])
+    if exclude:
+        fac.filter_datasets(exclude=exclude)
     images: List[Image] = fac.make_images()
     if not images:
         raise RuntimeError("No images with both disc/cup masks found.")
@@ -289,12 +244,13 @@ def _eval_one_image_for_pad(
     img: Image,
     pad_frac: float,
     out_pad_dir: Path,
+    save_viz: bool,
 ) -> Optional[dict]:
     """
-    - Ensure GT boxes from masks (normalized) → to pixel xyxy.
+    - Ensure GT boxes from masks (normalized) → pixel xyxy.
     - Pad boxes, embed once, infer disc/cup.
-    - Attach predicted masks to `img`, compute metrics, write artifacts.
-    - NEW: visualization includes Disc/Cup Dice values in the text overlay.
+    - Attach predicted masks to `img`, compute metrics.
+    - If save_viz: write overlay JPEG and include its path; else skip heavy viz work.
     """
     # Load RGB/BGR and geometry
     bgr = load_image_bgr(img.image_path)
@@ -345,32 +301,36 @@ def _eval_one_image_for_pad(
         cdr_err = float(pred_cdr - gt_cdr)
         cdr_abs = abs(cdr_err)
 
-    # --- Visualization with Dice in text overlay (NEW) ---
-    # Compose a single compact text line including Dice and CDR terms.
-    cdr_txt = (
-        f"Disc Dice={d_dice:.3f} | Cup Dice={c_dice:.3f} | "
-        f"CDR pred={pred_cdr:.3f}, GT={gt_cdr:.3f}, |err|={(cdr_abs if cdr_abs is not None else math.nan):.3f}"
-        if (pred_cdr is not None and gt_cdr is not None)
-        else f"Disc Dice={d_dice:.3f} | Cup Dice={c_dice:.3f} | CDR: N/A"
-    )
-    viz = overlay_masks_and_boxes(
-        bgr, pr_disc.astype(np.uint8), pr_cup.astype(np.uint8),
-        disc_xyxy_p, cup_xyxy_p, cdr_text=cdr_txt
-    )
-
-    # Save artifacts
+    # Prepare output dirs for masks (always saved) and viz (optional)
     disc_dir = out_pad_dir / "pred_disc"
     cup_dir  = out_pad_dir / "pred_cup"
-    viz_dir  = out_pad_dir / "viz"
-    ensure_dir(disc_dir); ensure_dir(cup_dir); ensure_dir(viz_dir)
+    ensure_dir(disc_dir); ensure_dir(cup_dir)
 
+    # Save predicted masks
     disc_png = disc_dir / f"{img.image_path.stem}.png"
     cup_png  = cup_dir  / f"{img.image_path.stem}.png"
     save_mask_png(disc_png, pr_disc.astype(np.uint8))
     save_mask_png(cup_png,  pr_cup.astype(np.uint8))
 
-    viz_path = viz_dir / f"{img.image_path.stem}_viz.jpg"
-    cv2.imwrite(str(viz_path), viz)
+    viz_path_str = ""  # default when not saving viz
+
+    if save_viz:
+        viz_dir = out_pad_dir / "viz"
+        ensure_dir(viz_dir)
+        # Compose compact text including Dice and CDR terms
+        cdr_txt = (
+            f"Disc Dice={d_dice:.3f} | Cup Dice={c_dice:.3f} | "
+            f"CDR pred={pred_cdr:.3f}, GT={gt_cdr:.3f}, |err|={(cdr_abs if cdr_abs is not None else math.nan):.3f}"
+            if (pred_cdr is not None and gt_cdr is not None)
+            else f"Disc Dice={d_dice:.3f} | Cup Dice={c_dice:.3f} | CDR: N/A"
+        )
+        viz = overlay_masks_and_boxes(
+            bgr, pr_disc.astype(np.uint8), pr_cup.astype(np.uint8),
+            disc_xyxy_p, cup_xyxy_p, cdr_text=cdr_txt
+        )
+        viz_path = viz_dir / f"{img.image_path.stem}_viz.jpg"
+        cv2.imwrite(str(viz_path), viz)
+        viz_path_str = str(viz_path)
 
     # Row
     row = {
@@ -378,7 +338,7 @@ def _eval_one_image_for_pad(
         "image_path": str(img.image_path),
         "pred_disc_path": str(disc_png),
         "pred_cup_path":  str(cup_png),
-        "viz_path":       str(viz_path),
+        "viz_path":       viz_path_str,  # empty if not saved
         "pad_frac": float(pad_frac),
         "disc_box": list(map(int, disc_xyxy)),
         "cup_box":  list(map(int, cup_xyxy)),
@@ -404,7 +364,7 @@ def main() -> None:
     args = _parse_args()
     ensure_dir(args.out_dir)
 
-    # Collect images via ImageFactory (consistent with train_yolo.py)
+    # Collect images via ImageFactory (consistent with train.py)
     images = _gather_images(args.data_root, args.exclude, args.subset_n, args.subset_seed)
 
     # Device & model
@@ -423,7 +383,7 @@ def main() -> None:
         print(f"[INFO] Evaluating pad={pad:.2f} on N={len(images)} images…")
         for img in images:
             try:
-                row = _eval_one_image_for_pad(msam, img, pad, out_pad_dir)
+                row = _eval_one_image_for_pad(msam, img, pad, out_pad_dir, save_viz=args.save_viz)
                 if row is not None:
                     pad_rows.append(row)
             except Exception as e:
@@ -431,8 +391,9 @@ def main() -> None:
 
         _write_csv(pad_rows, out_pad_dir / "details.csv")
 
-        # Best/Worst thumbnails
-        _copy_best_worst(pad_rows, out_pad_dir, k=10)
+        # Best/Worst thumbnails only make sense if viz were saved
+        if args.save_viz:
+            _copy_best_worst(pad_rows, out_pad_dir, k=args.topk)
 
         # Per-pad stats
         disc_dice_vals = [r["disc_dice"] for r in pad_rows if r.get("disc_dice") is not None]
@@ -473,7 +434,7 @@ def main() -> None:
     _write_csv(all_rows, args.out_dir / "details_all.csv")
     _write_csv(summary_by_pad, args.out_dir / "summary_by_pad.csv")
 
-    # Plot summary
+    # Plot summary (always saved; separate from per-image viz)
     pads = [row["pad_frac"] for row in summary_by_pad]
     metrics = {
         "disc_dice_mean": [row["disc_dice_mean"] for row in summary_by_pad],
@@ -488,7 +449,10 @@ def main() -> None:
     print(f"  metrics_vs_pad.png  → {args.out_dir / 'metrics_vs_pad.png'}")
     for pad in args.pad_fracs:
         tag = f"pad_{int(round(pad * 100)):03d}"
-        print(f"  {tag}/details.csv, {tag}/top10/, {tag}/bottom10/")
+        if args.save_viz:
+            print(f"  {tag}/details.csv, {tag}/viz/, {tag}/top10/, {tag}/bottom10/")
+        else:
+            print(f"  {tag}/details.csv")
 
 if __name__ == "__main__":
     main()

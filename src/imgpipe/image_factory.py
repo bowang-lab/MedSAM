@@ -48,7 +48,6 @@ class ImageFactory:
         if not isinstance(self.root, Path):
             self.root = Path(self.root)
         if self.auto_scan:
-            print("auto scanning")
             self.scan()
 
     def scan(self) -> None:
@@ -82,7 +81,6 @@ class ImageFactory:
                 "oc_mask": _stem_map(oc_mask_paths),
                 "od_mask": _stem_map(od_mask_paths),
             }
-        print("done scanning")
 
     # ---------------- convenience accessors ----------------
 

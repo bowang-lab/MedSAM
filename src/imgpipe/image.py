@@ -156,6 +156,25 @@ class Image:
         except KeyError as e:
             raise ValueError(f"Unsupported (component, kind)=({component}, {kind})") from e
 
+    def all_paths(self, *, drop_none: bool = False) -> Dict[str, Optional[Path]]:
+        """
+        Return a mapping of all path-bearing fields for this image instance.
+        Includes image path, YOLO label path, and any mask file paths if present.
+        """
+
+        def _mask_path(m: Optional[BinaryMaskRef]) -> Optional[Path]:
+            return getattr(m, "path", None) if m is not None else None
+
+        paths: Dict[str, Optional[Path]] = {
+            "image_path": self.image_path,
+            "yolo_label_path": self.yolo_label_path,
+            "gt_disc_mask_path": _mask_path(self.gt_disc_mask),
+            "gt_cup_mask_path": _mask_path(self.gt_cup_mask),
+            "pred_disc_mask_path": _mask_path(self.pred_disc_mask),
+            "pred_cup_mask_path": _mask_path(self.pred_cup_mask),
+        }
+        return {k: v for k, v in paths.items() if v is not None} if drop_none else paths
+
     def _box_attr_name(self, component: Structure, kind: LabelType) -> str:
         return {
             (Structure.DISC, LabelType.GT):   "gt_disc_box",
