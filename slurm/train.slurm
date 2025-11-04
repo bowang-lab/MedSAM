@@ -92,7 +92,7 @@ ARGS_TRAIN=(
   --data-root "${DATA_DIR}"
   --yolo-ds "${OUT_DIR}"
   --run-name "MultiClassV2-6616729-0"
-  --model "${REPO_DIR}/runs/MultiClassLargeV1/weights/last.pt"
+  --model "${REPO_DIR}/runs/MultiClassV2-6616729-0/weights/last.pt"
   --out-dir "${OUT_DIR}"
   --cfg "${CONFIG}"
   --device "${DEVICE}"
