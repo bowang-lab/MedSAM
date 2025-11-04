@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-# src/scripts/train_medsam.py
-# Fine-tune MedSAM (decoder-only by default) for OD/OC segmentation using box prompts.
-# - Scans datasets with ImageFactory (retaining your pipeline style)
-# - Splits into train/val/test with ratios matching your YOLO script
-# - Trains BCE+Dice on predicted masks from box prompts
-# - Saves best checkpoint and a JSON metrics file
-#
-# Requirements (Python):
-#   torch, torchvision, numpy, pillow
-#   segment-anything (pip install git+https://github.com/facebookresearch/segment-anything.git)
-# Optional for LoRA: peft (pip install peft)
+# src/scripts/finetune_medsam.py
+# Fine-tune MedSAM with robustness to imperfect YOLO boxes.
+# - Optionally loads a YOLO detector to provide imperfect boxes during training
+# - Adds translation/scale noise + padding jitter to boxes
+# - (Optional) point prompts (1 positive + K negatives) per sample
+# - Weighted BCE outside the (dilated) box to reduce spill-over
+# - Saves only trainable parts (decoder and optional LoRA) as compact checkpoints
 
 from __future__ import annotations
 
@@ -18,10 +14,10 @@ import json
 import math
 import random
 import argparse
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
-import inspect
 
 import numpy as np
 from PIL import Image as PILImage
@@ -31,35 +27,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+# Project imports
 from src.imgpipe.image_factory import ImageFactory
-# from src.imgpipe.enums import Structure  # not required in this script
 
-# Try SAM imports
+# --- SAM imports (lazy-checked) ---
 try:
     from segment_anything import sam_model_registry
-except Exception as e:
+except Exception as _sam_err:
     sam_model_registry = None
-    _SAM_IMPORT_ERR = e
+    _SAM_IMPORT_ERR = _sam_err
+
+# --- Optional YOLO imports ---
+try:
+    from ultralytics import YOLO as _YOLO
+except Exception:
+    _YOLO = None
+
 
 # =========================
-# Defaults (parallel to your YOLO script)
+# Defaults
 # =========================
 DEFAULT_DATA_ROOT = Path("/Users/carlosperez/Library/CloudStorage/OneDrive-UBC/Ipek_Carlos/GlaucomaDatasets/All_Datasets_Organized")
 DEFAULT_OUT_DIR   = Path("/Users/carlosperez/PycharmProjects/MedSAM/MEDSAM_TRAIN")
 DEFAULT_RUN_DIR   = Path("/Users/carlosperez/PycharmProjects/MedSAM/runs/runs_medsam")
-DEFAULT_MODEL     = "vit_b"  # SAM backbone key for registry; MedSAM is ViT-B
-DEFAULT_CKPT      = Path("/Users/carlosperez/PycharmProjects/MedSAM/work_dir/MedSAM/medsam_vit_b.pth")  # <- set to your MedSAM checkpoint
+DEFAULT_MODEL     = "vit_b"  # SAM backbone key for registry
+DEFAULT_CKPT      = Path("/Users/carlosperez/PycharmProjects/MedSAM/work_dir/MedSAM/medsam_vit_b.pth")
 
 DEFAULT_DEVICE: Optional[str | int] = "mps"
 DEFAULT_IMGSZ = 1024
 DEFAULT_EPOCHS = 50
 DEFAULT_BATCH = 8
-DEFAULT_WORKERS = 8
 SEED = 42
 
+# Splits (per Sample, not per image)
 TRAIN_RATIO = 0.80
 VAL_RATIO   = 0.10
 TEST_RATIO  = 0.10
+
 
 # =========================
 # Utilities
@@ -68,7 +72,6 @@ def set_global_seed(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     try:
-        import torch
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)  # type: ignore[attr-defined]
         torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
@@ -92,6 +95,7 @@ def _to_device(x: Any, device: torch.device) -> Any:
         return {k: _to_device(v, device) for k, v in x.items()}
     return x
 
+
 # =========================
 # Data adapter
 # =========================
@@ -107,13 +111,13 @@ def gather_samples_via_imagefactory(root: Path, exclude: Optional[List[str]] = N
       - image_path
       - gt_disc_mask.path
       - gt_cup_mask.path
-    Skips any item where a required on-disk mask path is missing.
+    Each disc/cup becomes a separate binary-sample.
     """
     print("[INFO] Scanning datasets with ImageFactory…")
     fac = ImageFactory(root=root, auto_scan=True)
     fac.filter_empty_masks()
-    fac.filter_datasets(exclude=["PAPILA"])
-    # fac.filter_random_subset(100)
+    if exclude:
+        fac.filter_datasets(exclude=exclude)
     images = fac.make_images()
     if not images:
         raise RuntimeError("No images available after filtering.")
@@ -146,9 +150,9 @@ def gather_samples_via_imagefactory(root: Path, exclude: Optional[List[str]] = N
     if not samples:
         raise RuntimeError("No (image, mask) pairs with valid on-disk paths. Check your serialized Image records.")
     if missing_paths:
-        print(f"[WARN] {missing_paths} mask references were present but their files were missing; skipped.")
+        print(f"[WARN] {missing_paths} mask references were present but missing on disk; skipped.")
 
-    print(f"[INFO] Formed {len(samples)} segmentation samples (disc+cup) from persisted paths.")
+    print(f"[INFO] Formed {len(samples)} segmentation samples (disc+cup).")
     return samples
 
 def split_samples(samples: List[Sample], train=0.8, val=0.1, test=0.1, seed=42) -> Tuple[List[Sample], List[Sample], List[Sample]]:
@@ -164,11 +168,12 @@ def split_samples(samples: List[Sample], train=0.8, val=0.1, test=0.1, seed=42) 
     test_s  = samples[n_train + n_val:]
     return train_s, val_s, test_s
 
+
 # =========================
-# Image/Mask preprocessing and box prompts
+# Geometry / preprocessing
 # =========================
 class LetterboxToSquare:
-    """Resize to square (size) with centered padding; also maps boxes accordingly."""
+    """Resize to square (size) with centered padding; also maps boxes and points."""
     def __init__(self, size: int = 1024):
         self.size = size
 
@@ -182,8 +187,13 @@ class LetterboxToSquare:
         pad_top  = pad_h // 2
         return scale, new_w, new_h, pad_left, pad_top
 
-    def __call__(self, img: PILImage.Image, mask: PILImage.Image, box_xyxy: np.ndarray
-                 ) -> Tuple[PILImage.Image, PILImage.Image, np.ndarray]:
+    def __call__(
+        self,
+        img: PILImage.Image,
+        mask: PILImage.Image,
+        box_xyxy: np.ndarray,
+        pts_xy: Optional[np.ndarray] = None,  # (N,2) in original coords
+    ) -> Tuple[PILImage.Image, PILImage.Image, np.ndarray, Optional[np.ndarray]]:
         w, h = img.size
         scale, new_w, new_h, pad_left, pad_top = self._compute_pad(w, h)
         # Resize
@@ -201,7 +211,13 @@ class LetterboxToSquare:
         x1 = x1 * scale + pad_left
         y1 = y1 * scale + pad_top
         box_t = np.array([x0, y0, x1, y1], dtype=np.float32)
-        return new_img, new_mask, box_t
+        # Points transform
+        pts_t = None
+        if pts_xy is not None:
+            px = pts_xy[:, 0] * scale + pad_left
+            py = pts_xy[:, 1] * scale + pad_top
+            pts_t = np.stack([px, py], axis=1).astype(np.float32)
+        return new_img, new_mask, box_t, pts_t
 
 def mask_to_tight_box(mask_np: np.ndarray) -> Optional[np.ndarray]:
     ys, xs = np.nonzero(mask_np)
@@ -250,64 +266,221 @@ def preprocess_for_sam(img_pil: PILImage.Image) -> torch.Tensor:
     x = torch.from_numpy(np.array(img_pil)).permute(2, 0, 1).float()  # RGB, 0..255
     return (x - PIXEL_MEAN) / PIXEL_STD
 
+
+# =========================
+# YOLO box provider (optional)
+# =========================
+class YOLOBoxProvider:
+    """
+    Runs a YOLO model to get disc/cup boxes per image. Caches results.
+    Expects classes: disc = yolo_disc_id, cup = yolo_cup_id.
+    """
+    def __init__(self, weights: Path, device: str = "cpu", imgsz: int = 640,
+                 yolo_disc_id: int = 0, yolo_cup_id: int = 1,
+                 conf: float = 0.05, iou: float = 0.6):
+        if _YOLO is None:
+            raise RuntimeError("Ultralytics not installed. pip install ultralytics")
+        self.model = _YOLO(str(weights))
+        self.device = device
+        self.imgsz = imgsz
+        self.disc_id = yolo_disc_id
+        self.cup_id  = yolo_cup_id
+        self.conf = conf
+        self.iou = iou
+        self._cache: Dict[str, Dict[str, Optional[np.ndarray]]] = {}
+
+    def _predict_one(self, image_path: Path) -> Dict[str, Optional[np.ndarray]]:
+        res = self.model.predict(
+            source=str(image_path),
+            device=self.device,
+            imgsz=self.imgsz,
+            conf=self.conf,
+            iou=self.iou,
+            verbose=False
+        )
+        if not res:
+            return {"disc": None, "cup": None}
+        r = res[0]
+        if r.boxes is None or len(r.boxes) == 0:
+            return {"disc": None, "cup": None}
+
+        xyxy = r.boxes.xyxy.cpu().numpy()  # (N,4) in original pixels
+        cls  = r.boxes.cls.cpu().numpy().astype(int)  # (N,)
+        conf = r.boxes.conf.cpu().numpy()  # (N,)
+
+        out = {"disc": None, "cup": None}
+        for target, cid in (("disc", self.disc_id), ("cup", self.cup_id)):
+            idx = np.where(cls == cid)[0]
+            if idx.size == 0:
+                out[target] = None
+            else:
+                # pick highest confidence
+                j = idx[np.argmax(conf[idx])]
+                out[target] = xyxy[j].astype(np.float32)  # [x0,y0,x1,y1]
+        return out
+
+    def get_box(self, image_path: Path, structure: str) -> Optional[np.ndarray]:
+        key = str(image_path)
+        if key not in self._cache:
+            self._cache[key] = self._predict_one(image_path)
+        return self._cache[key].get(structure, None)
+
+
 # =========================
 # Dataset
 # =========================
 class MedSAMDataset(Dataset):
-    def __init__(self, samples: List[Sample], img_size: int = 1024, jitter_pad: float = 0.3, train: bool = True):
+    def __init__(
+        self,
+        samples: List[Sample],
+        img_size: int = 1024,
+        jitter_pad: float = 0.3,
+        jitter_trans: float = 0.05,
+        jitter_scale: float = 0.10,
+        train: bool = True,
+        use_points: bool = False,
+        neg_points: int = 3,
+        yolo_provider: Optional[YOLOBoxProvider] = None,
+        use_det_prob: float = 0.5,
+    ):
         self.samples = samples
         self.img_size = img_size
         self.letterbox = LetterboxToSquare(img_size)
         self.jitter_pad = jitter_pad
+        self.jitter_trans = jitter_trans
+        self.jitter_scale = jitter_scale
         self.train = train
+        self.use_points = use_points
+        self.neg_points = max(0, int(neg_points))
+        self.yolo = yolo_provider
+        self.use_det_prob = use_det_prob
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    @staticmethod
+    def _sample_points(mask_np: np.ndarray, k_neg: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (points Nx2, labels Nx1) in original coordinates. 1 pos + k neg."""
+        ys, xs = np.nonzero(mask_np)
+        if len(xs) == 0:
+            # degenerate: return negatives only (all zeros)
+            H, W = mask_np.shape
+            pts = []
+            while len(pts) < max(1, k_neg):
+                x = np.random.randint(W); y = np.random.randint(H)
+                pts.append([x, y])
+            labels = np.zeros((len(pts), 1), dtype=np.float32)
+            return np.asarray(pts, np.float32), labels
+
+        # one positive
+        i = np.random.randint(len(xs))
+        pos = np.array([[xs[i], ys[i]]], dtype=np.float32)
+        # negatives
+        H, W = mask_np.shape
+        neg = []
+        while len(neg) < k_neg:
+            x = np.random.randint(W); y = np.random.randint(H)
+            if mask_np[y, x] == 0:
+                neg.append([x, y])
+        neg = np.asarray(neg, dtype=np.float32) if k_neg > 0 else np.zeros((0,2), np.float32)
+        pts = np.vstack([pos, neg]) if k_neg > 0 else pos
+        labels = np.array([1] + [0]*k_neg, dtype=np.float32).reshape(-1,1) if k_neg > 0 else np.array([[1.0]], dtype=np.float32)
+        return pts, labels
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         s = self.samples[idx]
         img = PILImage.open(s.image_path).convert("RGB")
         m   = PILImage.open(s.mask_path).convert("L")
 
-        # tight box from original mask
+        W, H = img.size
         mask_np = np.array(m, dtype=np.uint8)
-        box = mask_to_tight_box(mask_np)
-        if box is None:
-            # rare, skip or synthesize minimal box
-            box = np.array([0, 0, img.size[0]-1, img.size[1]-1], dtype=np.float32)
 
-        # jitter padding during training
+        # Base box: GT-tight
+        base_box = mask_to_tight_box(mask_np)
+        if base_box is None:
+            base_box = np.array([0, 0, W - 1, H - 1], dtype=np.float32)
 
-        box_p = pad_box(box, pad_frac, img.size[0], img.size[1])
-        box_p = jitter_box_xyxy(box_p, img.size[0], img.size[1], tr=0.05, sc=0.10)
+        # Optionally replace with detector box (simulating real inference)
+        if self.train and (self.yolo is not None) and (random.random() < self.use_det_prob):
+            det = self.yolo.get_box(s.image_path, s.structure)
+            if det is not None:
+                # Clip to image bounds just in case
+                x0,y0,x1,y1 = det
+                base_box = np.array([
+                    max(0.0, x0), max(0.0, y0),
+                    min(float(W-1), x1), min(float(H-1), y1)
+                ], dtype=np.float32)
 
-        # resize+pad to square + map box
-        img_r, mask_r, box_t = self.letterbox(img, m, box_p)
+        # Noise: pad + translation/scale (curriculum-friendly if you reduce early)
+        pad_frac = random.uniform(0.0, self.jitter_pad) if self.train else 0.0
+        box_p = pad_box(base_box, pad_frac, W, H)
+        if self.train:
+            box_p = jitter_box_xyxy(box_p, W, H, tr=self.jitter_trans, sc=self.jitter_scale)
 
-        # tensors
+        # Points (in original coords) → transformed with letterbox
+        pts_xy = lbl = None
+        if self.use_points:
+            pts_xy, lbl = self._sample_points(mask_np, k_neg=self.neg_points)
+
+        # Resize/pad to square + map box/points
+        img_r, mask_r, box_t, pts_t = self.letterbox(img, m, box_p, pts_xy)
+
+        # Tensors
         x = preprocess_for_sam(img_r)
-        # BEFORE (raises TypeError: Image > int)
-        # y = torch.from_numpy(np.array(mask_r > 0, dtype=np.float32))[None, :, :]  # (1,H,W)
-
-        # AFTER (convert to array first, then threshold)
-        mask_arr = np.array(mask_r, dtype=np.uint8)  # (H,W) 0..255
+        mask_arr = np.array(mask_r, dtype=np.uint8)
         y = torch.from_numpy((mask_arr > 0).astype(np.float32)).unsqueeze(0)  # (1,H,W)
-
         b = torch.from_numpy(box_t.astype(np.float32))  # (4,)
-        return {"image": x, "mask": y, "box": b}
+
+        result: Dict[str, torch.Tensor] = {"image": x, "mask": y, "box": b}
+        if self.use_points and (pts_t is not None) and (lbl is not None):
+            result["points"] = torch.from_numpy(pts_t.astype(np.float32))            # (1+K,2)
+            result["labels"] = torch.from_numpy(lbl.astype(np.float32)).squeeze(1)   # (1+K,)
+        return result
+
 
 # =========================
 # Losses / Metrics
 # =========================
-class BCEDice(nn.Module):
-    def __init__(self, bce_weight: float = 0.5):
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
-        self.bce_weight = bce_weight
+def outside_box_weight(H, W, box_xyxy, lam=0.3, dilate=0.05):
+    """Weight map >1 outside a slightly dilated box (penalize spill)."""
+    x0,y0,x1,y1 = box_xyxy
+    # dilate in pixels proportional to box size
+    dx = (x1-x0) * dilate
+    dy = (y1-y0) * dilate
+    x0 = max(0, int(x0 - dx)); y0 = max(0, int(y0 - dy))
+    x1 = min(W-1, int(x1 + dx)); y1 = min(H-1, int(y1 + dy))
+    w = np.ones((H, W), dtype=np.float32)
+    if y0 > 0: w[:y0, :] += lam
+    if y1 < H-1: w[y1+1:, :] += lam
+    if x0 > 0: w[:, :x0] += lam
+    if x1 < W-1: w[:, x1+1:] += lam
+    return torch.from_numpy(w)
 
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # logits: (B,1,H,W), target: (B,1,H,W) in {0,1}
-        bce = self.bce(logits, target)
+class BCEDiceWeighted(nn.Module):
+    def __init__(self, bce_weight=0.5, spill_lam=0.3, spill_dilate=0.05):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.bce_weight = bce_weight
+        self.spill_lam = spill_lam
+        self.spill_dilate = spill_dilate
+
+    def forward(self, logits, target, boxes=None):
+        # logits: (B,1,H,W), target: (B,1,H,W), boxes: (B,4) in 1024 coords
+        bce = self.bce(logits, target)  # (B,1,H,W)
+        if boxes is not None:
+            B, _, H, W = logits.shape
+            Wmaps = []
+            for i in range(B):
+                wmap = outside_box_weight(
+                    H, W, boxes[i].detach().cpu().numpy(),
+                    lam=self.spill_lam, dilate=self.spill_dilate
+                )
+                Wmaps.append(wmap)
+            Wt = torch.stack(Wmaps, 0).to(logits.device).unsqueeze(1)  # (B,1,H,W)
+            bce = (bce * Wt).mean()
+        else:
+            bce = bce.mean()
+
         prob = torch.sigmoid(logits)
         num = 2 * (prob * target).sum(dim=(2,3)) + 1e-6
         den = (prob.pow(2) + target.pow(2)).sum(dim=(2,3)) + 1e-6
@@ -323,6 +496,7 @@ def dice_coef(prob: torch.Tensor, target: torch.Tensor, thresh: float = 0.5) -> 
         return 1.0
     return (2.0 * inter) / den
 
+
 # =========================
 # Model wrapper
 # =========================
@@ -336,7 +510,7 @@ class MedSAMFinetuner(nn.Module):
         if not Path(checkpoint).exists():
             raise FileNotFoundError(f"MedSAM checkpoint not found: {checkpoint}")
         self.sam = sam_model_registry[sam_type](checkpoint=str(checkpoint))
-        self.sam.eval()  # start eval; we'll unfreeze parts below
+        self.sam.eval()  # start in eval; we selectively unfreeze below
 
         # Freeze encoders if requested
         for p in self.sam.image_encoder.parameters():
@@ -348,49 +522,52 @@ class MedSAMFinetuner(nn.Module):
         for p in self.sam.mask_decoder.parameters():
             p.requires_grad = True
 
-        # Optional LoRA on image encoder attention projections (requires peft)
+        # Optional LoRA on image encoder (requires peft)
         self._using_lora = False
         if use_lora:
             try:
                 from peft import LoraConfig, get_peft_model
             except Exception as e:
                 raise RuntimeError(f"[ERR] --lora requested but 'peft' not available: {e!r}")
-            # Identify attention projection module names heuristically
-            lora_targets = []
-            for name, module in self.sam.image_encoder.named_modules():
-                if isinstance(module, nn.Linear) and (name.endswith(".q_proj") or name.endswith(".k_proj") or name.endswith(".v_proj") or name.endswith(".proj")):
-                    lora_targets.append(name)
-            if not lora_targets:
-                # Fallback: all Linear layers in image encoder
-                lora_targets = [n for n, m in self.sam.image_encoder.named_modules() if isinstance(m, nn.Linear)]
-            peft_cfg = LoraConfig(r=lora_r, lora_alpha=2*lora_r, target_modules=lora_targets, lora_dropout=0.0, bias="none", task_type="FEATURE_EXTRACTION")
+            # Heuristic target selection: all Linear layers in image encoder
+            lora_targets = [n for n, m in self.sam.image_encoder.named_modules() if isinstance(m, nn.Linear)]
+            peft_cfg = LoraConfig(
+                r=lora_r, lora_alpha=2*lora_r, target_modules=lora_targets,
+                lora_dropout=0.0, bias="none", task_type="FEATURE_EXTRACTION"
+            )
             self.sam.image_encoder = get_peft_model(self.sam.image_encoder, peft_cfg)
-            # Keep LoRA trainable even if base is frozen
+            # Keep LoRA trainable
             for p in self.sam.image_encoder.parameters():
                 p.requires_grad = True
             self._using_lora = True
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass that returns (logits_1024, iou_pred).
+        Returns (logits_1024, iou_pred).
         batch keys: image (B,3,1024,1024), mask (B,1,1024,1024), box (B,4)
+                    optional: points (B,N,2) and labels (B,N)
         """
-        x = batch["image"]  # (B,3,1024,1024) SAM-normalized
-        b = batch["box"]  # (B,4) in 1024 coords
+        x = batch["image"]  # (B,3,1024,1024)
+        b = batch["box"]    # (B,4)
         B = x.shape[0]
 
         # Encode image
         image_embeddings = self.sam.image_encoder(x)  # (B,256,64,64)
-        dense_pe = self.sam.prompt_encoder.get_dense_pe()  # positional enc
+        dense_pe = self.sam.prompt_encoder.get_dense_pe()
 
-        # Prepare box prompts
+        # Prepare prompts
         boxes = b[:, None, :]  # (B,1,4)
-        sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(
-            points=None, boxes=boxes, masks=None
-        )
+        pe_kwargs: Dict[str, Any] = dict(points=None, boxes=boxes, masks=None)
 
-        # Some SAM builds accept an optional prior mask under different names.
-        # Build kwargs compatibly.
+        if ("points" in batch) and ("labels" in batch):
+            pts = batch["points"]  # (B,N,2)
+            lbs = batch["labels"]  # (B,N)
+            # SAM expects Tuple[Tensor, Tensor] with shapes (B,N,2) and (B,N)
+            pe_kwargs["points"] = (pts, lbs)
+
+        sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(**pe_kwargs)
+
+        # Determine kwargs for mask decoder compatibility
         md = self.sam.mask_decoder
         sig = inspect.signature(md.forward)
         params = set(sig.parameters.keys())
@@ -403,7 +580,7 @@ class MedSAMFinetuner(nn.Module):
             multimask_output=False,
         )
 
-        # If a prior/low-res mask is supported, pass a zero prior.
+        # If a prior/low-res mask is supported, pass zeros
         zero_prior = torch.zeros((B, 1, 256, 256), device=x.device, dtype=image_embeddings.dtype)
         if "mask_input" in params:
             md_kwargs["mask_input"] = zero_prior
@@ -411,16 +588,14 @@ class MedSAMFinetuner(nn.Module):
             md_kwargs["low_res_mask"] = zero_prior
         elif "low_res_masks" in params:
             md_kwargs["low_res_masks"] = zero_prior
-        # If "high_res_features" exists in the signature, it is optional and defaults to None; omit safely.
 
         low_res_masks, iou_pred = md(**md_kwargs)
-
-        # Upsample to 1024 for loss
         logits_1024 = F.interpolate(
             low_res_masks, size=(x.shape[2], x.shape[3]),
             mode="bilinear", align_corners=False
         )
         return logits_1024, iou_pred
+
 
 # =========================
 # Training / Eval loops
@@ -434,45 +609,43 @@ def run_one_epoch(model: MedSAMFinetuner, loader: DataLoader, optim: torch.optim
     for batch in loader:
         batch = _to_device(batch, device)
         with torch.set_grad_enabled(train):
-            logits, _ = model(batch)  # (B,1,1024,1024)
-            loss = loss_fn(logits, batch["mask"])
+            logits, _ = model(batch)
+            # Pass boxes for spill penalty
+            loss = loss_fn(logits, batch["mask"], boxes=batch.get("box"))
             if train:
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
                 optim.step()
             with torch.no_grad():
                 prob = torch.sigmoid(logits)
-                for i in range(prob.shape[0]):
-                    total_dice += dice_coef(prob[i], batch["mask"][i])
-                    n += 1
-            total_loss += loss.item() * batch["mask"].shape[0]
+                total_dice += dice_coef(prob, batch["mask"])
+                n += 1
+            total_loss += loss.item()
     return {"loss": total_loss / max(1, n), "dice": total_dice / max(1, n)}
 
+@torch.no_grad()
 def evaluate(model: MedSAMFinetuner, loader: DataLoader, device: torch.device) -> Dict[str, float]:
     model.eval()
     total_dice = 0.0
     n = 0
-    with torch.no_grad():
-        for batch in loader:
-            batch = _to_device(batch, device)
-            logits, _ = model(batch)
-            prob = torch.sigmoid(logits)
-            for i in range(prob.shape[0]):
-                total_dice += dice_coef(prob[i], batch["mask"][i])
-                n += 1
+    for batch in loader:
+        batch = _to_device(batch, device)
+        logits, _ = model(batch)
+        prob = torch.sigmoid(logits)
+        total_dice += dice_coef(prob, batch["mask"])
+        n += 1
     return {"dice": total_dice / max(1, n)}
+
 
 # =========================
 # I/O helpers
 # =========================
 def save_checkpoint(model: MedSAMFinetuner, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Save only trainable parts to keep it small
     state = {
         "mask_decoder": model.sam.mask_decoder.state_dict(),
         "using_lora": model._using_lora,
     }
-    # If LoRA used, also save image_encoder (PEFT) adapters
     if model._using_lora:
         state["image_encoder"] = model.sam.image_encoder.state_dict()
     torch.save(state, str(path))
@@ -483,48 +656,67 @@ def load_trainable_parts(model: MedSAMFinetuner, path: Path) -> None:
     if state.get("using_lora", False) and model._using_lora and "image_encoder" in state:
         model.sam.image_encoder.load_state_dict(state["image_encoder"], strict=False)
 
+
 # =========================
 # CLI
 # =========================
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fine-tune MedSAM on OD/OC masks using box prompts.")
+    p = argparse.ArgumentParser(description="Fine-tune MedSAM with robustness to imperfect YOLO boxes.")
+
     # Modes
     p.add_argument("--train", action="store_true", help="Enable training mode.")
     p.add_argument("--test-weights", type=Path, dest="test_weights", help="Path to a saved trainable checkpoint (*.pth).")
 
     # Paths/config
-    p.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT, help=f"Root datasets (default: {DEFAULT_DATA_ROOT})")
-    p.add_argument("--out-dir",   type=Path, default=DEFAULT_OUT_DIR,   help=f"Output dir for splits/metrics (default: {DEFAULT_OUT_DIR})")
-    p.add_argument("--run-dir",   type=Path, default=DEFAULT_RUN_DIR,   help=f"Runs dir (default: {DEFAULT_RUN_DIR})")
-    p.add_argument("--model",     type=str,  default=DEFAULT_MODEL,     help=f"SAM backbone key (default: {DEFAULT_MODEL})")
-    p.add_argument("--ckpt",      type=Path, default=DEFAULT_CKPT,      help=f"MedSAM ViT-B checkpoint (.pth)")
+    p.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    p.add_argument("--out-dir",   type=Path, default=DEFAULT_OUT_DIR)
+    p.add_argument("--run-dir",   type=Path, default=DEFAULT_RUN_DIR)
+    p.add_argument("--model",     type=str,  default=DEFAULT_MODEL)
+    p.add_argument("--ckpt",      type=Path, default=DEFAULT_CKPT)
 
     # Training knobs
-    p.add_argument("--device", type=str, default=str(DEFAULT_DEVICE), help=f"'cpu', 'mps', 'cuda:0', etc. (default: {DEFAULT_DEVICE})")
-    p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,      help=f"Epochs (default: {DEFAULT_EPOCHS})")
-    p.add_argument("--batch",  type=int, default=DEFAULT_BATCH,       help=f"Batch size (default: {DEFAULT_BATCH})")
-    p.add_argument("--imgsz",  type=int, default=DEFAULT_IMGSZ,       help=f"Image size (default: {DEFAULT_IMGSZ})")
-    p.add_argument("--lr",     type=float, default=1e-4,              help="Learning rate (default: 1e-4)")
-    p.add_argument("--wd",     type=float, default=1e-4,              help="Weight decay (default: 1e-4)")
+    p.add_argument("--device", type=str, default=str(DEFAULT_DEVICE))
+    p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    p.add_argument("--batch",  type=int, default=DEFAULT_BATCH)
+    p.add_argument("--imgsz",  type=int, default=DEFAULT_IMGSZ)
+    p.add_argument("--lr",     type=float, default=1e-4)
+    p.add_argument("--wd",     type=float, default=1e-4)
     p.add_argument("--resume", type=Path, help="Resume from a trainable checkpoint (*.pth).")
+    p.add_argument("--run-name", type=str, help="Run name for directory naming.")
 
-    # Prompt jitter
-    p.add_argument("--pad-jitter", type=float, default=0.3, help="Random box padding fraction during training (default: 0.3)")
+    # Prompt jitter / noise
+    p.add_argument("--pad-jitter", type=float, default=0.30, help="Random box padding fraction (0..).")
+    p.add_argument("--box-trans",  type=float, default=0.05, help="±translation as fraction of box width/height.")
+    p.add_argument("--box-scale",  type=float, default=0.10, help="±isotropic scale as fraction of box size.")
+
+    # Points
+    p.add_argument("--use-points", action="store_true", help="Include 1 positive + K negative points as prompts.")
+    p.add_argument("--neg-points", type=int, default=3, help="Number of negative points per sample when --use-points.")
+
+    # Spill penalty
+    p.add_argument("--spill-lam",    type=float, default=0.30, help="Penalty weight outside box region.")
+    p.add_argument("--spill-dilate", type=float, default=0.05, help="Relative dilation of the box before penalizing.")
 
     # Freezing / LoRA
     p.add_argument("--unfreeze-encoders", action="store_true", help="Unfreeze image+prompt encoders (full finetune).")
     p.add_argument("--lora", action="store_true", help="Enable LoRA adapters on image encoder.")
-    p.add_argument("--lora-r", type=int, default=8, help="LoRA rank (default: 8)")
+    p.add_argument("--lora-r", type=int, default=8, help="LoRA rank.")
 
     # Splits
     p.add_argument("--train-ratio", type=float, default=TRAIN_RATIO)
     p.add_argument("--val-ratio",   type=float, default=VAL_RATIO)
     p.add_argument("--test-ratio",  type=float, default=TEST_RATIO)
 
-    # Run naming
-    p.add_argument("--run-name", type=str, help="Run name (for directory naming).")
+    # YOLO integration
+    p.add_argument("--yolo-weights", type=Path, help="Path to YOLO *.pt weights to sample detector boxes.")
+    p.add_argument("--yolo-device",  type=str, help="Device for YOLO (defaults to --device).")
+    p.add_argument("--yolo-imgsz",   type=int, default=640)
+    p.add_argument("--yolo-disc-id", type=int, default=0)
+    p.add_argument("--yolo-cup-id",  type=int, default=1)
+    p.add_argument("--use-det-prob", type=float, default=0.50, help="Probability of using detector box (vs GT box) in training.")
 
     return p.parse_args()
+
 
 # =========================
 # Main
@@ -546,20 +738,66 @@ def main():
     print(f"[INFO] BATCH     = {args.batch}")
     print(f"[INFO] IMGSZ     = {args.imgsz}")
     print(f"[INFO] MODES     = train={args.train}, test={'yes' if args.test_weights else 'no'}")
+    if args.yolo_weights:
+        print(f"[INFO] YOLO      = {args.yolo_weights} (use_det_prob={args.use_det_prob:.2f})")
 
-    # Gather samples strictly from persisted paths
+    # Build samples
     samples = gather_samples_via_imagefactory(args.data_root, exclude=["PAPILA"])
     train_s, val_s, test_s = split_samples(samples, args.train_ratio, args.val_ratio, args.test_ratio, SEED)
     print(f"[INFO] Split sizes -> train={len(train_s)} val={len(val_s)} test={len(test_s)}")
 
-    # Datasets/Loaders
-    ds_train = MedSAMDataset(train_s, img_size=args.imgsz, jitter_pad=args.pad_jitter, train=True)
-    ds_val   = MedSAMDataset(val_s,   img_size=args.imgsz, jitter_pad=0.0,           train=False)
-    ds_test  = MedSAMDataset(test_s,  img_size=args.imgsz, jitter_pad=0.0,           train=False)
+    # YOLO provider (optional)
+    yolo_provider: Optional[YOLOBoxProvider] = None
+    if args.yolo_weights:
+        yolo_dev = args.yolo_device or args.device
+        yolo_provider = YOLOBoxProvider(
+            weights=args.yolo_weights,
+            device=yolo_dev,
+            imgsz=args.yolo_imgsz,
+            yolo_disc_id=args.yolo_disc_id,
+            yolo_cup_id=args.yolo_cup_id
+        )
 
-    dl_train = DataLoader(ds_train, batch_size=args.batch, shuffle=True,  num_workers=DEFAULT_WORKERS, pin_memory=True, drop_last=False)
-    dl_val   = DataLoader(ds_val,   batch_size=max(1, args.batch//2), shuffle=False, num_workers=DEFAULT_WORKERS, pin_memory=True)
-    dl_test  = DataLoader(ds_test,  batch_size=max(1, args.batch//2), shuffle=False, num_workers=DEFAULT_WORKERS, pin_memory=True)
+    # Datasets
+    ds_train = MedSAMDataset(
+        train_s,
+        img_size=args.imgsz,
+        jitter_pad=args.pad_jitter,
+        jitter_trans=args.box_trans,
+        jitter_scale=args.box_scale,
+        train=True,
+        use_points=args.use_points,
+        neg_points=args.neg_points,
+        yolo_provider=yolo_provider,
+        use_det_prob=args.use_det_prob,
+    )
+    ds_val = MedSAMDataset(
+        val_s,
+        img_size=args.imgsz,
+        jitter_pad=0.0,
+        jitter_trans=0.0,
+        jitter_scale=0.0,
+        train=False,
+        use_points=False,
+        yolo_provider=None,
+        use_det_prob=0.0,
+    )
+    ds_test = MedSAMDataset(
+        test_s,
+        img_size=args.imgsz,
+        jitter_pad=0.0,
+        jitter_trans=0.0,
+        jitter_scale=0.0,
+        train=False,
+        use_points=False,
+        yolo_provider=None,
+        use_det_prob=0.0,
+    )
+
+    pin_mem = (device.type != "mps")  # avoid pin_memory warnings on MPS
+    dl_train = DataLoader(ds_train, batch_size=args.batch, shuffle=True,  num_workers=4, pin_memory=pin_mem, drop_last=False)
+    dl_val   = DataLoader(ds_val,   batch_size=max(1, args.batch//2), shuffle=False, num_workers=2, pin_memory=pin_mem)
+    dl_test  = DataLoader(ds_test,  batch_size=max(1, args.batch//2), shuffle=False, num_workers=2, pin_memory=pin_mem)
 
     # Model
     model = MedSAMFinetuner(
@@ -570,12 +808,12 @@ def main():
         lora_r=args.lora_r,
     ).to(device)
 
-    # Optimizer
+    # Optimizer and loss
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.wd)
-    loss_fn = BCEDice(bce_weight=0.5)
+    loss_fn = BCEDiceWeighted(bce_weight=0.5, spill_lam=args.spill_lam, spill_dilate=args.spill_dilate)
 
-    # Optionally resume trainable parts
+    # Paths
     run_name = args.run_name or "MedSAMTrain"
     run_path = Path(args.run_dir) / run_name
     weights_dir = run_path / "weights"
@@ -584,6 +822,7 @@ def main():
     last_path = weights_dir / "last.pth"
     weights_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resume
     if args.resume:
         print(f"[INFO] Resuming from: {args.resume}")
         load_trainable_parts(model, args.resume)
@@ -606,7 +845,7 @@ def main():
             # Save last
             save_checkpoint(model, last_path)
 
-            # Save best on val dice
+            # Save best (val dice)
             if va["dice"] > best_val:
                 best_val = va["dice"]
                 save_checkpoint(model, best_path)
@@ -624,7 +863,6 @@ def main():
         load_trainable_parts(model, test_ckpt)
         te = evaluate(model, dl_test, device)
         print(f"[OK] Test Dice={te['dice']:.4f}")
-        # append to metrics
         try:
             if metrics_path.exists():
                 with open(metrics_path, "r") as f:
@@ -638,6 +876,7 @@ def main():
             print(f"[WARN] Could not write test metrics: {e!r}")
     elif not args.train:
         print("[WARN] No mode selected (use --train and/or --test-weights).")
+
 
 if __name__ == "__main__":
     main()
