@@ -91,7 +91,7 @@ ARGS_TRAIN=(
   --run-dir "${REPO_DIR}/runs"
   --data-root "${DATA_DIR}"
   --yolo-ds "${OUT_DIR}"
-  --run-name "MultiClassLargeV1"
+  --run-name "MultiClassV2-6616729-0"
   --model "${REPO_DIR}/runs/MultiClassLargeV1/weights/last.pt"
   --out-dir "${OUT_DIR}"
   --cfg "${CONFIG}"
@@ -134,7 +134,7 @@ cd "${REPO_DIR}"
 
 case "${MODE}" in
   train)
-    srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TRAIN[@]}" --run-name "MultiClassV2-${SLURM_JOB_ID:-na}-${TASK_ID}"
+    srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TRAIN[@]}" "
     ;;
   tune)
     srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TUNE[@]}"
