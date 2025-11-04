@@ -134,7 +134,7 @@ cd "${REPO_DIR}"
 
 case "${MODE}" in
   train)
-    srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TRAIN[@]}" "
+    srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TRAIN[@]}"
     ;;
   tune)
     srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TUNE[@]}"
