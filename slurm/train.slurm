@@ -82,6 +82,8 @@ echo "[INFO] Selected MODE=${MODE}"
 # - You can override any flag at call time by adding it at the end of the srun line.
 
 #  --model "${WEIGHTS_LOCAL}"
+#  --model "${REPO_DIR}/runs/MultiClassLarge/weights/last.pt"
+
 
 ARGS_TRAIN=(
   --train
@@ -89,8 +91,8 @@ ARGS_TRAIN=(
   --run-dir "${REPO_DIR}/runs"
   --data-root "${DATA_DIR}"
   --yolo-ds "${OUT_DIR}"
-  --run-name "MultiClassLarge"
-  --model "${REPO_DIR}/runs/MultiClassLarge/weights/last.pt"
+  --run-name "MultiClassLargeV1"
+  --model "${WEIGHTS_LOCAL}"
   --out-dir "${OUT_DIR}"
   --cfg "${CONFIG}"
   --device "${DEVICE}"

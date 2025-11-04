@@ -383,7 +383,7 @@ class DetectionValidator(BaseValidator):
             stats[f"metrics/mIoU/{name}"] = round(float(per_class_iou[i]), 6)
 
         # ---------- Define the optimization target ----------
-        # stats["fitness"] = stats["metrics/Dice@weighted"]  # tuner/trainer will maximize this
+        stats["fitness"] = stats["metrics/Dice@weighted"]  # tuner/trainer will maximize this
 
         return stats
 
