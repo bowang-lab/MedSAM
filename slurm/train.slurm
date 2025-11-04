@@ -87,11 +87,12 @@ echo "[INFO] Selected MODE=${MODE}"
 
 ARGS_TRAIN=(
   --train
+  --resume
   --run-dir "${REPO_DIR}/runs"
   --data-root "${DATA_DIR}"
   --yolo-ds "${OUT_DIR}"
   --run-name "MultiClassLargeV1"
-  --model "${WEIGHTS_LOCAL}"
+  --model "${REPO_DIR}/runs/MultiClassLargeV1/weights/last.pt"
   --out-dir "${OUT_DIR}"
   --cfg "${CONFIG}"
   --device "${DEVICE}"

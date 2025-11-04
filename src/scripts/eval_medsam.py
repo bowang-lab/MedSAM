@@ -58,7 +58,7 @@ PAD_DEFAULTS = [0.00, 0.05, 0.10, 0.20, 0.30]
 
 DEFAULT_DATA_ROOT = Path("/Users/carlosperez/Library/CloudStorage/OneDrive-UBC/Ipek_Carlos/GlaucomaDatasets/All_Datasets_Organized")
 DEFAULT_OUT_DIR   = Path("/Users/carlosperez/PycharmProjects/MedSAM/EVAL")
-DEFAULT_MEDSAM_CKPT = "/Users/carlosperez/PycharmProjects/MedSAM/work_dir/MedSAM/medsam_vit_b.pth"
+DEFAULT_MEDSAM_CKPT = "/Users/carlosperez/PycharmProjects/MedSAM/work_dir/MedSAM/medsam_updated.pth"
 
 # =============================
 # Small helpers
@@ -227,8 +227,9 @@ def _gather_images(data_root: Path, exclude: List[str], subset_n: int, subset_se
     print("[INFO] Scanning datasets…")
     fac = ImageFactory(root=data_root, auto_scan=True)
     fac.filter_empty_masks()
-    if exclude:
-        fac.filter_datasets(exclude=exclude)
+    # if exclude:
+    #     fac.filter_datasets(exclude=exclude)
+    fac.filter_datasets(include=["PAPILA"])
     images: List[Image] = fac.make_images()
     if not images:
         raise RuntimeError("No images with both disc/cup masks found.")

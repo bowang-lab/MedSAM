@@ -223,6 +223,25 @@ def pad_box(box: np.ndarray, pad_frac: float, img_w: int, img_h: int) -> np.ndar
     yy1 = min(float(img_h - 1), y1 + pad_y)
     return np.array([xx0, yy0, xx1, yy1], dtype=np.float32)
 
+def jitter_box_xyxy(box, img_w, img_h, tr=0.05, sc=0.10):
+    # tr: max ±5% translation; sc: max ±10% scale change
+    x0,y0,x1,y1 = box
+    w = max(1.0, x1-x0); h = max(1.0, y1-y0)
+    cx = (x0+x1)/2; cy = (y0+y1)/2
+
+    # random translation
+    dx = (2*random.random()-1) * tr * w
+    dy = (2*random.random()-1) * tr * h
+    cx += dx; cy += dy
+
+    # random isotropic scaling
+    s = 1.0 + (2*random.random()-1) * sc
+    nw = max(1.0, w * s); nh = max(1.0, h * s)
+
+    nx0 = max(0.0, cx - nw/2); ny0 = max(0.0, cy - nh/2)
+    nx1 = min(float(img_w-1), cx + nw/2); ny1 = min(float(img_h-1), cy + nh/2)
+    return np.array([nx0, ny0, nx1, ny1], dtype=np.float32)
+
 PIXEL_MEAN = torch.tensor([123.675, 116.280, 103.530]).view(3, 1, 1)
 PIXEL_STD  = torch.tensor([58.395, 57.120, 57.375]).view(3, 1, 1)
 
@@ -258,8 +277,9 @@ class MedSAMDataset(Dataset):
             box = np.array([0, 0, img.size[0]-1, img.size[1]-1], dtype=np.float32)
 
         # jitter padding during training
-        pad_frac = random.uniform(0.0, self.jitter_pad) if self.train else 0.0
+
         box_p = pad_box(box, pad_frac, img.size[0], img.size[1])
+        box_p = jitter_box_xyxy(box_p, img.size[0], img.size[1], tr=0.05, sc=0.10)
 
         # resize+pad to square + map box
         img_r, mask_r, box_t = self.letterbox(img, m, box_p)
