@@ -133,7 +133,7 @@ cd "${REPO_DIR}"
 
 case "${MODE}" in
   train)
-    srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TRAIN[@]}" --run-name "Train-${SLURM_JOB_ID:-na}-${TASK_ID}"
+    srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TRAIN[@]}" --run-name "MultiClassV2-${SLURM_JOB_ID:-na}-${TASK_ID}"
     ;;
   tune)
     srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TUNE[@]}"

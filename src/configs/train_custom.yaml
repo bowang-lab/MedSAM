@@ -91,11 +91,11 @@ workspace:            # (float, optional) engine (TensorRT) only; workspace size
 nms: False            # (bool) fuse NMS into exported model when backend supports; if True, conf/iou apply (agnostic_nms except coreml)
 
 # Hyperparameters ------------------------------------------------------------------------------------------------------
-lr0: 0.01             # (float) initial learning rate (SGD=1e-2, Adam/AdamW=1e-3)
-lrf: 0.01             # (float) final LR fraction; final LR = lr0 * lrf
-momentum: 0.937       # (float) SGD momentum or Adam beta1
+lr0: 0.005            # (float) initial learning rate (SGD=1e-2, Adam/AdamW=1e-3)
+lrf: 0.1             # (float) final LR fraction; final LR = lr0 * lrf
+momentum: 0.8714      # (float) SGD momentum or Adam beta1
 weight_decay: 0.0005  # (float) weight decay (L2 regularization)
-warmup_epochs: 3.0    # (float) warmup epochs (fractions allowed)
+warmup_epochs: 1.74932    # (float) warmup epochs (fractions allowed)
 warmup_momentum: 0.8  # (float) initial momentum during warmup
 warmup_bias_lr: 0.1   # (float) bias learning rate during warmup
 box: 10              # (float) box loss gain
@@ -107,21 +107,21 @@ nbs: 64               # (int) nominal batch size used for loss normalization
 hsv_h: 0.015          # (float) HSV hue augmentation fraction
 hsv_s: 0.7            # (float) HSV saturation augmentation fraction
 hsv_v: 0.8            # (float) HSV value (brightness) augmentation fraction
-degrees: 10.0         # (float) rotation degrees (+/-)
-translate: 0.4        # (float) translation fraction (+/-)
+degrees: 0         # (float) rotation degrees (+/-)
+translate: 0.08043        # (float) translation fraction (+/-)
 scale: 1.0            # (float) scale gain (+/-)
-shear: 1.0            # (float) shear degrees (+/-)
+shear: 0            # (float) shear degrees (+/-)
 perspective: 0.001      # (float) perspective fraction (0–0.001 typical)
 flipud: 0.0           # (float) vertical flip probability
 fliplr: 0.5           # (float) horizontal flip probability
 bgr: 0.0              # (float) RGB↔BGR channel swap probability
-mosaic: 0             # (float) mosaic augmentation probability
+mosaic: 0.09             # (float) mosaic augmentation probability
 mixup: 0.3           # (float) MixUp augmentation probability
 cutmix: 0.0           # (float) CutMix augmentation probability
 copy_paste: 0.0       # (float) segmentation copy-paste probability
 copy_paste_mode: flip # (str) copy-paste strategy for segmentation: flip or mixup
 auto_augment: randaugment # (str) classification auto augmentation policy: randaugment, autoaugment, augmix
-erasing: 0.4          # (float) random erasing probability for classification (0–0.9), <1.0
+erasing: 0.1          # (float) random erasing probability for classification (0–0.9), <1.0
 
 # Custom config.yaml ---------------------------------------------------------------------------------------------------
 cfg: # (str, optional) path to a config.yaml that overrides defaults
