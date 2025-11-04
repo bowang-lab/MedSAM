@@ -28,7 +28,7 @@ DEVICE="0"
 BATCH=8
 
 # Python module entrypoint
-PYTHON_MODULE="src.scripts.train"
+PYTHON_MODULE="src.scripts.train_yolo"
 
 # Make project importable as `src.*`
 export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
