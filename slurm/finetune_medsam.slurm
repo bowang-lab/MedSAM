@@ -21,10 +21,10 @@ set -euo pipefail
 REPO_DIR="/scratch/st-ipor-1/cperez/MedSAM"
 OUT_DIR="/scratch/st-ipor-1/cperez/MedSAM/TRAINING_DS"
 DATA_DIR="/arc/project/st-ipor-1/carlosp/fundus_data/All_Datasets_Organized"
-CONFIG="${REPO_DIR}/src/configs/train_custom.yaml"
-WEIGHTS_LOCAL="${REPO_DIR}/weights/yolo12x.pt"
+CKPT="${REPO_DIR}/weights/medsam_vit_b.pth"
 
-DEVICE="0"
+
+DEVICE="cuda:0"
 BATCH=8
 
 # Python module entrypoint
@@ -50,12 +50,12 @@ cd "${REPO_DIR}"
 
 srun -u python -m ${PYTHON_MODULE} \
   --train \
-  --device "cuda:0" \
-  --data-root "$DATA_DIR" \
-  --ckpt "$CKPT" \
-  --out-dir "$OUT_DIR" \
-  --run-dir "$RUN_DIR" \
-  --run-name "$RUN_NAME" \
+  --device "${DEVICE}" \
+  --data-root "${DATA_DIR}" \
+  --ckpt "${CKPT}" \
+  --out-dir "${OUT_DIR}" \
+  --run-dir "${RUN_DIR}" \
+  --run-name "${RUN_NAME}" \
   --epochs 50 \
   --batch 8 \
   --imgsz 1024 \

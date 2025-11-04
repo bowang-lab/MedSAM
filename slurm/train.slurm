@@ -87,7 +87,6 @@ echo "[INFO] Selected MODE=${MODE}"
 
 ARGS_TRAIN=(
   --train
-  --resume
   --run-dir "${REPO_DIR}/runs"
   --data-root "${DATA_DIR}"
   --yolo-ds "${OUT_DIR}"
