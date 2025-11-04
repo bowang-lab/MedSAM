@@ -27,7 +27,6 @@ RESUME="${REPO_DIR}/runs/FineTune_MedSAM/weights/last.pth"
 
 DEVICE="cuda:0"
 BATCH=8
-batch
 # Python module entrypoint
 PYTHON_MODULE="src.scripts.finetune_medsam"
 
