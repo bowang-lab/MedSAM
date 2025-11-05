@@ -46,7 +46,7 @@ YOLO_WEIGHTS="/scratch/st-ipor-1/cperez/MedSAM/runs/MultiClassLarge/weights/best
 ############################
 DEVICE="cuda:0"
 BATCH=8
-EPOCHS=50
+EPOCHS=100
 IMGSZ=1024
 
 # Box-mixing and robustness
