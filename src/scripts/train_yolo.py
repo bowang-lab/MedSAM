@@ -70,6 +70,214 @@ SPACE = {
 # =========================
 # Helpers
 # =========================
+
+_IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
+def _parse_data_yaml(yaml_path: Path) -> Dict[str, str]:
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"data.yaml not found at {yaml_path}")
+    data = yaml.safe_load(yaml_path.read_text())
+    out = {}
+    for k in ("train", "val", "test"):
+        if k in data:
+            out[k] = str(data[k])
+    return out
+
+def _read_lines_txt(txt_path: Path) -> List[Path]:
+    with txt_path.open("r") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+    return [Path(ln) for ln in lines]
+
+def _list_images_under(p: Path) -> List[Path]:
+    if not p.exists():
+        return []
+    if p.is_file():
+        return [p] if p.suffix.lower() in _IMG_EXTS else []
+    return sorted([q for q in p.rglob("*") if q.is_file() and q.suffix.lower() in _IMG_EXTS])
+
+def _resolve_split_images(yolo_ds: Path, entry: str | None) -> List[Path]:
+    if not entry:
+        return []
+    p = Path(entry)
+    if not p.is_absolute():
+        p = (yolo_ds / p).resolve()
+    if p.suffix.lower() == ".txt":
+        return _read_lines_txt(p)
+    return _list_images_under(p)
+
+def _image_to_label_path(img_path: Path, yolo_ds: Path) -> Optional[Path]:
+    """
+    Derive labels path from images path by replacing 'images' with 'labels' and extension with .txt.
+    """
+    try:
+        parts = list(img_path.parts)
+        # Replace the first occurrence of 'images' with 'labels'
+        for i, seg in enumerate(parts):
+            if seg == "images":
+                parts[i] = "labels"
+                break
+        lbl_dir = Path(*parts[:-1])  # directory up to filename
+        lbl_path = lbl_dir / (img_path.stem + ".txt")
+        if lbl_path.exists():
+            return lbl_path
+        # Fallback: search sibling labels dir under yolo_ds
+        candidate = (yolo_ds / "labels" / img_path.parent.name / (img_path.stem + ".txt"))
+        return candidate if candidate.exists() else None
+    except Exception:
+        return None
+
+def _load_gt_boxes_norm(label_path: Path) -> Dict[int, NormalizedBox]:
+    """
+    Read YOLO label file and return {class_id: NormalizedBox} for classes present.
+    If multiple boxes for a class exist, keep the largest area (rare for OD/OC).
+    """
+    by_cls: Dict[int, NormalizedBox] = {}
+    if not label_path or not label_path.exists():
+        return by_cls
+    for ln in label_path.read_text().splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split()
+        if len(parts) < 5:
+            continue
+        cls = int(float(parts[0]))
+        xc, yc, w, h = map(float, parts[1:5])
+        nb = NormalizedBox(xc, yc, w, h)
+        if (cls not in by_cls) or (nb.area() > by_cls[cls].area()):
+            by_cls[cls] = nb
+    return by_cls
+
+def _best_pred_box_norm_for_class(res, cls_id: int) -> Optional[NormalizedBox]:
+    """
+    From an Ultralytics Result (single image), return the top-confidence predicted box
+    for class `cls_id` in normalized (xc,yc,w,h) space, or None if not found.
+    """
+    if res.boxes is None or len(res.boxes) == 0:
+        return None
+    cls = res.boxes.cls.cpu().numpy().astype(int)
+    conf = res.boxes.conf.cpu().numpy()
+    if hasattr(res.boxes, "xywhn") and res.boxes.xywhn is not None:
+        xywhn = res.boxes.xywhn.cpu().numpy()
+    else:
+        # Normalize manually using image shape
+        xywh = res.boxes.xywh.cpu().numpy()
+        H, W = res.orig_shape
+        xywhn = xywh.copy()
+        xywhn[:, 0] /= W
+        xywhn[:, 1] /= H
+        xywhn[:, 2] /= W
+        xywhn[:, 3] /= H
+
+    idx = np.where(cls == cls_id)[0]
+    if idx.size == 0:
+        return None
+    best = idx[np.argmax(conf[idx])]
+    xc, yc, w, h = map(float, xywhn[best, :4])
+    # clip to [0,1] for safety
+    xc = float(np.clip(xc, 0.0, 1.0))
+    yc = float(np.clip(yc, 0.0, 1.0))
+    w  = float(np.clip(w,  0.0, 1.0))
+    h  = float(np.clip(h,  0.0, 1.0))
+    return NormalizedBox(xc, yc, w, h)
+
+def evaluate_test_boxes(
+    model: YOLO,
+    yolo_ds: Path,
+    out_dir: Path,
+    device: str = "cpu",
+    imgsz: int = 640,
+    conf: float = 0.25,
+) -> Tuple[Dict[str, float], Path, Path]:
+    """
+    Run inference on the test split and compute per-prediction Dice (box Dice) and box loss (1-CIoU).
+    Returns (summary_dict, jsonl_path, summary_json_path).
+    """
+    yaml_path = yolo_ds / "data.yaml"
+    entries = _parse_data_yaml(yaml_path)
+    test_imgs = _resolve_split_images(yolo_ds, entries.get("test"))
+    if not test_imgs:
+        raise RuntimeError(f"No test images resolved from {yaml_path}")
+
+    per_class_dice: Dict[int, List[float]] = {0: [], 1: []}
+    per_class_loss: Dict[int, List[float]] = {0: [], 1: []}
+
+    jsonl_path = out_dir / "test_box_metrics.jsonl"
+    summary_path = out_dir / "test_box_summary.json"
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with jsonl_path.open("w") as jf:
+        for img_path in test_imgs:
+            lbl_path = _image_to_label_path(img_path, yolo_ds)
+            gt = _load_gt_boxes_norm(lbl_path) if lbl_path else {}
+
+            # Run inference for this image
+            res = model.predict(
+                source=str(img_path),
+                device=device,
+                imgsz=imgsz,
+                conf=conf,
+                verbose=False
+            )[0]
+
+            # Evaluate for both classes (0=disc, 1=cup)
+            for cls_id in (0, 1):
+                rec = {
+                    "image": str(img_path),
+                    "class": int(cls_id),
+                    "pred_exists": False,
+                    "gt_exists": False,
+                    "dice_box": None,
+                    "box_loss": None,
+                }
+
+                gt_box = gt.get(cls_id, None)
+                if gt_box is not None:
+                    rec["gt_exists"] = True
+
+                pred_box = _best_pred_box_norm_for_class(res, cls_id)
+                if pred_box is not None:
+                    rec["pred_exists"] = True
+
+                if (pred_box is not None) and (gt_box is not None):
+                    dice = float(pred_box.dice(gt_box))
+                    loss = float(pred_box.box_loss(gt_box))
+                    rec["dice_box"] = dice
+                    rec["box_loss"] = loss
+                    per_class_dice[cls_id].append(dice)
+                    per_class_loss[cls_id].append(loss)
+                else:
+                    # If either side is missing, record zeros but do not include in mean
+                    rec["dice_box"] = 0.0
+                    rec["box_loss"] = 1.0
+
+                jf.write(json.dumps(rec) + "\n")
+
+    # Summary
+    def _mean(lst: List[float]) -> float:
+        return float(np.mean(lst)) if lst else float("nan")
+
+    summary = {
+        "disc": {
+            "mean_dice_box": _mean(per_class_dice[0]),
+            "mean_box_loss": _mean(per_class_loss[0]),
+            "n_effective": len(per_class_dice[0]),
+        },
+        "cup": {
+            "mean_dice_box": _mean(per_class_dice[1]),
+            "mean_box_loss": _mean(per_class_loss[1]),
+            "n_effective": len(per_class_dice[1]),
+        },
+        "notes": "Dice here is computed over boxes (not masks). Means exclude missing GT/pred pairs."
+    }
+    with summary_path.open("w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("[OK] Wrote per-prediction metrics:", jsonl_path)
+    print("[OK] Wrote summary:", summary_path)
+    print("[SUMMARY]", summary)
+    return summary, jsonl_path, summary_path
+
 def set_global_seed(seed: int = 42) -> None:
     """Best-effort reproducibility."""
     random.seed(seed)
@@ -258,12 +466,15 @@ if __name__ == "__main__":
         print("[OK] Best hyperparameters saved at:", best)
 
     # TEST
+    # TEST
     if TEST_WEIGHTS:
         if not TEST_WEIGHTS.exists():
             raise FileNotFoundError(f"[ERR] --test-weights not found: {TEST_WEIGHTS}")
         rn = RUN_NAME or "Test"
         print(f"[INFO] Running final evaluation on the TEST set… weights={TEST_WEIGHTS}")
         model = YOLO(str(TEST_WEIGHTS))
+
+        # 3.1 Ultralytics' built-in evaluation (kept as-is)
         metrics = model.val(
             data=str(data_yaml),
             split="test",
@@ -277,6 +488,26 @@ if __name__ == "__main__":
         with open(out_json, "w") as f:
             json.dump(metrics, f, indent=2)
         print(f"[OK] Saved test metrics to: {out_json}")
+
+        # 3.2 Additional per-prediction Dice (boxes) and box-loss summary
+        #     Pass the YOLO dataset directory so we can find data.yaml and label files.
+        yolo_ds_dir = args.yolo_ds if args.yolo_ds else OUT_DIR  # if you created DS in this run
+        summary, per_pred_path, summary_path = evaluate_test_boxes(
+            model=model,
+            yolo_ds=yolo_ds_dir,
+            out_dir=OUT_DIR,
+            device=DEVICE,
+            imgsz=IMGSZ,
+            conf=0.25,  # adjust to your detector's operating point
+        )
+        # Optional: also persist an aggregated file alongside Ultralytics metrics
+        agg_json = OUT_DIR / "test_box_summary_combined.json"
+        with open(agg_json, "w") as f:
+            json.dump({
+                "ultralytics": metrics,
+                "box_metrics_summary": summary
+            }, f, indent=2)
+        print(f"[OK] Saved combined summary to: {agg_json}")
+
     elif not (TRAIN_MODE or TUNE_MODE):
-        # If none of the modes were selected, warn
         print("[WARN] No mode selected (use --train, --tune, and/or --test-weights).")
