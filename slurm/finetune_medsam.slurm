@@ -21,7 +21,7 @@ set -euo pipefail
 REPO_DIR="/scratch/st-ipor-1/cperez/MedSAM"
 
 # Outputs (metrics, preds, etc.)
-OUT_DIR="/scratch/st-ipor-1/cperez/MedSAM/MEDSAM_TRAIN"
+OUT_DIR="/scratch/st-ipor-1/cperez/MedSAM/MEDSAM_TRAIN2"
 RUN_DIR="${REPO_DIR}/runs"
 RUN_NAME="FineTune_MedSAM_${SLURM_JOB_ID:-local}"
 
@@ -133,6 +133,7 @@ ARGS=(
   --box-jitter-tr "${BOX_JITTER_TR}"
   --box-jitter-sc "${BOX_JITTER_SC}"
   --test-prompt "${TEST_PROMPT}"
+  --unfreeze-encoders
 )
 
 # Optional resume
