@@ -121,7 +121,7 @@ ARGS_TEST=(
   --run-dir "${REPO_DIR}/runs"
   --yolo-ds "${OUT_DIR}"
   --run-name "Test"
-  --test-weights "${REPO_DIR}/runs/train/weights/best.pt"
+  --test-weights "/scratch/st-ipor-1/cperez/MedSAM/runs/MultiClassV2-6616729-0/weights/best.pt"
   --device "${DEVICE}"
   --imgsz 640
   --batch "${BATCH}"
@@ -140,7 +140,7 @@ case "${MODE}" in
     srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TUNE[@]}"
     ;;
   test)
-    srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TEST[@]}" --run-name "Test-${SLURM_JOB_ID:-na}-${TASK_ID}"
+    srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TEST[@]}"
     ;;
   *)
     echo "[ERROR] Unknown mode: ${MODE}" >&2
