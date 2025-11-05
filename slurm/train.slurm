@@ -121,6 +121,7 @@ ARGS_TEST=(
   --run-dir "${REPO_DIR}/runs"
   --yolo-ds "${OUT_DIR}"
   --run-name "Test"
+  --out-dir "${REPO_DIR}/runs"
   --test-weights "/scratch/st-ipor-1/cperez/MedSAM/runs/MultiClassV2-6616729-0/weights/best.pt"
   --device "${DEVICE}"
   --imgsz 640
