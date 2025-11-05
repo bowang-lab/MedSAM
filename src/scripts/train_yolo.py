@@ -8,7 +8,7 @@ import json
 import os
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -33,8 +33,8 @@ DEFAULT_IMGSZ = 640
 DEFAULT_EPOCHS = 1
 DEFAULT_BATCH = 16
 DEFAULT_WORKERS = 8  # not used directly here
-DEFAULT_CONF = 0.001
-DEFAULT_IOU = 0.70
+DEFAULT_CONF = 0.01
+DEFAULT_IOU = 0.7
 SEED = 42
 
 TRAIN_RATIO = 0.0
@@ -195,7 +195,7 @@ def _label_path_from_image(img: Path) -> Path:
         pass
     return img.with_suffix(".txt")
 
-def _load_gt_xyxy(img_path: Path) -> tuple[np.ndarray, np.ndarray]:
+def _load_gt_xyxy(img_path: Path) -> Tuple[np.ndarray, np.ndarray]:
     lbl = _label_path_from_image(img_path)
     if not lbl.exists():
         return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64)
@@ -216,7 +216,7 @@ def _load_gt_xyxy(img_path: Path) -> tuple[np.ndarray, np.ndarray]:
         cls.append(c)
     return np.asarray(xyxy, np.float32), np.asarray(cls, np.int64)
 
-def _predict_xyxy(
+def _predict_xyxy_conf(
     model: YOLO,
     img_path: Path,
     *,
@@ -224,7 +224,10 @@ def _predict_xyxy(
     imgsz: int,
     conf: float,
     iou: float,
-):
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return (xyxy, cls, conf) for all predictions passing thresholds.
+    """
     res = model.predict(
         source=str(img_path),
         device=device,
@@ -234,11 +237,36 @@ def _predict_xyxy(
         verbose=False,
     )[0]
     if res.boxes is None or len(res.boxes) == 0:
-        return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+        return (
+            np.zeros((0, 4), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float32),
+        )
     b = res.boxes
     xyxy = b.xyxy.cpu().numpy().astype(np.float32)
     cls = b.cls.cpu().numpy().astype(np.int64)
-    return xyxy, cls
+    cf = b.conf.cpu().numpy().astype(np.float32)
+    return xyxy, cls, cf
+
+def _keep_single_top_conf_per_class(
+    xyxy: np.ndarray, cls: np.ndarray, conf: np.ndarray, nc: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Reduce predictions to at most one (the highest-confidence) per class.
+    """
+    if xyxy.size == 0:
+        return xyxy, cls, conf
+    keep_idx: List[int] = []
+    for c in range(nc):
+        inds = np.where(cls == c)[0]
+        if inds.size == 0:
+            continue
+        best = inds[np.argmax(conf[inds])]
+        keep_idx.append(int(best))
+    if not keep_idx:
+        return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.float32)
+    keep_idx = np.array(sorted(keep_idx), dtype=int)
+    return xyxy[keep_idx], cls[keep_idx], conf[keep_idx]
 
 def evaluate_test_boxes_hungarian_strict(
     model: YOLO,
@@ -251,8 +279,9 @@ def evaluate_test_boxes_hungarian_strict(
     save_jsonl: Path | None = None,
 ) -> Dict[str, Any]:
     """
-    Mirrors validator behavior:
-      - Per-image, per-class Hungarian matching on IoU.
+    Evaluation with enforced single prediction per class:
+      - For each image and class, keep only the **highest-confidence** predicted box (0 or 1).
+      - Hungarian matching on IoU (effectively 1-to-1 given the reduction).
       - Dice = 2*IoU/(1+IoU) for matched pairs.
       - Denominator per class += max(#GT, #Pred) → unmatched count as zero.
     """
@@ -286,20 +315,27 @@ def evaluate_test_boxes_hungarian_strict(
 
     for img_path in test_imgs:
         gt_b, gt_c = _load_gt_xyxy(img_path)
-        pr_b, pr_c = _predict_xyxy(model, img_path, device=device, imgsz=imgsz, conf=conf, iou=iou)
+
+        # All predictions for the image
+        pr_b_all, pr_c_all, pr_cf_all = _predict_xyxy_conf(
+            model, img_path, device=device, imgsz=imgsz, conf=conf, iou=iou
+        )
+        # Reduce to **one per class** (highest confidence)
+        pr_b, pr_c, pr_cf = _keep_single_top_conf_per_class(pr_b_all, pr_c_all, pr_cf_all, nc)
 
         for c in range(nc):
             gi = np.where(gt_c == c)[0]
             pi = np.where(pr_c == c)[0]
-            n_g, n_p = len(gi), len(pi)
-            den = max(n_g, n_p)  # unmatched will be counted as zero via denominator
+            n_g, n_p = len(gi), len(pi)  # n_p is 0 or 1 due to reduction
+            den = max(n_g, n_p)  # denominator counts unmatched as zero
             sum_dice = 0.0
 
             if n_g > 0 and n_p > 0:
+                # With at most one pred per class, Hungarian degenerates to single IoU
                 g = torch.from_numpy(gt_b[gi]).float()
                 p = torch.from_numpy(pr_b[pi]).float()
                 iou_mat = uy_box_iou(g, p).cpu().numpy()
-                # Hungarian maximize IoU
+                # Best one-to-one pairing (still use Hungarian/greedy for completeness)
                 try:
                     import scipy.optimize as spo
                     row_ind, col_ind = spo.linear_sum_assignment(-iou_mat)
@@ -327,7 +363,7 @@ def evaluate_test_boxes_hungarian_strict(
                     "n_gt": int(n_g),
                     "n_pred": int(n_p),
                     "sum_dice": float(sum_dice),
-                    "den": int(den)
+                    "den": int(den),
                 }
                 jsonl_fp.write(json.dumps(rec) + "\n")
 
@@ -432,9 +468,6 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"[ERR] --yolo-ds given but {data_yaml} does not exist.")
         print(f"[INFO] Using pre-existing YOLO dataset: {YOLO_DS}")
     else:
-        # If testing only and no yolo-ds is provided, fail fast (avoid huge scan/build on cluster unexpectedly)
-        # if TEST_WEIGHTS and not (TRAIN_MODE or TUNE_MODE):
-        #     raise RuntimeError("[ERR] Testing requested but --yolo-ds not provided. Supply a prebuilt dataset.")
         print("[INFO] Creating YOLO dataset (no --yolo-ds provided)…")
         images = scan_filter(DATA_ROOT, OUT_DIR)
         data_yaml = create_yolo_ds(images, OUT_DIR)
@@ -511,7 +544,7 @@ if __name__ == "__main__":
             json.dump(_extract_ultralytics_metrics(val_obj), f, indent=2)
         print(f"[OK] Saved test metrics to: {out_json}")
 
-        # 2) Strict Dice with unmatched counted as zero (Hungarian; same thresholds)
+        # 2) Strict Dice with unmatched counted as zero (Hungarian; single top-confidence pred per class)
         yolo_ds_dir = YOLO_DS if YOLO_DS is not None else OUT_DIR
         summary = evaluate_test_boxes_hungarian_strict(
             model=model,

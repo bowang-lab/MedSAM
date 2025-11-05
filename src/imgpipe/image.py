@@ -59,6 +59,10 @@ class Image:
     gt_cd_ratio: Optional[float] = None
     pred_cd_ratio: Optional[float] = None
 
+    # --- NEW: cached mask Dice (prediction vs GT), per class ---
+    mask_dice_disc: Optional[float] = None
+    mask_dice_cup: Optional[float] = None
+
     # Optional bookkeeping
     yolo_label_path: Optional[Path] = None
     extras: Dict[str, Any] = field(default_factory=dict)
@@ -141,6 +145,7 @@ class Image:
                 "nbox must be a NormalizedBox, (xc,yc,w,h) tuple/list, dict with keys {'xc','yc','w','h'}, or None.")
 
         setattr(self, self._box_attr_name(component, kind), nb)
+
     # ----------------- setters -----------------
 
     def set_mask(self, component: Structure, kind: LabelType, mask: BinaryMaskRef | Path | np.ndarray) -> None:
@@ -223,16 +228,32 @@ class Image:
         y1, y2 = float(ys.min()), float(ys.max() + 1)
         return NormalizedBox.from_xyxy(x1, y1, x2, y2, self.width, self.height)
 
+    # Helper: rasterize a normalized box into a bool mask at (H,W)
+    def _rasterize_box(self, nbox: Optional[NormalizedBox]) -> Optional[np.ndarray]:
+        if nbox is None:
+            return None
+        x1, y1, x2, y2 = nbox.to_pixel_xyxy(self.width, self.height)
+        x1, y1 = int(max(0, np.floor(x1))), int(max(0, np.floor(y1)))
+        x2, y2 = int(min(self.width, np.ceil(x2))), int(min(self.height, np.ceil(y2)))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        m = np.zeros((self.height, self.width), dtype=bool)
+        m[y1:y2, x1:x2] = True
+        return m
+
+    # in src/imgpipe/image.py
     def ensure_boxes_from_masks(self) -> None:
         """Populate missing normalized boxes from masks (aligned to image size)."""
         if self.gt_disc_box is None:
             self.gt_disc_box = self._mask_bbox_norm_aligned(self.gt_disc_mask)
         if self.gt_cup_box is None:
             self.gt_cup_box = self._mask_bbox_norm_aligned(self.gt_cup_mask)
-        if self.inter_pred_disc_box is None:
-            self.inter_pred_disc_box = self._mask_bbox_norm_aligned(self.pred_disc_mask)
-        if self.inter_pred_cup_box is None:
-            self.inter_pred_cup_box = self._mask_bbox_norm_aligned(self.pred_cup_mask)
+
+        # FIX: SAM output masks must drive the *final* predicted boxes
+        if self.pred_disc_box is None:
+            self.pred_disc_box = self._mask_bbox_norm_aligned(self.pred_disc_mask)
+        if self.pred_cup_box is None:
+            self.pred_cup_box = self._mask_bbox_norm_aligned(self.pred_cup_mask)
 
     # ----------------- normalized accessors -----------------
 
@@ -295,6 +316,60 @@ class Image:
                 c = max(0.0, cbox.width)
             return (c / d) if d > 0 else None
         return None
+
+    # --- NEW: class-wise Dice computation & caching ---
+
+    @staticmethod
+    def _dice_from_bool(pred: Optional[np.ndarray], gt: Optional[np.ndarray]) -> Optional[float]:
+        if pred is None or gt is None:
+            return None
+        p = pred.astype(bool)
+        g = gt.astype(bool)
+        if not p.any() and not g.any():
+            return 1.0  # both empty → perfect agreement
+        inter = float((p & g).sum())
+        denom = float(p.sum() + g.sum())
+        return (2.0 * inter / denom) if denom > 0 else 0.0
+
+    def compute_mask_dice(
+        self,
+        component: Structure,
+        *,
+        fallback_to_boxes: bool = True
+    ) -> Optional[float]:
+        """
+        Compute (and return) Dice between predicted and GT masks for a component.
+        If masks are missing and fallback_to_boxes is True, rasterize available boxes.
+        Does not change existing fields except updating the cached dice attribute.
+        """
+        assert component in (Structure.DISC, Structure.CUP)
+        # Load masks aligned to image size
+        pred_m = self._mask_to_image_size(self.pred_disc_mask if component is Structure.DISC else self.pred_cup_mask)
+        gt_m   = self._mask_to_image_size(self.gt_disc_mask   if component is Structure.DISC else self.gt_cup_mask)
+
+        # Optional fallbacks from boxes
+        if pred_m is None and fallback_to_boxes:
+            nb = self.pred_disc_box if component is Structure.DISC else self.pred_cup_box
+            pred_m = self._rasterize_box(nb)
+        if gt_m is None and fallback_to_boxes:
+            nb = self.gt_disc_box if component is Structure.DISC else self.gt_cup_box
+            gt_m = self._rasterize_box(nb)
+
+        d = self._dice_from_bool(pred_m, gt_m)
+        if component is Structure.DISC:
+            self.mask_dice_disc = d
+        else:
+            self.mask_dice_cup = d
+        return d
+
+    def update_mask_dice(self, *, fallback_to_boxes: bool = True) -> Dict[str, Optional[float]]:
+        """
+        Compute Dice for both classes and cache them.
+        """
+        return {
+            "disc": self.compute_mask_dice(Structure.DISC, fallback_to_boxes=fallback_to_boxes),
+            "cup":  self.compute_mask_dice(Structure.CUP,  fallback_to_boxes=fallback_to_boxes),
+        }
 
     def rim_metrics(self, *, use_pred: bool = False) -> Optional[Dict[str, Optional[float]]]:
         """
@@ -384,7 +459,6 @@ class Image:
         return out
 
     # ----------------- visualization -----------------
-
     def visualize(
             self,
             *,
@@ -396,13 +470,15 @@ class Image:
             show_metrics: bool = True,
     ) -> None:
         """
-        Visualize overlays; annotate key metrics when available.
-        Boxes are converted from normalized to pixel-space for drawing only.
+        Render 1–2 panels:
+          • Panel 1 (if available): Ground-truth disc/cup masks + GT metrics.
+          • Panel 2 (if available): Predicted disc/cup masks + detector inter_pred boxes + predicted metrics.
         """
+        # Load base image
         img = PILImage.open(self.image_path).convert("RGB")
         W, H = img.size
-        self.ensure_boxes_from_masks()
 
+        # Helpers
         def _mask_arr(mref: Optional[BinaryMaskRef]) -> Optional[np.ndarray]:
             return self._mask_to_image_size(mref)
 
@@ -419,63 +495,93 @@ class Image:
             w, h = max(0.0, x2 - x1), max(0.0, y2 - y1)
             ax.add_patch(Rectangle((x1, y1), w, h, fill=False, edgecolor=color, linewidth=lw, linestyle=ls))
 
+        # Determine availability
+        gt_disc_m = _mask_arr(self.gt_disc_mask)
+        gt_cup_m = _mask_arr(self.gt_cup_mask)
+        pred_disc_m = _mask_arr(self.pred_disc_mask)
+        pred_cup_m = _mask_arr(self.pred_cup_mask)
+
+        has_gt = (gt_disc_m is not None) or (gt_cup_m is not None)
+        has_pred = (pred_disc_m is not None) or (pred_cup_m is not None) or \
+                   (self.inter_pred_disc_box is not None) or (self.inter_pred_cup_box is not None)
+
+        # Nothing to show → single image only
+        if not has_gt and not has_pred:
+            fig, ax = plt.subplots(1, 1, figsize=(figsize[0] / 2, figsize[1]), dpi=dpi)
+            ax.imshow(img, origin="upper")
+            ax.set_axis_off()
+            if save_path is not None:
+                Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+                fig.savefig(str(save_path), bbox_inches="tight", dpi=dpi)
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
+            return
+
+        # Assemble panels: strictly at most two
         panels = []
-
-        # Ground truth panel
-        gt_masks = (_mask_arr(self.gt_disc_mask), _mask_arr(self.gt_cup_mask))
-        if any(m is not None for m in gt_masks) or (self.gt_disc_box or self.gt_cup_box):
-            panels.append(("Ground Truth", gt_masks, (self.gt_disc_box, self.gt_cup_box)))
-
-        # Detector intermediate boxes
-        if self.inter_pred_disc_box or self.inter_pred_cup_box:
-            panels.append(("Inter Predictions (Detector Boxes)", (None, None),
-                           (self.inter_pred_disc_box, self.inter_pred_cup_box)))
-
-        # MedSAM predictions
-        pred_masks = (_mask_arr(self.pred_disc_mask), _mask_arr(self.pred_cup_mask))
-        if any(m is not None for m in pred_masks) or (self.pred_disc_box or self.pred_cup_box):
-            panels.append(("MedSAM Predictions", pred_masks, (self.pred_disc_box, self.pred_cup_box)))
-
-        if not panels:
-            panels.append(("Image", (None, None), (None, None)))
+        if has_gt:
+            panels.append(("Ground Truth", {"disc_m": gt_disc_m, "cup_m": gt_cup_m,
+                                            "disc_box": None, "cup_box": None, "use_pred": False}))
+        if has_pred:
+            panels.append(("Predictions", {"disc_m": pred_disc_m, "cup_m": pred_cup_m,
+                                           "disc_box": self.inter_pred_disc_box,
+                                           "cup_box": self.inter_pred_cup_box,
+                                           "use_pred": True}))
 
         ncols = len(panels)
-        fig, axes = plt.subplots(nrows=1, ncols=ncols, figsize=figsize, dpi=dpi, squeeze=False)
+        fig, axes = plt.subplots(nrows=1, ncols=ncols, figsize=figsize if ncols == 2 else (figsize[0] / 2, figsize[1]),
+                                 dpi=dpi, squeeze=False)
 
-        # Add image name (and identifiers) as a figure-level title
+        # Figure title
         suptitle = f"{self.dataset} / {self.subject_id} — {self.image_path.name}"
         fig.suptitle(suptitle, fontsize=12)
 
+        # Colors
         disc_color_mask = "tab:red"
         cup_color_mask = "tab:blue"
         disc_color_box = "red"
         cup_color_box = "blue"
 
-        for j, (title, (disc_m, cup_m), (disc_b, cup_b)) in enumerate(panels):
+        # Update cached Dice (non-intrusive; uses masks and optional box fallbacks)
+        self.update_mask_dice(fallback_to_boxes=True)
+
+        for j, (title, dct) in enumerate(panels):
             ax = axes[0, j]
             ax.imshow(img, origin="upper")
             ax.set_axis_off()
             ax.set_title(title, fontsize=11)
 
-            if disc_m is not None:
-                _draw_mask(ax, disc_m, disc_color_mask, mask_alpha)
-            if cup_m is not None:
-                _draw_mask(ax, cup_m, cup_color_mask, mask_alpha)
+            # Masks
+            if dct["disc_m"] is not None:
+                _draw_mask(ax, dct["disc_m"], disc_color_mask, mask_alpha)
+            if dct["cup_m"] is not None:
+                _draw_mask(ax, dct["cup_m"], cup_color_mask, mask_alpha)
 
-            _draw_nbox(ax, disc_b, disc_color_box, ls="-", lw=2.0)
-            _draw_nbox(ax, cup_b, cup_color_box, ls="--", lw=2.0)
+            # Boxes (only inter_pred on predictions panel as requested)
+            _draw_nbox(ax, dct["disc_box"], disc_color_box, ls="-", lw=2.0)
+            _draw_nbox(ax, dct["cup_box"], cup_color_box, ls="--", lw=2.0)
 
+            # Metrics block
             if show_metrics:
-                use_pred = (title != "Ground Truth") and ("Prediction" in title)
-                if title == "Ground Truth":
-                    use_pred = False
+                use_pred = bool(dct["use_pred"])
                 cdr_v = self.cdr(use_pred=use_pred, axis="vertical")
                 cdr_h = self.cdr(use_pred=use_pred, axis="horizontal")
                 rims = self.rim_metrics(use_pred=use_pred)
 
                 lines = []
-                if cdr_v is not None: lines.append(f"CDR (V): {cdr_v:.3f}")
-                if cdr_h is not None: lines.append(f"CDR (H): {cdr_h:.3f}")
+                # Show Dice on prediction panel (GT vs Pred)
+                if use_pred:
+                    if self.mask_dice_disc is not None:
+                        lines.append(f"Dice (Disc): {self.mask_dice_disc:.3f}")
+                    if self.mask_dice_cup is not None:
+                        lines.append(f"Dice (Cup):  {self.mask_dice_cup:.3f}")
+
+                if cdr_v is not None:
+                    lines.append(f"CDR (V): {cdr_v:.3f}")
+                if cdr_h is not None:
+                    lines.append(f"CDR (H): {cdr_h:.3f}")
                 if rims is not None:
                     if np.isfinite(rims.get("rim_over_disc", np.nan)):
                         lines.append(f"R/D: {rims['rim_over_disc']:.3f}")
@@ -496,15 +602,15 @@ class Image:
                         bbox=dict(facecolor="black", alpha=0.35, boxstyle="round,pad=0.3", edgecolor="none"),
                     )
 
+            # Legend (only if something was drawn)
             handles = []
-            if (disc_m is not None) or (disc_b is not None):
+            if (dct["disc_m"] is not None) or (dct["disc_box"] is not None):
                 handles.append(plt.Line2D([0], [0], color=disc_color_box, lw=2, linestyle="-", label="Disc"))
-            if (cup_m is not None) or (cup_b is not None):
+            if (dct["cup_m"] is not None) or (dct["cup_box"] is not None):
                 handles.append(plt.Line2D([0], [0], color=cup_color_box, lw=2, linestyle="--", label="Cup"))
             if handles:
                 ax.legend(handles=handles, loc="lower right", fontsize=9, frameon=True)
 
-        # Make room for the suptitle
         fig.tight_layout(rect=(0, 0, 1, 0.96))
 
         if save_path is not None:
@@ -571,7 +677,7 @@ class Image:
     def to_dict(self, *, drop_none: bool = False) -> Dict[str, Any]:
         self.ensure_boxes_from_masks()  # ensure normalized GT exist if masks available
         d: Dict[str, Any] = {
-            "_schema": 4,  # bumped since format changed to normalized-only
+            "_schema": 5,  # bumped since format changed (added cached mask dice)
 
             # identity
             "uid": self.uid,
@@ -601,6 +707,10 @@ class Image:
             # lightweight cached metrics
             "gt_cd_ratio": self.gt_cd_ratio,
             "pred_cd_ratio": self.pred_cd_ratio,
+
+            # NEW: cached dice
+            "mask_dice_disc": self.mask_dice_disc,
+            "mask_dice_cup": self.mask_dice_cup,
 
             # bookkeeping
             "yolo_label_path": self._path_to_str(self.yolo_label_path),
@@ -652,6 +762,10 @@ class Image:
         # cached metrics
         obj.gt_cd_ratio   = (float(d["gt_cd_ratio"])   if d.get("gt_cd_ratio")   is not None else None)
         obj.pred_cd_ratio = (float(d["pred_cd_ratio"]) if d.get("pred_cd_ratio") is not None else None)
+
+        # NEW: cached dice
+        obj.mask_dice_disc = (float(d["mask_dice_disc"]) if d.get("mask_dice_disc") is not None else None)
+        obj.mask_dice_cup  = (float(d["mask_dice_cup"])  if d.get("mask_dice_cup")  is not None else None)
 
         # patient info
         obj.laterality = Image._enum_from_str(Eye, d.get("eye"))
