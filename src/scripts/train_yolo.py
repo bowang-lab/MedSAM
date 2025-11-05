@@ -1,40 +1,45 @@
 #!/usr/bin/env python3
-#src.scripts.train_yolo.py
+# src.scripts.train_yolo.py
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
-import argparse
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
+import torch
+import yaml
+from PIL import Image as PILImage
 from ultralytics import YOLO
+from ultralytics.utils.metrics import box_iou as uy_box_iou
 
 from src.imgpipe.image_factory import ImageFactory
 from src.imgpipe.yolo_splits import create_yolo_dataset
 
 # =========================
-# Default Configuration (will be overridden by Slurm CLI)
+# Default Configuration (overridden by CLI)
 # =========================
 DEFAULT_DATA_ROOT = Path("/Users/carlosperez/Library/CloudStorage/OneDrive-UBC/Ipek_Carlos/GlaucomaDatasets/All_Datasets_Organized")
-DEFAULT_OUT_DIR = Path("/Users/carlosperez/PycharmProjects/MedSAM/TRAINING_DS_TOY")
+DEFAULT_OUT_DIR = Path("/Users/carlosperez/PycharmProjects/MedSAM/TEST_DS_PAPILA_ONLY")
 DEFAULT_RUN_DIR = Path("/Users/carlosperez/PycharmProjects/MedSAM/runs")
 DEFAULT_CFG = Path("/Users/carlosperez/PycharmProjects/MedSAM/src/configs/train_custom.yaml")
-DEFAULT_MODEL = "yolo12n.pt"
+DEFAULT_MODEL = "yolo12x.pt"
 DEFAULT_DEVICE: Optional[str | int] = "mps"
-
 DEFAULT_IMGSZ = 640
 DEFAULT_EPOCHS = 1
 DEFAULT_BATCH = 16
-DEFAULT_WORKERS = 8  # not used directly by this script, kept for reference
+DEFAULT_WORKERS = 8  # not used directly here
+DEFAULT_CONF = 0.001
+DEFAULT_IOU = 0.70
 SEED = 42
 
-TRAIN_RATIO = 0.80
-VAL_RATIO = 0.10
-TEST_RATIO = 0.10
+TRAIN_RATIO = 0.0
+VAL_RATIO = 0.0
+TEST_RATIO = 1.0
 
 VISUALIZE_ONE = False
 
@@ -45,11 +50,9 @@ SPACE = {
     "weight_decay": (0.0, 5e-4),
     "momentum": (0.85, 0.98),
     "warmup_epochs": (0.0, 2.0),
-
     # loss balance
     "box": (5, 15),
     "cls": (0.2, 2.0),
-
     # light augmentations (fundus-safe)
     "degrees": (0.0, 7.5),
     "translate": (0.0, 0.10),
@@ -60,7 +63,6 @@ SPACE = {
     "hsv_v": (0.0, 0.30),
     "flipud": (0.0, 0.10),
     "fliplr": (0.0, 0.10),
-
     # avoid aggressive mixing for medical images
     "mosaic": (0.0, 0.10),
     "mixup": (0.0, 0.05),
@@ -68,284 +70,30 @@ SPACE = {
 }
 
 # =========================
-# Helpers
+# Reproducibility
 # =========================
-
-_IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-
-def _parse_data_yaml(yaml_path: Path) -> Dict[str, str]:
-    if not yaml_path.exists():
-        raise FileNotFoundError(f"data.yaml not found at {yaml_path}")
-    data = yaml.safe_load(yaml_path.read_text())
-    out = {}
-    for k in ("train", "val", "test"):
-        if k in data:
-            out[k] = str(data[k])
-    return out
-
-def _read_lines_txt(txt_path: Path) -> List[Path]:
-    with txt_path.open("r") as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
-    return [Path(ln) for ln in lines]
-
-def _list_images_under(p: Path) -> List[Path]:
-    if not p.exists():
-        return []
-    if p.is_file():
-        return [p] if p.suffix.lower() in _IMG_EXTS else []
-    return sorted([q for q in p.rglob("*") if q.is_file() and q.suffix.lower() in _IMG_EXTS])
-
-def _resolve_split_images(yolo_ds: Path, entry: str | None) -> List[Path]:
-    if not entry:
-        return []
-    p = Path(entry)
-    if not p.is_absolute():
-        p = (yolo_ds / p).resolve()
-    if p.suffix.lower() == ".txt":
-        return _read_lines_txt(p)
-    return _list_images_under(p)
-
-def _image_to_label_path(img_path: Path, yolo_ds: Path) -> Optional[Path]:
-    """
-    Derive labels path from images path by replacing 'images' with 'labels' and extension with .txt.
-    """
-    try:
-        parts = list(img_path.parts)
-        # Replace the first occurrence of 'images' with 'labels'
-        for i, seg in enumerate(parts):
-            if seg == "images":
-                parts[i] = "labels"
-                break
-        lbl_dir = Path(*parts[:-1])  # directory up to filename
-        lbl_path = lbl_dir / (img_path.stem + ".txt")
-        if lbl_path.exists():
-            return lbl_path
-        # Fallback: search sibling labels dir under yolo_ds
-        candidate = (yolo_ds / "labels" / img_path.parent.name / (img_path.stem + ".txt"))
-        return candidate if candidate.exists() else None
-    except Exception:
-        return None
-
-def _load_gt_boxes_norm(label_path: Path) -> Dict[int, NormalizedBox]:
-    """
-    Read YOLO label file and return {class_id: NormalizedBox} for classes present.
-    If multiple boxes for a class exist, keep the largest area (rare for OD/OC).
-    """
-    by_cls: Dict[int, NormalizedBox] = {}
-    if not label_path or not label_path.exists():
-        return by_cls
-    for ln in label_path.read_text().splitlines():
-        ln = ln.strip()
-        if not ln:
-            continue
-        parts = ln.split()
-        if len(parts) < 5:
-            continue
-        cls = int(float(parts[0]))
-        xc, yc, w, h = map(float, parts[1:5])
-        nb = NormalizedBox(xc, yc, w, h)
-        if (cls not in by_cls) or (nb.area() > by_cls[cls].area()):
-            by_cls[cls] = nb
-    return by_cls
-
-def _best_pred_box_norm_for_class(res, cls_id: int) -> Optional[NormalizedBox]:
-    """
-    From an Ultralytics Result (single image), return the top-confidence predicted box
-    for class `cls_id` in normalized (xc,yc,w,h) space, or None if not found.
-    """
-    if res.boxes is None or len(res.boxes) == 0:
-        return None
-    cls = res.boxes.cls.cpu().numpy().astype(int)
-    conf = res.boxes.conf.cpu().numpy()
-    if hasattr(res.boxes, "xywhn") and res.boxes.xywhn is not None:
-        xywhn = res.boxes.xywhn.cpu().numpy()
-    else:
-        # Normalize manually using image shape
-        xywh = res.boxes.xywh.cpu().numpy()
-        H, W = res.orig_shape
-        xywhn = xywh.copy()
-        xywhn[:, 0] /= W
-        xywhn[:, 1] /= H
-        xywhn[:, 2] /= W
-        xywhn[:, 3] /= H
-
-    idx = np.where(cls == cls_id)[0]
-    if idx.size == 0:
-        return None
-    best = idx[np.argmax(conf[idx])]
-    xc, yc, w, h = map(float, xywhn[best, :4])
-    # clip to [0,1] for safety
-    xc = float(np.clip(xc, 0.0, 1.0))
-    yc = float(np.clip(yc, 0.0, 1.0))
-    w  = float(np.clip(w,  0.0, 1.0))
-    h  = float(np.clip(h,  0.0, 1.0))
-    return NormalizedBox(xc, yc, w, h)
-
-def evaluate_test_boxes(
-    model: YOLO,
-    yolo_ds: Path,
-    out_dir: Path,
-    device: str = "cpu",
-    imgsz: int = 640,
-    conf: float = 0.25,
-) -> Tuple[Dict[str, float], Path, Path]:
-    """
-    Run inference on the test split and compute per-prediction Dice (box Dice) and box loss (1-CIoU).
-    Returns (summary_dict, jsonl_path, summary_json_path).
-    """
-    yaml_path = yolo_ds / "data.yaml"
-    entries = _parse_data_yaml(yaml_path)
-    test_imgs = _resolve_split_images(yolo_ds, entries.get("test"))
-    if not test_imgs:
-        raise RuntimeError(f"No test images resolved from {yaml_path}")
-
-    per_class_dice: Dict[int, List[float]] = {0: [], 1: []}
-    per_class_loss: Dict[int, List[float]] = {0: [], 1: []}
-
-    jsonl_path = out_dir / "test_box_metrics.jsonl"
-    summary_path = out_dir / "test_box_summary.json"
-    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with jsonl_path.open("w") as jf:
-        for img_path in test_imgs:
-            lbl_path = _image_to_label_path(img_path, yolo_ds)
-            gt = _load_gt_boxes_norm(lbl_path) if lbl_path else {}
-
-            # Run inference for this image
-            res = model.predict(
-                source=str(img_path),
-                device=device,
-                imgsz=imgsz,
-                conf=conf,
-                verbose=False
-            )[0]
-
-            # Evaluate for both classes (0=disc, 1=cup)
-            for cls_id in (0, 1):
-                rec = {
-                    "image": str(img_path),
-                    "class": int(cls_id),
-                    "pred_exists": False,
-                    "gt_exists": False,
-                    "dice_box": None,
-                    "box_loss": None,
-                }
-
-                gt_box = gt.get(cls_id, None)
-                if gt_box is not None:
-                    rec["gt_exists"] = True
-
-                pred_box = _best_pred_box_norm_for_class(res, cls_id)
-                if pred_box is not None:
-                    rec["pred_exists"] = True
-
-                if (pred_box is not None) and (gt_box is not None):
-                    dice = float(pred_box.dice(gt_box))
-                    loss = float(pred_box.box_loss(gt_box))
-                    rec["dice_box"] = dice
-                    rec["box_loss"] = loss
-                    per_class_dice[cls_id].append(dice)
-                    per_class_loss[cls_id].append(loss)
-                else:
-                    # If either side is missing, record zeros but do not include in mean
-                    rec["dice_box"] = 0.0
-                    rec["box_loss"] = 1.0
-
-                jf.write(json.dumps(rec) + "\n")
-
-    # Summary
-    def _mean(lst: List[float]) -> float:
-        return float(np.mean(lst)) if lst else float("nan")
-
-    summary = {
-        "disc": {
-            "mean_dice_box": _mean(per_class_dice[0]),
-            "mean_box_loss": _mean(per_class_loss[0]),
-            "n_effective": len(per_class_dice[0]),
-        },
-        "cup": {
-            "mean_dice_box": _mean(per_class_dice[1]),
-            "mean_box_loss": _mean(per_class_loss[1]),
-            "n_effective": len(per_class_dice[1]),
-        },
-        "notes": "Dice here is computed over boxes (not masks). Means exclude missing GT/pred pairs."
-    }
-    with summary_path.open("w") as f:
-        json.dump(summary, f, indent=2)
-
-    print("[OK] Wrote per-prediction metrics:", jsonl_path)
-    print("[OK] Wrote summary:", summary_path)
-    print("[SUMMARY]", summary)
-    return summary, jsonl_path, summary_path
-
 def set_global_seed(seed: int = 42) -> None:
-    """Best-effort reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     try:
-        import torch
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)  # type: ignore[attr-defined]
         torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
         torch.backends.cudnn.benchmark = False     # type: ignore[attr-defined]
     except Exception:
-        pass  # torch may not be installed
+        pass
 
+# =========================
+# Dataset build helpers
+# =========================
 def infer_data_yaml_path(out_dir: Path) -> Path:
-    """Conventional location for the dataset YAML produced by create_yolo_dataset()."""
     return out_dir / "data.yaml"
 
-def locate_best_weights(run_dir: Path) -> Optional[Path]:
-    weights_dir = run_dir / "weights"
-    if weights_dir.exists():
-        best = next(weights_dir.glob("best*.pt"), None)
-        if best:
-            print(f"[OK] Best weights: {best}")
-            return best
-    return None
-
-def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments."""
-    p = argparse.ArgumentParser(description="Train/Tune/Test YOLO on glaucoma datasets.")
-
-    # Modes (all optional; Slurm script decides which to pass)
-    p.add_argument("--train", action="store_true", help="Enable training mode.")
-    p.add_argument("--tune", action="store_true", help="Enable hyperparameter tuning mode.")
-    p.add_argument("--test-weights", type=Path, dest="test_weights",
-                   help="Path to weights for running evaluation on the TEST split.")
-
-    # Paths/config
-    p.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT,
-                   help=f"Root directory with datasets (default: {DEFAULT_DATA_ROOT})")
-    p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR,
-                   help=f"Output directory for YOLO dataset (default: {DEFAULT_OUT_DIR})")
-    p.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR,
-                   help=f"Output directory for runs (default: {DEFAULT_RUN_DIR})")
-    p.add_argument("--cfg", type=Path, default=DEFAULT_CFG,
-                   help=f"Ultralytics train config YAML (default: {DEFAULT_CFG})")
-    p.add_argument("--yolo-ds", type=Path,
-                   help="Path to preprocessed YOLO dataset directory (containing data.yaml).")
-
-    # Training/tuning knobs
-    p.add_argument("--resume", action="store_true", help="Resume training/tuning if possible.")
-    p.add_argument("--run-name", type=str, help="Run name (overrides automatic names).")
-    p.add_argument("--model", type=str, default=DEFAULT_MODEL,
-                   help=f"Starting YOLO checkpoint (default: {DEFAULT_MODEL})")
-    p.add_argument("--device", type=str, default=str(DEFAULT_DEVICE),
-                   help=f"Device: '0', 'cpu', 'mps', or '0,1' (default: {DEFAULT_DEVICE})")
-    p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help=f"Epochs (default: {DEFAULT_EPOCHS})")
-    p.add_argument("--batch", type=int, default=DEFAULT_BATCH, help=f"Batch size (default: {DEFAULT_BATCH})")
-    p.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ, help=f"Image size (default: {DEFAULT_IMGSZ})")
-
-    return p.parse_args()
-
 def scan_filter(DATA_ROOT: Path, OUT_DIR: Path):
-    """Scan datasets and filter to images with both masks; write summary."""
     print("[INFO] Scanning datasets…")
     image_factory = ImageFactory(root=DATA_ROOT, auto_scan=True)
     image_factory.filter_empty_masks()
-    image_factory.filter_datasets(exclude=["PAPILA"])
-    # image_factory.filter_random_subset(100)
+    image_factory.filter_datasets(include=["PAPILA"])
     images = image_factory.make_images()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     image_factory.save_images(images, OUT_DIR / "saved_images.jsonl")
@@ -360,13 +108,280 @@ def scan_filter(DATA_ROOT: Path, OUT_DIR: Path):
     return images
 
 def create_yolo_ds(images, OUT_DIR: Path) -> Path:
-    """Create YOLO directory structure and return data.yaml path."""
     print("[INFO] Creating YOLO dataset structure…")
     create_yolo_dataset(images, train=TRAIN_RATIO, val=VAL_RATIO, test=TEST_RATIO, out_dir=OUT_DIR)
     data_yaml = infer_data_yaml_path(OUT_DIR)
     if not data_yaml.exists():
         raise FileNotFoundError(f"`data.yaml` not found at {data_yaml}.")
     return data_yaml
+
+# =========================
+# Ultralytics metrics → JSON-safe
+# =========================
+def _jsonify(o: Any) -> Any:
+    if o is None or isinstance(o, (str, int, float, bool)):
+        return o
+    if isinstance(o, (np.floating, np.integer, np.bool_)):
+        return o.item()
+    if hasattr(o, "tolist"):
+        try:
+            return _jsonify(o.tolist())
+        except Exception:
+            pass
+    if isinstance(o, dict):
+        return {str(k): _jsonify(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple, set)):
+        return [_jsonify(v) for v in o]
+    if isinstance(o, Path):
+        return str(o)
+    if "torch" in type(o).__module__:
+        try:
+            return str(o)
+        except Exception:
+            return None
+    if hasattr(o, "__dict__"):
+        return {k: _jsonify(v) for k, v in vars(o).items() if not k.startswith("_")}
+    return str(o)
+
+def _extract_ultralytics_metrics(val_obj: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    box = getattr(val_obj, "box", None)
+    if box is not None:
+        out["box"] = {
+            "mp": _jsonify(getattr(box, "mp", np.nan)),
+            "mr": _jsonify(getattr(box, "mr", np.nan)),
+            "map50": _jsonify(getattr(box, "map50", np.nan)),
+            "map": _jsonify(getattr(box, "map", np.nan)),
+            "maps": _jsonify(getattr(box, "maps", [])),
+        }
+    speed = getattr(val_obj, "speed", None)
+    if speed is not None:
+        out["speed"] = _jsonify(speed)
+    cm = getattr(val_obj, "confusion_matrix", None)
+    if cm is not None and hasattr(cm, "matrix"):
+        out["confusion_matrix_shape"] = list(np.shape(getattr(cm, "matrix", [])))
+    results_dict = getattr(val_obj, "results_dict", None)
+    if results_dict:
+        out["results_dict"] = _jsonify(results_dict)
+    out["raw_summary"] = _jsonify(val_obj)
+    return out
+
+# =========================
+# Test evaluator (Hungarian; unmatched → zero)
+# =========================
+def _resolve_test_images(yolo_ds: Path, data: Dict[str, Any]) -> List[Path]:
+    entry = data.get("test")
+    if not entry:
+        return []
+    p = Path(entry)
+    if not p.is_absolute():
+        p = (yolo_ds / p).resolve()
+    if p.suffix.lower() == ".txt":
+        return [Path(s.strip()) for s in p.read_text().splitlines() if s.strip()]
+    if p.is_dir():
+        exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+        return sorted(x for x in p.rglob("*") if x.suffix.lower() in exts)
+    raise ValueError(f"Unsupported test entry in data.yaml: {entry}")
+
+def _label_path_from_image(img: Path) -> Path:
+    parts = list(img.parts)
+    try:
+        idx = parts.index("images")
+        parts[idx] = "labels"
+        lbl = Path(*parts).with_suffix(".txt")
+        if lbl.exists():
+            return lbl
+    except ValueError:
+        pass
+    return img.with_suffix(".txt")
+
+def _load_gt_xyxy(img_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    lbl = _label_path_from_image(img_path)
+    if not lbl.exists():
+        return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    W, H = PILImage.open(img_path).size
+    rows = [ln.strip() for ln in lbl.read_text().splitlines() if ln.strip()]
+    if not rows:
+        return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    xyxy, cls = [], []
+    for r in rows:
+        parts = r.split()
+        c = int(float(parts[0]))
+        xc, yc, w, h = map(float, parts[1:5])
+        Xc, Yc = xc * W, yc * H
+        Wb, Hb = w * W, h * H
+        x1, y1 = Xc - Wb / 2.0, Yc - Hb / 2.0
+        x2, y2 = Xc + Wb / 2.0, Yc + Hb / 2.0
+        xyxy.append([x1, y1, x2, y2])
+        cls.append(c)
+    return np.asarray(xyxy, np.float32), np.asarray(cls, np.int64)
+
+def _predict_xyxy(
+    model: YOLO,
+    img_path: Path,
+    *,
+    device: str,
+    imgsz: int,
+    conf: float,
+    iou: float,
+):
+    res = model.predict(
+        source=str(img_path),
+        device=device,
+        imgsz=imgsz,
+        conf=conf,
+        iou=iou,
+        verbose=False,
+    )[0]
+    if res.boxes is None or len(res.boxes) == 0:
+        return np.zeros((0, 4), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    b = res.boxes
+    xyxy = b.xyxy.cpu().numpy().astype(np.float32)
+    cls = b.cls.cpu().numpy().astype(np.int64)
+    return xyxy, cls
+
+def evaluate_test_boxes_hungarian_strict(
+    model: YOLO,
+    yolo_ds: Path,
+    *,
+    device: str = "cuda:0",
+    imgsz: int = 640,
+    conf: float = 0.001,
+    iou: float = 0.70,
+    save_jsonl: Path | None = None,
+) -> Dict[str, Any]:
+    """
+    Mirrors validator behavior:
+      - Per-image, per-class Hungarian matching on IoU.
+      - Dice = 2*IoU/(1+IoU) for matched pairs.
+      - Denominator per class += max(#GT, #Pred) → unmatched count as zero.
+    """
+    data_yaml = Path(yolo_ds) / "data.yaml"
+    if not data_yaml.exists():
+        raise FileNotFoundError(f"data.yaml not found at {data_yaml}")
+    data = yaml.safe_load(data_yaml.read_text())
+    test_imgs = _resolve_test_images(yolo_ds, data)
+    if not test_imgs:
+        raise RuntimeError("No test images resolved from data.yaml 'test' entry.")
+
+    # class count from model
+    names = getattr(model, "names", None) or {}
+    if isinstance(names, dict):
+        nc = len(names)
+        class_names = [names[i] for i in range(nc)]
+    elif isinstance(names, list):
+        nc = len(names)
+        class_names = names
+    else:
+        nc = int(max(getattr(model, "nc", 2), 2))
+        class_names = [str(i) for i in range(nc)]
+
+    dice_sum = np.zeros(nc, dtype=np.float64)
+    match_cnt = np.zeros(nc, dtype=np.int64)
+
+    jsonl_fp = None
+    if save_jsonl is not None:
+        Path(save_jsonl).parent.mkdir(parents=True, exist_ok=True)
+        jsonl_fp = open(save_jsonl, "w")
+
+    for img_path in test_imgs:
+        gt_b, gt_c = _load_gt_xyxy(img_path)
+        pr_b, pr_c = _predict_xyxy(model, img_path, device=device, imgsz=imgsz, conf=conf, iou=iou)
+
+        for c in range(nc):
+            gi = np.where(gt_c == c)[0]
+            pi = np.where(pr_c == c)[0]
+            n_g, n_p = len(gi), len(pi)
+            den = max(n_g, n_p)  # unmatched will be counted as zero via denominator
+            sum_dice = 0.0
+
+            if n_g > 0 and n_p > 0:
+                g = torch.from_numpy(gt_b[gi]).float()
+                p = torch.from_numpy(pr_b[pi]).float()
+                iou_mat = uy_box_iou(g, p).cpu().numpy()
+                # Hungarian maximize IoU
+                try:
+                    import scipy.optimize as spo
+                    row_ind, col_ind = spo.linear_sum_assignment(-iou_mat)
+                    pairs = [(r, c2, iou_mat[r, c2]) for r, c2 in zip(row_ind, col_ind)]
+                except Exception:
+                    # Greedy fallback
+                    pairs = []
+                    used_g, used_p = set(), set()
+                    flat = [(r, c2, iou_mat[r, c2]) for r in range(n_g) for c2 in range(n_p)]
+                    flat.sort(key=lambda x: x[2], reverse=True)
+                    for r, c2, v in flat:
+                        if r not in used_g and c2 not in used_p:
+                            used_g.add(r); used_p.add(c2); pairs.append((r, c2, v))
+                for _, _, u in pairs:
+                    d = (2.0 * float(u)) / (1.0 + float(u)) if u > 0.0 else 0.0
+                    sum_dice += d
+
+            dice_sum[c] += sum_dice
+            match_cnt[c] += den
+
+            if jsonl_fp is not None:
+                rec = {
+                    "image": str(img_path),
+                    "class": int(c),
+                    "n_gt": int(n_g),
+                    "n_pred": int(n_p),
+                    "sum_dice": float(sum_dice),
+                    "den": int(den)
+                }
+                jsonl_fp.write(json.dumps(rec) + "\n")
+
+    if jsonl_fp is not None:
+        jsonl_fp.close()
+
+    eps = 1e-12
+    per_class = (dice_sum / np.maximum(match_cnt, eps)).tolist()
+    macro = float(np.mean(per_class)) if nc else 0.0
+
+    return {
+        "per_class_dice": per_class,
+        "macro_dice": macro,
+        "match_count": match_cnt.tolist(),
+        "class_names": class_names,
+        "conf_used": conf,
+        "iou_used": iou,
+    }
+
+# =========================
+# CLI
+# =========================
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train/Tune/Test YOLO on glaucoma datasets.")
+    # Modes
+    p.add_argument("--train", action="store_true", help="Enable training mode.")
+    p.add_argument("--tune", action="store_true", help="Enable hyperparameter tuning mode.")
+    p.add_argument("--test-weights", type=Path, dest="test_weights",
+                   help="Path to weights for running evaluation on the TEST split.")
+    # Paths/config
+    p.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT,
+                   help=f"Root directory with datasets (default: {DEFAULT_DATA_ROOT})")
+    p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR,
+                   help=f"Output directory for YOLO dataset (default: {DEFAULT_OUT_DIR})")
+    p.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR,
+                   help=f"Output directory for runs (default: {DEFAULT_RUN_DIR})")
+    p.add_argument("--cfg", type=Path, default=DEFAULT_CFG,
+                   help=f"Ultralytics train config YAML (default: {DEFAULT_CFG})")
+    p.add_argument("--yolo-ds", type=Path,
+                   help="Path to preprocessed YOLO dataset directory (containing data.yaml).")
+    # Training/tuning knobs
+    p.add_argument("--resume", action="store_true", help="Resume training/tuning if possible.")
+    p.add_argument("--run-name", type=str, help="Run name (overrides automatic names).")
+    p.add_argument("--model", type=str, default=DEFAULT_MODEL,
+                   help=f"Starting YOLO checkpoint (default: {DEFAULT_MODEL})")
+    p.add_argument("--device", type=str, default=str(DEFAULT_DEVICE),
+                   help=f"Device: '0', 'cpu', 'mps', or '0,1' (default: {DEFAULT_DEVICE})")
+    p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help=f"Epochs (default: {DEFAULT_EPOCHS})")
+    p.add_argument("--batch", type=int, default=DEFAULT_BATCH, help=f"Batch size (default: {DEFAULT_BATCH})")
+    p.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ, help=f"Image size (default: {DEFAULT_IMGSZ})")
+    # Eval thresholds (align test with validator)
+    p.add_argument("--conf", type=float, default=DEFAULT_CONF, help=f"Confidence threshold (default: {DEFAULT_CONF})")
+    p.add_argument("--iou", type=float, default=DEFAULT_IOU, help=f"IoU threshold (default: {DEFAULT_IOU})")
+    return p.parse_args()
 
 # =========================
 # Main
@@ -381,7 +396,6 @@ if __name__ == "__main__":
     OUT_DIR: Path = args.out_dir
     RUN_DIR: Path = args.run_dir
     RUN_NAME: Optional[str] = args.run_name
-
     MODEL = args.model
     DEVICE = args.device
     CFG: Path = args.cfg
@@ -393,6 +407,11 @@ if __name__ == "__main__":
     TUNE_MODE = args.tune
     RESUME = args.resume
     TEST_WEIGHTS: Optional[Path] = args.test_weights
+    CONF_TH = float(args.conf)
+    IOU_TH = float(args.iou)
+
+    # Ensure output dir exists for test-only runs as well
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] DATA_ROOT = {DATA_ROOT}")
     print(f"[INFO] OUT_DIR   = {OUT_DIR}")
@@ -403,6 +422,7 @@ if __name__ == "__main__":
     print(f"[INFO] EPOCHS    = {EPOCHS}")
     print(f"[INFO] BATCH     = {BATCH}")
     print(f"[INFO] IMGSZ     = {IMGSZ}")
+    print(f"[INFO] CONF/IOU  = {CONF_TH} / {IOU_TH}")
     print(f"[INFO] MODES     = train={TRAIN_MODE}, tune={TUNE_MODE}, test={'yes' if TEST_WEIGHTS else 'no'}")
 
     # Resolve dataset YAML
@@ -413,11 +433,12 @@ if __name__ == "__main__":
         print(f"[INFO] Using pre-existing YOLO dataset: {YOLO_DS}")
     else:
         # If testing only and no yolo-ds is provided, fail fast (avoid huge scan/build on cluster unexpectedly)
-        if TEST_WEIGHTS and not (TRAIN_MODE or TUNE_MODE):
-            raise RuntimeError("[ERR] Testing requested but --yolo-ds not provided. Supply a prebuilt dataset.")
+        # if TEST_WEIGHTS and not (TRAIN_MODE or TUNE_MODE):
+        #     raise RuntimeError("[ERR] Testing requested but --yolo-ds not provided. Supply a prebuilt dataset.")
         print("[INFO] Creating YOLO dataset (no --yolo-ds provided)…")
         images = scan_filter(DATA_ROOT, OUT_DIR)
         data_yaml = create_yolo_ds(images, OUT_DIR)
+        YOLO_DS = OUT_DIR  # set for later use
 
     print(f"[INFO] data.yaml = {data_yaml}")
 
@@ -466,7 +487,6 @@ if __name__ == "__main__":
         print("[OK] Best hyperparameters saved at:", best)
 
     # TEST
-    # TEST
     if TEST_WEIGHTS:
         if not TEST_WEIGHTS.exists():
             raise FileNotFoundError(f"[ERR] --test-weights not found: {TEST_WEIGHTS}")
@@ -474,37 +494,38 @@ if __name__ == "__main__":
         print(f"[INFO] Running final evaluation on the TEST set… weights={TEST_WEIGHTS}")
         model = YOLO(str(TEST_WEIGHTS))
 
-        # 3.1 Ultralytics' built-in evaluation (kept as-is)
-        metrics = model.val(
+        # 1) Ultralytics built-in evaluation (use same thresholds)
+        val_obj = model.val(
             data=str(data_yaml),
             split="test",
             device=DEVICE,
             imgsz=IMGSZ,
             batch=BATCH,
+            conf=CONF_TH,
+            iou=IOU_TH,
             save_json=True,
             plots=True,
         )
         out_json = OUT_DIR / "test_metrics.json"
         with open(out_json, "w") as f:
-            json.dump(metrics, f, indent=2)
+            json.dump(_extract_ultralytics_metrics(val_obj), f, indent=2)
         print(f"[OK] Saved test metrics to: {out_json}")
 
-        # 3.2 Additional per-prediction Dice (boxes) and box-loss summary
-        #     Pass the YOLO dataset directory so we can find data.yaml and label files.
-        yolo_ds_dir = args.yolo_ds if args.yolo_ds else OUT_DIR  # if you created DS in this run
-        summary, per_pred_path, summary_path = evaluate_test_boxes(
+        # 2) Strict Dice with unmatched counted as zero (Hungarian; same thresholds)
+        yolo_ds_dir = YOLO_DS if YOLO_DS is not None else OUT_DIR
+        summary = evaluate_test_boxes_hungarian_strict(
             model=model,
             yolo_ds=yolo_ds_dir,
-            out_dir=OUT_DIR,
             device=DEVICE,
             imgsz=IMGSZ,
-            conf=0.25,  # adjust to your detector's operating point
+            conf=CONF_TH,
+            iou=IOU_TH,
+            save_jsonl=OUT_DIR / "test_dice_records.jsonl",
         )
-        # Optional: also persist an aggregated file alongside Ultralytics metrics
         agg_json = OUT_DIR / "test_box_summary_combined.json"
         with open(agg_json, "w") as f:
             json.dump({
-                "ultralytics": metrics,
+                "ultralytics": _extract_ultralytics_metrics(val_obj),
                 "box_metrics_summary": summary
             }, f, indent=2)
         print(f"[OK] Saved combined summary to: {agg_json}")
