@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=YOLO
+#SBATCH --job-name=YOLO_WITH_PAPILA
 #SBATCH --account=st-ipor-1-gpu
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=2:00:00
+#SBATCH --time=72:00:00
 #SBATCH --gpus=1
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A_%a.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A_%a.err
@@ -48,6 +48,9 @@ mkdir -p "${REPO_DIR}/logs" /scratch/st-ipor-1/cperez/MedSAM/hpc_logs
 #   sbatch --array=0-2 ./slurm/train.slurm --modes=train,test,test
 #
 #   sbatch --array=0-1 ./slurm/train.slurm --modes=train,tune
+
+#   sbatch ./slurm/train.slurm --modes=train_test
+
 #
 # If you submit without --array, the script will run only the first mode.
 
