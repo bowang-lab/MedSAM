@@ -106,7 +106,7 @@ ARGS_TRAIN=(
 ARGS_TRAIN_TEST=(
   --run-dir "${REPO_DIR}/Nov12"
   --data-root "${DATA_DIR}"
-  --yolo-ds "${OUT_DIR}"
+#  --yolo-ds "${OUT_DIR}"
   --run-name "With10%Papila"
   --model "${WEIGHTS_LOCAL}"
   --out-dir "${OUT_DIR}"
