@@ -37,9 +37,9 @@ DEFAULT_CONF = 0.01
 DEFAULT_IOU = 0.7
 SEED = 42
 
-TRAIN_RATIO = 0.0
-VAL_RATIO = 0.0
-TEST_RATIO = 1.0
+TRAIN_RATIO = 0.8
+VAL_RATIO = 0.1
+TEST_RATIO = 0.1
 
 VISUALIZE_ONE = False
 
@@ -93,7 +93,8 @@ def scan_filter(DATA_ROOT: Path, OUT_DIR: Path):
     print("[INFO] Scanning datasets…")
     image_factory = ImageFactory(root=DATA_ROOT, auto_scan=True)
     image_factory.filter_empty_masks()
-    image_factory.filter_datasets(include=["PAPILA"])
+    # image_factory.filter_datasets(include=["PAPILA"])
+    excluded_papila = image_factory.retain_percentage_in_dataset("PAPILA", 0.1)
     images = image_factory.make_images()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     image_factory.save_images(images, OUT_DIR / "saved_images.jsonl")
@@ -105,11 +106,49 @@ def scan_filter(DATA_ROOT: Path, OUT_DIR: Path):
             images[0].visualize(show=True)
         except Exception as e:
             print(f"[WARN] Visualization failed: {e!r}")
-    return images
+    return images, excluded_papila
 
-def create_yolo_ds(images, OUT_DIR: Path) -> Path:
+def create_yolo_ds(
+    images,
+    OUT_DIR: Path,
+    *,
+    train_ratio: float = TRAIN_RATIO,
+    val_ratio: float = VAL_RATIO,
+    test_ratio: float = TEST_RATIO,
+) -> Path:
+    """
+    Create the YOLO dataset structure at OUT_DIR using the provided split ratios.
+
+    Parameters
+    ----------
+    images : Iterable
+        Collection of Image objects to materialize into a YOLO dataset.
+    OUT_DIR : Path
+        Output directory where the YOLO dataset (images/, labels/, data.yaml) will be created.
+    train_ratio : float, optional
+        Proportion of images assigned to the training split. Defaults to module-level TRAIN_RATIO.
+    val_ratio : float, optional
+        Proportion of images assigned to the validation split. Defaults to module-level VAL_RATIO.
+    test_ratio : float, optional
+        Proportion of images assigned to the test split. Defaults to module-level TEST_RATIO.
+
+    Returns
+    -------
+    Path
+        Path to the generated data.yaml.
+
+    Notes
+    -----
+    - Existing defaults are preserved; callers can override via keyword args.
+    """
     print("[INFO] Creating YOLO dataset structure…")
-    create_yolo_dataset(images, train=TRAIN_RATIO, val=VAL_RATIO, test=TEST_RATIO, out_dir=OUT_DIR)
+    create_yolo_dataset(
+        images,
+        train=train_ratio,
+        val=val_ratio,
+        test=test_ratio,
+        out_dir=OUT_DIR,
+    )
     data_yaml = infer_data_yaml_path(OUT_DIR)
     if not data_yaml.exists():
         raise FileNotFoundError(f"`data.yaml` not found at {data_yaml}.")
@@ -469,8 +508,11 @@ if __name__ == "__main__":
         print(f"[INFO] Using pre-existing YOLO dataset: {YOLO_DS}")
     else:
         print("[INFO] Creating YOLO dataset (no --yolo-ds provided)…")
-        images = scan_filter(DATA_ROOT, OUT_DIR)
+        images, excluded = scan_filter(DATA_ROOT, OUT_DIR)
         data_yaml = create_yolo_ds(images, OUT_DIR)
+        data_yaml_excluded = create_yolo_ds(excluded, Path(str(OUT_DIR) + "_papila_excluded"),
+                                            train_ratio=0.0, val_ratio = 0.0, test_ratio=1.0)
+
         YOLO_DS = OUT_DIR  # set for later use
 
     print(f"[INFO] data.yaml = {data_yaml}")

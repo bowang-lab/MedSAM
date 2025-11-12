@@ -19,7 +19,7 @@ set -euo pipefail
 # User-configurable paths  #
 ############################
 REPO_DIR="/scratch/st-ipor-1/cperez/MedSAM"
-OUT_DIR="/scratch/st-ipor-1/cperez/MedSAM/TRAINING_DS"
+OUT_DIR="/scratch/st-ipor-1/cperez/MedSAM/PAPILA_TRAINING_DS"
 DATA_DIR="/arc/project/st-ipor-1/carlosp/fundus_data/All_Datasets_Organized"
 CONFIG="${REPO_DIR}/src/configs/train_custom.yaml"
 WEIGHTS_LOCAL="${REPO_DIR}/weights/yolo12x.pt"
@@ -88,10 +88,10 @@ echo "[INFO] Selected MODE=${MODE}"
 ARGS_TRAIN=(
   --train
   --resume
-  --run-dir "${REPO_DIR}/runs"
+  --run-dir "${REPO_DIR}/Nov12"
   --data-root "${DATA_DIR}"
   --yolo-ds "${OUT_DIR}"
-  --run-name "MultiClassV2-6616729-0"
+  --run-name "With10%Papila"
   --model "${REPO_DIR}/runs/MultiClassV2-6616729-0/weights/last.pt"
   --out-dir "${OUT_DIR}"
   --cfg "${CONFIG}"

@@ -58,7 +58,7 @@ PAD_DEFAULTS = [0.00, 0.05, 0.10, 0.20, 0.30]
 
 DEFAULT_DATA_ROOT = Path("/Users/carlosperez/Library/CloudStorage/OneDrive-UBC/Ipek_Carlos/GlaucomaDatasets/All_Datasets_Organized")
 DEFAULT_OUT_DIR   = Path("/Users/carlosperez/PycharmProjects/MedSAM/EVAL")
-DEFAULT_MEDSAM_CKPT = "/Users/carlosperez/PycharmProjects/MedSAM/work_dir/MedSAM/medsam_updated.pth"
+DEFAULT_MEDSAM_CKPT = "/Users/carlosperez/PycharmProjects/MedSAM/work_dir/MedSAM/medsam_updatedV2.pth"
 
 # =============================
 # Small helpers

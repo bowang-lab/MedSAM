@@ -4,41 +4,15 @@ End-to-end optic disc/cup prediction → MedSAM segmentation pipeline.
 
 What's new in this revision
 ---------------------------
-- Removed the --mode switch. The pipeline always loads images via ImageFactory
-  (to guarantee access to ground-truth masks/metadata).
-- Optional YOLO subset filter: if --yolo-ds is provided, the factory-built list
-  is filtered to the intersection with the image stems found under
-  <yolo-ds>/images/<split>. This lets you run inference on a YOLO-defined
-  subset while still using the factory to supply GT masks.
-- Maintains the --box-pad-frac flag (default 0.05 = 5%) to pad detector boxes
-  before MedSAM prompting.
-- Summary-only flow unchanged.
-
-Typical usages
---------------
-Factory only (all/filtered datasets, with/without require-complete):
-python predict.py \
-  --data-root /path/to/All_Datasets_Organized \
-  --yolo-weights runs/train/best.pt \
-  --medsam-checkpoint /path/to/medsam_vit_b.pth \
-  --out-dir /path/to/out \
-  --conf 0.001 --iou 0.70 --imgsz 640 \
-  --save-overlays
-
-Factory + YOLO subset (restrict to images listed in YOLO splits):
-python predict.py \
-  --data-root /path/to/All_Datasets_Organized \
-  --yolo-ds /path/to/yolo_dataset \
-  --splits val,test \
-  --yolo-weights runs/train/best.pt \
-  --medsam-checkpoint /path/to/medsam_vit_b.pth \
-  --out-dir /path/to/out \
-  --conf 0.001 --iou 0.70 --imgsz 640 \
-  --box-pad-frac 0.05 \
-  --save-overlays
-
-Offline summary only:
-python predict.py --summary-only --out-dir /path/to/out --jsonl /path/to/out/predictions.jsonl
+- Factory-only pipeline (always builds Image objects via ImageFactory to ensure GT masks).
+- Optional YOLO subset filter: if --yolo-ds is provided, we restrict the factory-built list
+  to stems listed under <yolo-ds>/images/<split>.
+- Summary now reports, for every category:
+    • Means + Standard Deviation (std) + Standard Error (se)
+    • For GT↔Pred metric *errors* (cdr_v, cdr_h, rim_over_disc, I_over_S, I_over_N, I_over_T):
+        - MAE, RMSE, signed bias (mean error), std, se, and count n
+- --summary-only recomputes all summary stats (incl. MAE/RMSE/std/se) from predictions.jsonl
+  without rerunning detection/segmentation (reconstructs metrics from saved masks and/or GT boxes).
 """
 
 from __future__ import annotations
@@ -163,6 +137,85 @@ def _collect_yolo_split_stems(yolo_ds: Path, splits: List[str]) -> Set[str]:
                 stems.add(p.stem)
     return stems
 
+def _is_finite(x: Optional[float]) -> bool:
+    return (x is not None) and np.isfinite(x)
+
+# ===== Metric helpers (mask-based; mirror Image methods, used for summary_jsonl) =====
+
+def _cdr_from_masks(disc_mask: Optional[np.ndarray], cup_mask: Optional[np.ndarray], axis: str = "vertical") -> Optional[float]:
+    if disc_mask is None or cup_mask is None:
+        return None
+    d = (disc_mask > 0)
+    c = (cup_mask > 0)
+    if not d.any():
+        return None
+    ys_d, xs_d = np.nonzero(d)
+    ys_c, xs_c = np.nonzero(c)
+    if ys_d.size == 0:
+        return None
+    if axis == "vertical":
+        d_extent = float(ys_d.max() - ys_d.min() + 1)
+        c_extent = float(ys_c.max() - ys_c.min() + 1) if ys_c.size else 0.0
+    else:
+        d_extent = float(xs_d.max() - xs_d.min() + 1)
+        c_extent = float(xs_c.max() - xs_c.min() + 1) if xs_c.size else 0.0
+    return (c_extent / d_extent) if d_extent > 0 else None
+
+def _rim_metrics_from_masks(
+    disc_mask: Optional[np.ndarray],
+    cup_mask: Optional[np.ndarray],
+    *,
+    laterality: Optional[str],
+) -> Optional[Dict[str, Optional[float]]]:
+    if disc_mask is None or cup_mask is None:
+        return None
+    disc = (disc_mask > 0)
+    cup = (cup_mask > 0)
+    if not disc.any():
+        return None
+
+    H, W = disc.shape
+    rim = disc & (~cup)
+
+    disc_area = float(disc.sum())
+    rim_area = float(rim.sum())
+    r_over_d = rim_area / disc_area if disc_area > 0 else np.nan
+
+    ys, xs = np.nonzero(disc)
+    yc = float(ys.mean()) if ys.size else (H / 2.0)
+    xc = float(xs.mean()) if xs.size else (W / 2.0)
+
+    superior = (np.arange(H)[:, None] < yc)
+    inferior = ~superior
+
+    rim_sup = float((rim & superior).sum())
+    rim_inf = float((rim & inferior).sum())
+
+    def _safe(a: float, b: float) -> float:
+        return float(a / b) if b > 0 else np.nan
+
+    out: Dict[str, Optional[float]] = {
+        "rim_over_disc": r_over_d,
+        "I_over_S": _safe(rim_inf, rim_sup),
+        "I_over_N": None,
+        "I_over_T": None,
+    }
+
+    if laterality:
+        lat = str(laterality).upper()
+        left = (np.arange(W)[None, :] < xc)
+        right = ~left
+        if lat == "OD":
+            nasal, temporal = left, right
+        else:
+            nasal, temporal = right, left
+        rim_nas = float((rim & nasal).sum())
+        rim_tem = float((rim & temporal).sum())
+        out["I_over_N"] = _safe(rim_inf, rim_nas)
+        out["I_over_T"] = _safe(rim_inf, rim_tem)
+
+    return out
+
 # =========================
 # MedSAM wrapper
 # =========================
@@ -189,9 +242,6 @@ class MedSAM:
 
     @torch.no_grad()
     def embed_image(self, img_rgb: np.ndarray) -> Tuple[torch.Tensor, int, int]:
-        """
-        Prepare 3-channel uint8 image → (embedding, H, W).
-        """
         from skimage import transform  # type: ignore
 
         H, W = img_rgb.shape[:2]
@@ -214,10 +264,6 @@ class MedSAM:
             W: int,
             threshold: float = 0.5,
     ) -> List[np.ndarray]:
-        """
-        Robust multi-box inference for a *single image* embedding.
-        Iterate one box at a time while reusing the same embedding to match SAM prompt shapes.
-        """
         import torch.nn.functional as F  # local import
 
         if boxes_xyxy_pixel is None:
@@ -232,7 +278,6 @@ class MedSAM:
 
         for k in range(boxes_xyxy_pixel.shape[0]):
             box_xyxy = boxes_xyxy_pixel[k: k + 1]  # (1,4)
-            # Scale to 1024x1024 as expected by prompt encoder
             box_1024 = box_xyxy / np.array([W, H, W, H], dtype=np.float32) * 1024.0
             box_t = torch.as_tensor(box_1024, dtype=torch.float32, device=image_embedding.device)  # (1,4)
             box_t = box_t[:, None, :]  # -> (1,1,4)
@@ -306,7 +351,7 @@ class ODCupDetector:
             idx = np.where(cls == cls_id)[0]
             if idx.size == 0:
                 continue
-            j = idx[np.argmax(conf[idx])]  # SINGLE max-confidence prediction
+            j = idx[np.argmax(conf[idx])]
             xc, yc, w, h = map(float, xywhn[j, :4])
             out[cls_id] = (NormalizedBox(xc, yc, w, h), float(conf[j]))
         return out
@@ -348,15 +393,9 @@ class ODCupPredictor:
         self.summary_path = self.pcfg.out_dir / self.pcfg.summary_json
         self.per_image_csv_path = self.pcfg.out_dir / self.pcfg.per_image_csv
 
-        # Padding fraction (per side) for detector boxes before SAM prompting
         self.box_pad_frac = float(max(0.0, min(1.0, box_pad_frac)))
 
     def _predict_one(self, img: Image) -> Dict[str, Any]:
-        """
-        Predict top-1 boxes for disc/cup, run MedSAM with BOTH boxes (if present),
-        and attach results to the Image object. Also computes and caches Dice.
-        Returns a serializable record for JSONL.
-        """
         assert self.det is not None and self.sam is not None, "Detector and MedSAM must be initialized for prediction."
 
         # --- Detector: top-1 per class
@@ -378,14 +417,12 @@ class ODCupPredictor:
 
         if disc_box is not None:
             xyxy = _xyxy_from_norm(disc_box, W, H)
-            xyxy_padded = _pad_xyxy_box(xyxy, W, H, self.box_pad_frac)
-            boxes_xyxy.append(xyxy_padded)
+            boxes_xyxy.append(_pad_xyxy_box(xyxy, W, H, self.box_pad_frac))
             order_map.append(0)
 
         if cup_box is not None:
             xyxy = _xyxy_from_norm(cup_box, W, H)
-            xyxy_padded = _pad_xyxy_box(xyxy, W, H, self.box_pad_frac)
-            boxes_xyxy.append(xyxy_padded)
+            boxes_xyxy.append(_pad_xyxy_box(xyxy, W, H, self.box_pad_frac))
             order_map.append(1)
 
         masks_by_class: Dict[int, Optional[np.ndarray]] = {0: None, 1: None}
@@ -416,10 +453,10 @@ class ODCupPredictor:
         if pcm is not None:
             _save_png(cup_m_path, _to_uint8_mask(pcm))
 
-        # Compute and cache Dice (falls back to boxes if masks missing)
+        # Compute and cache Dice
         dice = img.update_mask_dice(fallback_to_boxes=True)
 
-        # Optional overlay (uses Image.visualize, which shows Dice now)
+        # Optional overlay
         if self.pcfg.save_overlays:
             ov_path = self.viz_dir / f"{img.uid}_overlay.png"
             try:
@@ -427,26 +464,26 @@ class ODCupPredictor:
             except Exception:
                 pass
 
-        # GT mask paths if available (for offline summaries)
+        # GT mask paths if available
         disc_gt_path = getattr(img.gt_disc_mask, "path", None)
         cup_gt_path  = getattr(img.gt_cup_mask,  "path", None)
 
-        # Build record
+        laterality = getattr(img, "laterality", None)
+        laterality_str = getattr(laterality, "name", None) if laterality is not None else None
+
         rec: Dict[str, Any] = {
             "uid": img.uid,
             "dataset": img.dataset,
             "subject_id": img.subject_id,
             "image_path": str(img.image_path),
+            "laterality": laterality_str,  # optional
             "detector": {
                 "disc": {"conf": disc_conf, "box_norm": (disc_box.as_tuple() if disc_box else None)},
                 "cup":  {"conf": cup_conf,  "box_norm": (cup_box.as_tuple()  if cup_box  else None)},
                 "conf_th": self.det.cfg.conf,
                 "iou_th": self.det.cfg.iou,
             },
-            "sam_prompt": {
-                "pad_frac": self.box_pad_frac,
-                "boxes_xyxy_padded": [tuple(map(float, b)) for b in boxes_xyxy],
-            },
+            "sam_prompt": {"pad_frac": self.box_pad_frac},
             "pred_masks": {
                 "disc_path": str(disc_m_path) if pdm is not None else None,
                 "cup_path":  str(cup_m_path)  if pcm is not None else None,
@@ -463,16 +500,12 @@ class ODCupPredictor:
                 "disc_path": str(disc_gt_path) if disc_gt_path else None,
                 "cup_path":  str(cup_gt_path)  if cup_gt_path  else None,
             },
-            # Cached dice in record for convenience
             "dice": {"disc": dice.get("disc"), "cup": dice.get("cup")},
             "split": img.split,
         }
         return rec
 
     def predict(self, images: List[Image], limit: Optional[int] = None) -> None:
-        """
-        Run the full pipeline and write JSONL + per-image CSV (filename, Dice).
-        """
         assert self.det is not None and self.sam is not None, "Detector and MedSAM must be initialized for prediction."
         if limit is not None:
             images = images[: int(limit)]
@@ -483,12 +516,10 @@ class ODCupPredictor:
             for img in images:
                 rec = self._predict_one(img)
                 f.write(json.dumps(rec) + "\n")
-                # Collect for CSV
                 image_name = Path(rec["image_path"]).name
                 dd = rec.get("dice", {})
                 rows_for_csv.append((image_name, dd.get("disc"), dd.get("cup")))
 
-        # Write per-image CSV (image_name, dice_disc, dice_cup)
         with open(self.per_image_csv_path, "w", newline="") as cf:
             writer = csv.writer(cf)
             writer.writerow(["image_name", "dice_disc", "dice_cup"])
@@ -514,10 +545,30 @@ class ODCupPredictor:
             return 0.0
         return float(pb.dice(gb))
 
+    @staticmethod
+    def _mean_std_se(xs: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
+        n = len(xs)
+        if n == 0:
+            return None, None, None, 0
+        mean = float(np.mean(xs))
+        std = float(np.std(xs, ddof=1)) if n > 1 else 0.0
+        se = (std / float(np.sqrt(n))) if n > 0 else None
+        return mean, std, se, n
+
+    @staticmethod
+    def _rate_stats(successes: int, n: int) -> Dict[str, Optional[float]]:
+        if n <= 0:
+            return {"p": None, "std": None, "se": None, "n": 0}
+        p = successes / n
+        std = float(np.sqrt(p * (1 - p)))  # Bernoulli std per-trial
+        se = float(np.sqrt(p * (1 - p) / n))
+        return {"p": float(p), "std": std, "se": se, "n": n}
+
     def summarize(self, images: List[Image]) -> Dict[str, Any]:
         """
         Compute summary statistics using in-memory Image objects.
         Falls back to rasterized GT boxes if GT masks are absent.
+        Also computes RMSE/std/se for GT↔Pred metric errors.
         """
         n = len(images)
 
@@ -534,17 +585,22 @@ class ODCupPredictor:
         strict_box_disc, strict_box_cup = [], []
         paired_box_disc, paired_box_cup = [], []
 
+        # Metric error accumulators (signed errors)
+        err_values: Dict[str, List[float]] = {
+            "cdr_v": [], "cdr_h": [],
+            "rim_over_disc": [], "I_over_S": [], "I_over_N": [], "I_over_T": []
+        }
+
         for im in images:
-            # Image dimensions
             W, H = im.width, im.height
 
-            # Load masks if present (aligned via Image helper)
+            # Load masks (aligned)
             gdm = im._mask_to_image_size(im.gt_disc_mask) if im.gt_disc_mask is not None else None
             gcm = im._mask_to_image_size(im.gt_cup_mask)  if im.gt_cup_mask  is not None else None
             pdm = im._mask_to_image_size(im.pred_disc_mask) if im.pred_disc_mask is not None else None
             pcm = im._mask_to_image_size(im.pred_cup_mask)  if im.pred_cup_mask  is not None else None
 
-            # Fallback: rasterize GT boxes if GT masks are missing
+            # Fallback: rasterize GT boxes if GT masks missing
             if gdm is None and im.gt_disc_box is not None:
                 gdm = _mask_from_norm_box(im.gt_disc_box.as_tuple(), H, W)
             if gcm is None and im.gt_cup_box is not None:
@@ -562,7 +618,7 @@ class ODCupPredictor:
                 if pcm is not None:
                     paired_mask_cup.append(d)
 
-            # Boxes (pred boxes from masks already set on Image)
+            # Boxes
             strict_box_disc.append(self._box_dice(im.pred_disc_box, im.gt_disc_box))
             strict_box_cup.append(self._box_dice(im.pred_cup_box,  im.gt_cup_box))
             if (im.pred_disc_box is not None) and (im.gt_disc_box is not None):
@@ -570,8 +626,69 @@ class ODCupPredictor:
             if (im.pred_cup_box is not None) and (im.gt_cup_box is not None):
                 paired_box_cup.append(self._box_dice(im.pred_cup_box,  im.gt_cup_box))
 
+            # Metric errors (signed)
+            gt_v = im.cdr(use_pred=False, axis="vertical")
+            pr_v = im.cdr(use_pred=True,  axis="vertical")
+            if _is_finite(gt_v) and _is_finite(pr_v):
+                err_values["cdr_v"].append(float(pr_v - gt_v))
+
+            gt_h = im.cdr(use_pred=False, axis="horizontal")
+            pr_h = im.cdr(use_pred=True,  axis="horizontal")
+            if _is_finite(gt_h) and _is_finite(pr_h):
+                err_values["cdr_h"].append(float(pr_h - gt_h))
+
+            gt_r = im.rim_metrics(use_pred=False)
+            pr_r = im.rim_metrics(use_pred=True)
+            if gt_r and pr_r:
+                for k in ("rim_over_disc", "I_over_S", "I_over_N", "I_over_T"):
+                    gt = gt_r.get(k, None)
+                    pr = pr_r.get(k, None)
+                    if _is_finite(gt) and _is_finite(pr):
+                        err_values[k].append(float(pr - gt))
+
+        # Aggregations
+        def _agg_dict(xs: List[float]) -> Dict[str, Optional[float]]:
+            mean, std, se, n_ = self._mean_std_se(xs)
+            return {"mean": mean, "std": std, "se": se, "n": n_}
+
+        # Dice aggregates
+        md_stats = {
+            "strict_disc": _agg_dict(strict_mask_disc),
+            "strict_cup":  _agg_dict(strict_mask_cup),
+            "paired_disc": _agg_dict(paired_mask_disc),
+            "paired_cup":  _agg_dict(paired_mask_cup),
+        }
+        bd_stats = {
+            "strict_disc": _agg_dict(strict_box_disc),
+            "strict_cup":  _agg_dict(strict_box_cup),
+            "paired_disc": _agg_dict(paired_box_disc),
+            "paired_cup":  _agg_dict(paired_box_cup),
+        }
+
+        # Keep legacy "mean" fields for backward compatibility
         def _mean_or_null(x: List[float]) -> Optional[float]:
-            return float(np.mean(x)) if x else None  # JSON 'null' when undefined
+            return float(np.mean(x)) if x else None
+
+        # Error metrics: MAE / RMSE / bias / std / se
+        metric_error: Dict[str, Dict[str, Optional[float]]] = {}
+        for k, vals in err_values.items():
+            n_k = len(vals)
+            if n_k == 0:
+                metric_error[k] = {"mae": None, "rmse": None, "bias": None, "std": None, "se": None, "n": 0}
+            else:
+                v = np.asarray(vals, dtype=float)
+                mae = float(np.mean(np.abs(v)))
+                rmse = float(np.sqrt(np.mean(v * v)))
+                bias = float(np.mean(v))
+                std = float(np.std(v, ddof=1)) if n_k > 1 else 0.0
+                se = float(std / np.sqrt(n_k)) if n_k > 0 else None
+                metric_error[k] = {"mae": mae, "rmse": rmse, "bias": bias, "std": std, "se": se, "n": n_k}
+
+        # Rate stats (binomial)
+        det_rate_disc = det_disc / max(1, n)
+        det_rate_cup  = det_cup  / max(1, n)
+        seg_rate_disc = seg_disc / max(1, n)
+        seg_rate_cup  = seg_cup  / max(1, n)
 
         summary: Dict[str, Any] = {
             "counts": {
@@ -582,11 +699,18 @@ class ODCupPredictor:
                 "segmented_cup": seg_cup,
             },
             "rates": {
-                "det_rate_disc": det_disc / max(1, n),
-                "det_rate_cup": det_cup / max(1, n),
-                "seg_rate_disc": seg_disc / max(1, n),
-                "seg_rate_cup": seg_cup / max(1, n),
+                "det_rate_disc": det_rate_disc,
+                "det_rate_cup":  det_rate_cup,
+                "seg_rate_disc": seg_rate_disc,
+                "seg_rate_cup":  seg_rate_cup,
             },
+            "rates_stats": {
+                "det_rate_disc": self._rate_stats(det_disc, n),
+                "det_rate_cup":  self._rate_stats(det_cup, n),
+                "seg_rate_disc": self._rate_stats(seg_disc, n),
+                "seg_rate_cup":  self._rate_stats(seg_cup, n),
+            },
+            # Legacy means (back-compat)
             "mask_dice": {
                 "strict_mean_disc": _mean_or_null(strict_mask_disc),
                 "strict_mean_cup":  _mean_or_null(strict_mask_cup),
@@ -601,6 +725,10 @@ class ODCupPredictor:
                 "paired_mean_disc": _mean_or_null(paired_box_disc),
                 "paired_mean_cup":  _mean_or_null(paired_box_cup),
             },
+            # New detailed stats
+            "mask_dice_stats": md_stats,
+            "box_dice_stats":  bd_stats,
+            "metric_error":    metric_error,
         }
 
         self.summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -613,8 +741,8 @@ class ODCupPredictor:
     def summarize_jsonl(self, jsonl_path: Optional[Path] = None) -> Dict[str, Any]:
         """
         Offline summary: read predictions.jsonl, load mask files, and compute
-        mask/box metrics. Uses GT mask paths if present; otherwise falls back to
-        rasterized GT boxes. Never writes NaN (uses null when undefined).
+        mask/box distributions and GT↔Pred metric errors with MAE/RMSE/std/se.
+        Uses GT mask paths if present; otherwise falls back to rasterized GT boxes.
         """
         jp = Path(jsonl_path) if jsonl_path else self.jsonl_path
         if not jp.exists():
@@ -627,6 +755,11 @@ class ODCupPredictor:
         det_disc = det_cup = seg_disc = seg_cup = 0
         n_images = 0
 
+        err_values: Dict[str, List[float]] = {
+            "cdr_v": [], "cdr_h": [],
+            "rim_over_disc": [], "I_over_S": [], "I_over_N": [], "I_over_T": []
+        }
+
         with open(jp, "r") as f:
             for line in f:
                 rec = json.loads(line)
@@ -638,13 +771,13 @@ class ODCupPredictor:
                 if rec["detector"]["disc"]["box_norm"] is not None: det_disc += 1
                 if rec["detector"]["cup"]["box_norm"]  is not None: det_cup  += 1
 
-                # Load predicted masks
+                # Predicted masks
                 pdm = _read_mask_path(rec.get("pred_masks", {}).get("disc_path"))
                 pcm = _read_mask_path(rec.get("pred_masks", {}).get("cup_path"))
                 if pdm is not None: seg_disc += 1
                 if pcm is not None: seg_cup  += 1
 
-                # GT references: prefer masks (if present), else rasterize boxes
+                # GT references
                 gdm = _read_mask_path(rec.get("gt_masks", {}).get("disc_path"))
                 gcm = _read_mask_path(rec.get("gt_masks", {}).get("cup_path"))
                 if gdm is None:
@@ -673,7 +806,7 @@ class ODCupPredictor:
                 pb_disc_nb = NormalizedBox(*pb_disc) if pb_disc else None
                 pb_cup_nb  = NormalizedBox(*pb_cup)  if pb_cup  else None
                 gb_disc_nb = NormalizedBox(*gb_disc) if gb_disc else None
-                gb_cup_nb  = NormalizedBox(*gb_cup)  if gb_cup else None
+                gb_cup_nb  = NormalizedBox(*gb_cup)  if gb_cup  else None
 
                 strict_box_disc.append(self._box_dice(pb_disc_nb, gb_disc_nb))
                 strict_box_cup.append(self._box_dice(pb_cup_nb,  gb_cup_nb))
@@ -682,8 +815,71 @@ class ODCupPredictor:
                 if pb_cup_nb and gb_cup_nb:
                     paired_box_cup.append(self._box_dice(pb_cup_nb,  gb_cup_nb))
 
+                # Metric errors (signed), using masks; laterality if present
+                laterality = rec.get("laterality")
+
+                cdr_v_gt = _cdr_from_masks(gdm, gcm, axis="vertical")
+                cdr_v_pr = _cdr_from_masks(pdm, pcm, axis="vertical")
+                cdr_h_gt = _cdr_from_masks(gdm, gcm, axis="horizontal")
+                cdr_h_pr = _cdr_from_masks(pdm, pcm, axis="horizontal")
+
+                for key, gt, pr in (("cdr_v", cdr_v_gt, cdr_v_pr), ("cdr_h", cdr_h_gt, cdr_h_pr)):
+                    if _is_finite(gt) and _is_finite(pr):
+                        err_values[key].append(float(pr - gt))
+
+                rm_gt = _rim_metrics_from_masks(gdm, gcm, laterality=laterality)
+                rm_pr = _rim_metrics_from_masks(pdm, pcm, laterality=laterality)
+                if rm_gt and rm_pr:
+                    for k in ("rim_over_disc", "I_over_S", "I_over_N", "I_over_T"):
+                        gt = rm_gt.get(k)
+                        pr = rm_pr.get(k)
+                        if _is_finite(gt) and _is_finite(pr):
+                            err_values[k].append(float(pr - gt))
+
+        # Aggregations
         def _mean_or_null(xs: List[float]) -> Optional[float]:
             return float(np.mean(xs)) if xs else None
+
+        def _agg(xs: List[float]) -> Dict[str, Optional[float]]:
+            n = len(xs)
+            if n == 0:
+                return {"mean": None, "std": None, "se": None, "n": 0}
+            mean = float(np.mean(xs))
+            std = float(np.std(xs, ddof=1)) if n > 1 else 0.0
+            se = float(std / np.sqrt(n)) if n > 0 else None
+            return {"mean": mean, "std": std, "se": se, "n": n}
+
+        md_stats = {
+            "strict_disc": _agg(strict_mask_disc),
+            "strict_cup":  _agg(strict_mask_cup),
+            "paired_disc": _agg(paired_mask_disc),
+            "paired_cup":  _agg(paired_mask_cup),
+        }
+        bd_stats = {
+            "strict_disc": _agg(strict_box_disc),
+            "strict_cup":  _agg(strict_box_cup),
+            "paired_disc": _agg(paired_box_disc),
+            "paired_cup":  _agg(paired_box_cup),
+        }
+
+        metric_error: Dict[str, Dict[str, Optional[float]]] = {}
+        for k, vals in err_values.items():
+            n_k = len(vals)
+            if n_k == 0:
+                metric_error[k] = {"mae": None, "rmse": None, "bias": None, "std": None, "se": None, "n": 0}
+            else:
+                v = np.asarray(vals, dtype=float)
+                mae = float(np.mean(np.abs(v)))
+                rmse = float(np.sqrt(np.mean(v * v)))
+                bias = float(np.mean(v))
+                std = float(np.std(v, ddof=1)) if n_k > 1 else 0.0
+                se = float(std / np.sqrt(n_k)) if n_k > 0 else None
+                metric_error[k] = {"mae": mae, "rmse": rmse, "bias": bias, "std": std, "se": se, "n": n_k}
+
+        det_rate_disc = det_disc / max(1, n_images)
+        det_rate_cup  = det_cup  / max(1, n_images)
+        seg_rate_disc = seg_disc / max(1, n_images)
+        seg_rate_cup  = seg_cup  / max(1, n_images)
 
         summary = {
             "counts": {
@@ -694,11 +890,18 @@ class ODCupPredictor:
                 "segmented_cup": seg_cup,
             },
             "rates": {
-                "det_rate_disc": det_disc / max(1, n_images),
-                "det_rate_cup":  det_cup  / max(1, n_images),
-                "seg_rate_disc": seg_disc / max(1, n_images),
-                "seg_rate_cup":  seg_cup  / max(1, n_images),
+                "det_rate_disc": det_rate_disc,
+                "det_rate_cup":  det_rate_cup,
+                "seg_rate_disc": seg_rate_disc,
+                "seg_rate_cup":  seg_rate_cup,
             },
+            "rates_stats": {
+                "det_rate_disc": self._rate_stats(det_disc, n_images),
+                "det_rate_cup":  self._rate_stats(det_cup, n_images),
+                "seg_rate_disc": self._rate_stats(seg_disc, n_images),
+                "seg_rate_cup":  self._rate_stats(seg_cup, n_images),
+            },
+            # Legacy means (back-compat)
             "mask_dice": {
                 "strict_mean_disc": _mean_or_null(strict_mask_disc),
                 "strict_mean_cup":  _mean_or_null(strict_mask_cup),
@@ -713,6 +916,10 @@ class ODCupPredictor:
                 "paired_mean_disc": _mean_or_null(paired_box_disc),
                 "paired_mean_cup":  _mean_or_null(paired_box_cup),
             },
+            # New detailed stats
+            "mask_dice_stats": md_stats,
+            "box_dice_stats":  bd_stats,
+            "metric_error":    metric_error,
         }
 
         self.summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -793,7 +1000,6 @@ def _filter_images_by_yolo_subset(images: List[Image], yolo_ds: Optional[Path], 
     stems = _collect_yolo_split_stems(yolo_ds, splits)
     if not stems:
         return []
-    # Filter by image file stem. This assumes stems are unique across the factory universe.
     out = [im for im in images if Path(im.image_path).stem in stems]
     return out
 
@@ -806,7 +1012,7 @@ def main() -> None:
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Offline summary path: does not need data_root / model files.
+    # Offline summary path
     if args.summary_only:
         pipe = ODCupPredictor(det=None, sam=None, pcfg=PipelineConfig(out_dir=out_dir, save_overlays=False))
         summary = pipe.summarize_jsonl(args.jsonl)
@@ -816,6 +1022,10 @@ def main() -> None:
             "jsonl_path": str(args.jsonl or pipe.jsonl_path),
             "counts": summary.get("counts", {}),
             "rates": summary.get("rates", {}),
+            "rates_stats": summary.get("rates_stats", {}),
+            "mask_dice_stats": summary.get("mask_dice_stats", {}),
+            "box_dice_stats": summary.get("box_dice_stats", {}),
+            "metric_error": summary.get("metric_error", {}),
         }, indent=2))
         return
 
@@ -864,14 +1074,11 @@ def main() -> None:
         "summary_path": str(pipe.summary_path),
         "jsonl_path": str(pipe.jsonl_path),
         "per_image_csv": str(pipe.per_image_csv_path),
-        "strict_det_rates": {
-            "disc": summary["rates"]["det_rate_disc"],
-            "cup":  summary["rates"]["det_rate_cup"],
-        },
-        "strict_seg_rates": {
-            "disc": summary["rates"]["seg_rate_disc"],
-            "cup":  summary["rates"]["seg_rate_cup"],
-        }
+        "rates": summary.get("rates", {}),
+        "rates_stats": summary.get("rates_stats", {}),
+        "mask_dice_stats": summary.get("mask_dice_stats", {}),
+        "box_dice_stats": summary.get("box_dice_stats", {}),
+        "metric_error": summary.get("metric_error", {}),
     }, indent=2))
 
 if __name__ == "__main__":

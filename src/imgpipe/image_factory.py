@@ -38,6 +38,7 @@ class ImageFactory:
     recursive: bool = True
     allowed_exts: Set[str] = field(default_factory=lambda: set(_ALLOWED_EXTS))
     auto_scan: bool = True
+    seed = 42
 
     # populated by scan()
     index: Dict[str, Dict[str, List[Path]]] = field(init=False, default_factory=dict)
@@ -231,7 +232,7 @@ class ImageFactory:
             return
 
         # Reproducible shuffle using a fixed seed.
-        rng = Random(0)
+        rng = Random(self.seed)
         rng.shuffle(all_items)
 
         # Take the first k items.
@@ -264,6 +265,115 @@ class ImageFactory:
 
         self.stem_index = new_stem_index
         self.index = new_index
+
+    def retain_percentage_in_dataset(
+            self,
+            ds: str,
+            p: float,
+            *,
+            return_left_out: bool = True,
+            require_complete: bool = True,
+            compute_boxes: bool = True,
+    ) -> Optional[List[Image]]:
+        """
+        In-place filter that reduces ONLY the specified dataset so that ~p of its images remain.
+        Optionally returns the images that were left out (useful for an external validation set).
+
+        Parameters
+        ----------
+        ds : str
+            Dataset name to downsample.
+        p : float
+            Target percentage of images to keep.
+            If 0.0 <= p <= 1.0, treated as a fraction (e.g., 0.25 = keep 25%).
+            If 1.0 < p <= 100.0, treated as a percent (e.g., 25 = keep 25%).
+        return_left_out : bool, default False
+            If True, return a list of Image objects corresponding to the removed items.
+        require_complete : bool, default True
+            When returning left-out images, include only stems that have fundus+oc_mask+od_mask.
+            If False, include any stem with fundus (masks attached when present).
+        compute_boxes : bool, default True
+            If returning Image objects, derive bounding boxes from masks.
+
+        Returns
+        -------
+        Optional[List[Image]]
+            If `return_left_out` is True, a list of Image objects for the removed items; otherwise None.
+
+        Raises
+        ------
+        RuntimeError
+            If no datasets have been scanned.
+        ValueError
+            If `ds` is unknown or `p` is invalid.
+        """
+        if not self.stem_index:
+            raise RuntimeError("No datasets indexed. Call scan() first.")
+        if ds not in self.stem_index:
+            raise ValueError(f"Unknown dataset: {ds!r}")
+
+        # Normalize p into [0,1]
+        if p < 0:
+            raise ValueError("p must be non-negative.")
+        if p > 1.0:
+            if p <= 100.0:
+                p = p / 100.0
+            else:
+                raise ValueError("p must be in [0,1] or (1,100].")
+
+        kinds = self.stem_index[ds]
+        f_map = kinds.get("fundus", {})
+        oc_map = kinds.get("oc_mask", {})
+        od_map = kinds.get("od_mask", {})
+
+        all_stems = sorted(f_map.keys())
+        n = len(all_stems)
+        keep_n = max(0, min(n, int(n * p)))  # floor to ensure "only p remain"
+
+        rng = Random(self.seed)
+        kept_stems = set(rng.sample(all_stems, keep_n)) if keep_n < n else set(all_stems)
+        removed_stems = sorted(set(all_stems) - kept_stems)
+        kept_stems_sorted = sorted(kept_stems)
+
+        # Optionally materialize removed items as Image objects before mutating indices
+        left_out: Optional[List[Image]] = None
+        if return_left_out and removed_stems:
+            left_out = []
+            for s in removed_stems:
+                fundus_path = f_map.get(s)
+                if fundus_path is None:
+                    continue  # safety
+                if require_complete and not (s in oc_map and s in od_map):
+                    continue
+                img = Image.from_path(
+                    image_path=fundus_path,
+                    dataset=ds,
+                    subject_id=s,
+                    uid=f"{ds}:{s}",
+                )
+                oc_path = oc_map.get(s)
+                if oc_path is not None:
+                    img.set_mask(Structure.CUP, LabelType.GT, oc_path)
+                od_path = od_map.get(s)
+                if od_path is not None:
+                    img.set_mask(Structure.DISC, LabelType.GT, od_path)
+                if compute_boxes:
+                    img.ensure_boxes_from_masks()
+                left_out.append(img)
+
+        # Rebuild this dataset only
+        self.stem_index[ds] = {
+            "fundus": {s: f_map[s] for s in kept_stems_sorted},
+            "oc_mask": {s: oc_map[s] for s in kept_stems_sorted if s in oc_map},
+            "od_mask": {s: od_map[s] for s in kept_stems_sorted if s in od_map},
+        }
+        self.index[ds] = {
+            "fundus": [f_map[s] for s in kept_stems_sorted],
+            "oc_mask": [oc_map[s] for s in kept_stems_sorted if s in oc_map],
+            "od_mask": [od_map[s] for s in kept_stems_sorted if s in od_map],
+        }
+
+        return left_out
 
     def make_images(
             self,

@@ -20,10 +20,10 @@ cache: False          # (bool | str) cache images in RAM (True/'ram') or on 'dis
 device:               # (int | str | list) device: 0 or [0,1,2,3] for CUDA, 'cpu'/'mps', or -1/[-1,-1] to auto-select idle GPUs
 workers: 16              # (int) dataloader workers (per RANK if DDP)
 project:              # (str, optional) project name for results root
-name: "MultiClassLarge"    # (str, optional) experiment name; results in 'project/name'
+name:     # (str, optional) experiment name; results in 'project/name'
 exist_ok: False       # (bool) overwrite existing 'project/name' if True
 pretrained: True      # (bool | str) use pretrained weights (bool) or load weights from path (str)
-optimizer: auto       # (str) optimizer: SGD, Adam, Adamax, AdamW, NAdam, RAdam, RMSProp, or auto
+optimizer: AdamW       # (str) optimizer: SGD, Adam, Adamax, AdamW, NAdam, RAdam, RMSProp, or auto
 verbose: True         # (bool) print verbose logs during training/val
 seed: 0               # (int) random seed for reproducibility
 deterministic: True   # (bool) enable deterministic ops; reproducible but may be slower
@@ -50,7 +50,7 @@ dropout: 0.0          # (float) dropout for classification head (classify only)
 val: True             # (bool) run validation/testing during training
 split: val            # (str) dataset split to evaluate: 'val', 'test' or 'train'
 save_json: False      # (bool) save results to COCO JSON for external evaluation
-conf:                 # (float, optional) confidence threshold; defaults: predict=0.25, val=0.001
+conf: 0.1                 # (float, optional) confidence threshold; defaults: predict=0.25, val=0.001
 iou: 0.7              # (float) IoU threshold used for NMS
 max_det: 4            # (int) maximum number of detections per image
 half: False           # (bool) use half precision (FP16) if supported
@@ -111,11 +111,11 @@ degrees: 0         # (float) rotation degrees (+/-)
 translate: 0.08043        # (float) translation fraction (+/-)
 scale: 1.0            # (float) scale gain (+/-)
 shear: 0            # (float) shear degrees (+/-)
-perspective: 0.001      # (float) perspective fraction (0–0.001 typical)
+perspective: 0.0      # (float) perspective fraction (0–0.001 typical)
 flipud: 0.0           # (float) vertical flip probability
 fliplr: 0.5           # (float) horizontal flip probability
-bgr: 0.0              # (float) RGB↔BGR channel swap probability
-mosaic: 0.09             # (float) mosaic augmentation probability
+bgr: 0.1              # (float) RGB↔BGR channel swap probability
+mosaic: 0.01             # (float) mosaic augmentation probability
 mixup: 0.3           # (float) MixUp augmentation probability
 cutmix: 0.0           # (float) CutMix augmentation probability
 copy_paste: 0.0       # (float) segmentation copy-paste probability
