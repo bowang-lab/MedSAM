@@ -87,12 +87,11 @@ echo "[INFO] Selected MODE=${MODE}"
 
 ARGS_TRAIN=(
   --train
-  --resume
   --run-dir "${REPO_DIR}/Nov12"
   --data-root "${DATA_DIR}"
   --yolo-ds "${OUT_DIR}"
   --run-name "With10%Papila"
-  --model "${REPO_DIR}/runs/MultiClassV2-6616729-0/weights/last.pt"
+  --model "${WEIGHTS_LOCAL}"
   --out-dir "${OUT_DIR}"
   --cfg "${CONFIG}"
   --device "${DEVICE}"
@@ -101,18 +100,16 @@ ARGS_TRAIN=(
   --imgsz 640
 )
 
-ARGS_TUNE=(
-  --resume
-  --tune
-  --run-dir "${REPO_DIR}/runs"
+ARGS_TRAIN_TEST=(
+  --run-dir "${REPO_DIR}/Nov12"
   --data-root "${DATA_DIR}"
   --yolo-ds "${OUT_DIR}"
-  --run-name "tune"
+  --run-name "With10%Papila"
   --model "${WEIGHTS_LOCAL}"
   --out-dir "${OUT_DIR}"
   --cfg "${CONFIG}"
   --device "${DEVICE}"
-  --epochs 50
+  --epochs 400
   --batch "${BATCH}"
   --imgsz 640
 )
@@ -139,6 +136,9 @@ case "${MODE}" in
     ;;
   tune)
     srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TUNE[@]}"
+    ;;
+  train_test)
+    srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TRAIN_TEST[@]}"
     ;;
   test)
     srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_TEST[@]}"

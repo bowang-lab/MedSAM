@@ -118,28 +118,6 @@ def create_yolo_ds(
 ) -> Path:
     """
     Create the YOLO dataset structure at OUT_DIR using the provided split ratios.
-
-    Parameters
-    ----------
-    images : Iterable
-        Collection of Image objects to materialize into a YOLO dataset.
-    OUT_DIR : Path
-        Output directory where the YOLO dataset (images/, labels/, data.yaml) will be created.
-    train_ratio : float, optional
-        Proportion of images assigned to the training split. Defaults to module-level TRAIN_RATIO.
-    val_ratio : float, optional
-        Proportion of images assigned to the validation split. Defaults to module-level VAL_RATIO.
-    test_ratio : float, optional
-        Proportion of images assigned to the test split. Defaults to module-level TEST_RATIO.
-
-    Returns
-    -------
-    Path
-        Path to the generated data.yaml.
-
-    Notes
-    -----
-    - Existing defaults are preserved; callers can override via keyword args.
     """
     print("[INFO] Creating YOLO dataset structure…")
     create_yolo_dataset(
@@ -488,6 +466,13 @@ if __name__ == "__main__":
     # Ensure output dir exists for test-only runs as well
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Default behavior: if no explicit mode/weights given, TRAIN then TEST automatically
+    AUTO_CHAIN_TEST = False
+    if not (TRAIN_MODE or TUNE_MODE or TEST_WEIGHTS):
+        TRAIN_MODE = True
+        AUTO_CHAIN_TEST = True
+        print("[INFO] No mode flags provided → defaulting to TRAIN then TEST with the trained weights.")
+
     print(f"[INFO] DATA_ROOT = {DATA_ROOT}")
     print(f"[INFO] OUT_DIR   = {OUT_DIR}")
     print(f"[INFO] RUN_DIR   = {RUN_DIR}")
@@ -510,9 +495,13 @@ if __name__ == "__main__":
         print("[INFO] Creating YOLO dataset (no --yolo-ds provided)…")
         images, excluded = scan_filter(DATA_ROOT, OUT_DIR)
         data_yaml = create_yolo_ds(images, OUT_DIR)
-        data_yaml_excluded = create_yolo_ds(excluded, Path(str(OUT_DIR) + "_papila_excluded"),
-                                            train_ratio=0.0, val_ratio = 0.0, test_ratio=1.0)
-
+        data_yaml_excluded = create_yolo_ds(
+            excluded,
+            Path(str(OUT_DIR) + "_papila_excluded"),
+            train_ratio=0.0,
+            val_ratio=0.0,
+            test_ratio=1.0,
+        )
         YOLO_DS = OUT_DIR  # set for later use
 
     print(f"[INFO] data.yaml = {data_yaml}")
@@ -522,6 +511,7 @@ if __name__ == "__main__":
     model = YOLO(MODEL)
 
     # TRAIN
+    trained_weights_path: Optional[Path] = None
     if TRAIN_MODE:
         rn = RUN_NAME or "Train"
         print("[INFO] Starting training…")
@@ -538,6 +528,13 @@ if __name__ == "__main__":
             imgsz=IMGSZ,
             batch=BATCH,
         )
+        # Derive the path to the produced weights (Ultralytics saves under {project}/{name}/weights/)
+        weights_dir = Path(RUN_DIR) / rn / "weights"
+        best_pt = weights_dir / "best.pt"
+        last_pt = weights_dir / "last.pt"
+        trained_weights_path = best_pt if best_pt.exists() else (last_pt if last_pt.exists() else None)
+        if trained_weights_path is None:
+            print(f"[WARN] Could not locate trained weights at {weights_dir} (best.pt/last.pt).")
 
     # TUNE
     if TUNE_MODE:
@@ -562,13 +559,23 @@ if __name__ == "__main__":
         print("[OK] Best hyperparameters saved at:", best)
 
     # TEST
+    # Priority:
+    #   1) If user provided --test-weights, use them.
+    #   2) Else if AUTO_CHAIN_TEST after training, use the weights just trained.
     if TEST_WEIGHTS:
         if not TEST_WEIGHTS.exists():
             raise FileNotFoundError(f"[ERR] --test-weights not found: {TEST_WEIGHTS}")
         rn = RUN_NAME or "Test"
         print(f"[INFO] Running final evaluation on the TEST set… weights={TEST_WEIGHTS}")
         model = YOLO(str(TEST_WEIGHTS))
+    elif AUTO_CHAIN_TEST and trained_weights_path:
+        rn = RUN_NAME or "TrainThenTest"
+        print(f"[INFO] Auto-testing with freshly trained weights: {trained_weights_path}")
+        model = YOLO(str(trained_weights_path))
+    else:
+        rn = None  # not used if we don't test
 
+    if TEST_WEIGHTS or (AUTO_CHAIN_TEST and trained_weights_path):
         # 1) Ultralytics built-in evaluation (use same thresholds)
         val_obj = model.val(
             data=str(data_yaml),
@@ -599,10 +606,14 @@ if __name__ == "__main__":
         )
         agg_json = OUT_DIR / "test_box_summary_combined.json"
         with open(agg_json, "w") as f:
-            json.dump({
-                "ultralytics": _extract_ultralytics_metrics(val_obj),
-                "box_metrics_summary": summary
-            }, f, indent=2)
+            json.dump(
+                {
+                    "ultralytics": _extract_ultralytics_metrics(val_obj),
+                    "box_metrics_summary": summary,
+                },
+                f,
+                indent=2,
+            )
         print(f"[OK] Saved combined summary to: {agg_json}")
 
     elif not (TRAIN_MODE or TUNE_MODE):
