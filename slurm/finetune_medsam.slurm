@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=72:00:00
+#SBATCH --time=48:00:00
 #SBATCH --gpus=1
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A_%a.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A_%a.err
@@ -33,10 +33,10 @@ CKPT="${REPO_DIR}/weights/medsam_vit_b.pth"
 
 # If you have a YOLO dataset already built, point to the directory containing data.yaml.
 # finetune_medsam.py REQUIRES --yolo-ds (train/val/test come from here).
-YOLO_DS_DIR="/scratch/st-ipor-1/cperez/MedSAM/TRAINING_DS"
+YOLO_DS_DIR="/scratch/st-ipor-1/cperez/MedSAM/PAPILA_TRAINING_DS"
 
 # Pretrained YOLO weights (two-class OD/OC detector)
-YOLO_WEIGHTS="/scratch/st-ipor-1/cperez/MedSAM/runs/MultiClassLarge/weights/best.pt"
+YOLO_WEIGHTS="/scratch/st-ipor-1/cperez/MedSAM/Nov12/With10%Papila/weights/best.pt"
 
 # Optional resume (trainable parts only, i.e., decoder)
 #RESUME="${REPO_DIR}/runs/FineTune_MedSAM/weights/last.pth"
