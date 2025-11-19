@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Literal, Sequence, Tuple
+from typing import Dict, List, Literal, Sequence, Tuple, Optional
 import json
 import math
 import os
@@ -11,7 +11,11 @@ import random
 import shutil
 from datetime import datetime
 
+import numpy as np
+from PIL import Image as PILImage
+
 from src.imgpipe.image import Image  # expects Image objects produced by your ImageFactory
+from src.utils import save_images_jsonl
 
 SplitName = Literal["train", "val", "test"]
 
@@ -72,8 +76,12 @@ def _split_indices(n: int, train: float, val: float, test: float) -> Tuple[List[
 
 
 def _ensure_dirs(root: Path) -> None:
-    for sub in ("images/train", "images/val", "images/test", "labels/train", "labels/val", "labels/test"):
+    # Images / labels
+    for sub in ("images/train", "images/val", "images/test",
+                "labels/train", "labels/val", "labels/test"):
         (root / sub).mkdir(parents=True, exist_ok=True)
+    # Mask dirs are created lazily in _save_gt_masks per split,
+    # so no need to pre-create them here.
 
 
 def _label_path_for(image_path: Path, labels_dir: Path) -> Path:
@@ -106,6 +114,62 @@ def _write_data_yaml(root: Path) -> None:
         "names": {0: "disc", 1: "cup"},
     }
     (root / "data.yaml").write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _mask_to_image_size(img: Image, mref) -> Optional[np.ndarray]:
+    """
+    Load a GT mask as a bool array aligned to the image's (H, W).
+    Mirrors Image._mask_to_image_size logic without importing BinaryMaskRef.
+    """
+    if mref is None:
+        return None
+    arr = mref.load().astype(bool)
+    H, W = img.height, img.width
+    if arr.shape == (H, W):
+        return arr
+    out = np.zeros((H, W), dtype=bool)
+    h = min(H, arr.shape[0])
+    w = min(W, arr.shape[1])
+    out[:h, :w] = arr[:h, :w]
+    return out
+
+
+def _save_gt_masks(img: Image, split_name: str, out_dir: Path, stem: str) -> None:
+    """
+    Save ground-truth disc and cup masks (if present) as PNGs.
+
+    Directory layout:
+      out_dir/
+        masks/
+          train/
+            disc/<stem>.png
+            cup/<stem>.png
+          val/
+            disc/<stem>.png
+            cup/<stem>.png
+          test/
+            disc/<stem>.png
+            cup/<stem>.png
+    """
+    base = out_dir / "masks" / split_name
+    disc_dir = base / "disc"
+    cup_dir = base / "cup"
+    disc_dir.mkdir(parents=True, exist_ok=True)
+    cup_dir.mkdir(parents=True, exist_ok=True)
+
+    # Disc mask
+    if img.gt_disc_mask is not None:
+        disc_mask = _mask_to_image_size(img, img.gt_disc_mask)
+        if disc_mask is not None:
+            disc_arr = (disc_mask.astype(np.uint8) * 255)
+            PILImage.fromarray(disc_arr).save(disc_dir / f"{stem}.png")
+
+    # Cup mask
+    if img.gt_cup_mask is not None:
+        cup_mask = _mask_to_image_size(img, img.gt_cup_mask)
+        if cup_mask is not None:
+            cup_arr = (cup_mask.astype(np.uint8) * 255)
+            PILImage.fromarray(cup_arr).save(cup_dir / f"{stem}.png")
 
 
 def create_yolo_dataset(
@@ -141,7 +205,10 @@ def create_yolo_dataset(
       out_dir/
         images/{train,val,test}/<stem>.<ext>
         labels/{train,val,test}/<stem>.txt
+        masks/{train,val,test}/disc/<stem>.png     (if GT disc mask exists)
+        masks/{train,val,test}/cup/<stem>.png      (if GT cup mask exists)
         data.yaml  (Ultralytics format)
+        split_meta.json
 
     Returns
     -------
@@ -168,12 +235,13 @@ def create_yolo_dataset(
         test=[images[i] for i in test_idx],
     )
 
-    # Materialize images and labels
+    # Materialize images, labels, and GT masks
     for split_name, imgs in split.as_mapping().items():
         img_dir = out_dir / "images" / split_name
         lbl_dir = out_dir / "labels" / split_name
 
         for im in imgs:
+            im.set_split(split_name)
             src = im.image_path
             if not src.exists():
                 # Skip missing sources defensively
@@ -187,6 +255,10 @@ def create_yolo_dataset(
             label_path = _label_path_for(dst, lbl_dir)
             _write_label_file(im, label_path, use_gt=use_gt)
 
+            # Save GT masks (if present)
+            _save_gt_masks(im, split_name, out_dir, stem=dst.stem)
+
+    save_images_jsonl(images, out_dir / "saved_images.jsonl")
     # Write metadata for reproducibility
     meta = {
         "created_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -195,6 +267,7 @@ def create_yolo_dataset(
         "counts": split.counts(),
         "total": len(images),
         "use_gt": use_gt,
+        "has_gt_masks": True,  # indicates this script is capable of exporting GT masks
     }
     (out_dir / "split_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 

@@ -55,11 +55,15 @@ class Image:
     pred_disc_box: Optional[NormalizedBox] = None
     pred_cup_box: Optional[NormalizedBox] = None
 
-    # Simple cached metrics
+    # Detector / segmenter confidences
+    yolo_disc_conf: Optional[float] = None
+    yolo_cup_conf: Optional[float] = None
+    sam_disc_conf: Optional[float] = None  # currently unused → None
+    sam_cup_conf: Optional[float] = None   # currently unused → None
+
     gt_cd_ratio: Optional[float] = None
     pred_cd_ratio: Optional[float] = None
 
-    # --- NEW: cached mask Dice (prediction vs GT), per class ---
     mask_dice_disc: Optional[float] = None
     mask_dice_cup: Optional[float] = None
 
@@ -113,10 +117,10 @@ class Image:
         )
 
     def set_box_norm(
-            self,
-            component: Structure,
-            kind: LabelType,
-            nbox: Optional[NormalizedBox | Tuple[float, float, float, float] | Dict[str, float]],
+        self,
+        component: Structure,
+        kind: LabelType,
+        nbox: Optional[NormalizedBox | Tuple[float, float, float, float] | Dict[str, float]],
     ) -> None:
         """
         Set a normalized YOLO box (xc,yc,w,h in [0,1]) for the given component/kind.
@@ -142,7 +146,8 @@ class Image:
             nb = NormalizedBox(xc, yc, w, h)
         else:
             raise TypeError(
-                "nbox must be a NormalizedBox, (xc,yc,w,h) tuple/list, dict with keys {'xc','yc','w','h'}, or None.")
+                "nbox must be a NormalizedBox, (xc,yc,w,h) tuple/list, dict with keys {'xc','yc','w','h'}, or None."
+            )
 
         setattr(self, self._box_attr_name(component, kind), nb)
 
@@ -241,7 +246,6 @@ class Image:
         m[y1:y2, x1:x2] = True
         return m
 
-    # in src/imgpipe/image.py
     def ensure_boxes_from_masks(self) -> None:
         """Populate missing normalized boxes from masks (aligned to image size)."""
         if self.gt_disc_box is None:
@@ -249,7 +253,6 @@ class Image:
         if self.gt_cup_box is None:
             self.gt_cup_box = self._mask_bbox_norm_aligned(self.gt_cup_mask)
 
-        # FIX: SAM output masks must drive the *final* predicted boxes
         if self.pred_disc_box is None:
             self.pred_disc_box = self._mask_bbox_norm_aligned(self.pred_disc_mask)
         if self.pred_cup_box is None:
@@ -316,8 +319,6 @@ class Image:
                 c = max(0.0, cbox.width)
             return (c / d) if d > 0 else None
         return None
-
-    # --- NEW: class-wise Dice computation & caching ---
 
     @staticmethod
     def _dice_from_bool(pred: Optional[np.ndarray], gt: Optional[np.ndarray]) -> Optional[float]:
@@ -468,11 +469,18 @@ class Image:
             figsize: Tuple[int, int] = (14, 6),
             mask_alpha: float = 0.35,
             show_metrics: bool = True,
+            show_conf: bool = True,
     ) -> None:
         """
         Render 1–2 panels:
           • Panel 1 (if available): Ground-truth disc/cup masks + GT metrics.
-          • Panel 2 (if available): Predicted disc/cup masks + detector inter_pred boxes + predicted metrics.
+          • Panel 2 (if available): Predicted disc/cup masks + detector inter_pred boxes
+            + predicted metrics (+ optional confidences).
+
+        The function is robust to partial annotations:
+          - If only GT is present, shows only the GT panel.
+          - If only predictions are present, shows only the predictions panel.
+          - If neither is present, shows just the raw fundus image.
         """
         # Load base image
         img = PILImage.open(self.image_path).convert("RGB")
@@ -488,12 +496,23 @@ class Image:
             overlay[mask] = rgba
             ax.imshow(overlay, origin="upper")
 
-        def _draw_nbox(ax, nbox: Optional[NormalizedBox], color: str, ls: str = "-", lw: float = 2.0):
+        def _draw_nbox(ax, nbox: Optional[NormalizedBox], color: str,
+                       ls: str = "-", lw: float = 2.0):
             if nbox is None:
                 return
             x1, y1, x2, y2 = nbox.to_pixel_xyxy(W, H)
             w, h = max(0.0, x2 - x1), max(0.0, y2 - y1)
-            ax.add_patch(Rectangle((x1, y1), w, h, fill=False, edgecolor=color, linewidth=lw, linestyle=ls))
+            ax.add_patch(
+                Rectangle(
+                    (x1, y1),
+                    w,
+                    h,
+                    fill=False,
+                    edgecolor=color,
+                    linewidth=lw,
+                    linestyle=ls,
+                )
+            )
 
         # Determine availability
         gt_disc_m = _mask_arr(self.gt_disc_mask)
@@ -502,12 +521,21 @@ class Image:
         pred_cup_m = _mask_arr(self.pred_cup_mask)
 
         has_gt = (gt_disc_m is not None) or (gt_cup_m is not None)
-        has_pred = (pred_disc_m is not None) or (pred_cup_m is not None) or \
-                   (self.inter_pred_disc_box is not None) or (self.inter_pred_cup_box is not None)
+        has_pred = (
+                (pred_disc_m is not None)
+                or (pred_cup_m is not None)
+                or (self.inter_pred_disc_box is not None)
+                or (self.inter_pred_cup_box is not None)
+        )
 
         # Nothing to show → single image only
         if not has_gt and not has_pred:
-            fig, ax = plt.subplots(1, 1, figsize=(figsize[0] / 2, figsize[1]), dpi=dpi)
+            fig, ax = plt.subplots(
+                1,
+                1,
+                figsize=(figsize[0] / 2, figsize[1]),
+                dpi=dpi,
+            )
             ax.imshow(img, origin="upper")
             ax.set_axis_off()
             if save_path is not None:
@@ -522,17 +550,40 @@ class Image:
         # Assemble panels: strictly at most two
         panels = []
         if has_gt:
-            panels.append(("Ground Truth", {"disc_m": gt_disc_m, "cup_m": gt_cup_m,
-                                            "disc_box": None, "cup_box": None, "use_pred": False}))
+            panels.append(
+                (
+                    "Ground Truth",
+                    {
+                        "disc_m": gt_disc_m,
+                        "cup_m": gt_cup_m,
+                        "disc_box": None,
+                        "cup_box": None,
+                        "use_pred": False,
+                    },
+                )
+            )
         if has_pred:
-            panels.append(("Predictions", {"disc_m": pred_disc_m, "cup_m": pred_cup_m,
-                                           "disc_box": self.inter_pred_disc_box,
-                                           "cup_box": self.inter_pred_cup_box,
-                                           "use_pred": True}))
+            panels.append(
+                (
+                    "Predictions",
+                    {
+                        "disc_m": pred_disc_m,
+                        "cup_m": pred_cup_m,
+                        "disc_box": self.inter_pred_disc_box,
+                        "cup_box": self.inter_pred_cup_box,
+                        "use_pred": True,
+                    },
+                )
+            )
 
         ncols = len(panels)
-        fig, axes = plt.subplots(nrows=1, ncols=ncols, figsize=figsize if ncols == 2 else (figsize[0] / 2, figsize[1]),
-                                 dpi=dpi, squeeze=False)
+        fig, axes = plt.subplots(
+            nrows=1,
+            ncols=ncols,
+            figsize=figsize if ncols == 2 else (figsize[0] / 2, figsize[1]),
+            dpi=dpi,
+            squeeze=False,
+        )
 
         # Figure title
         suptitle = f"{self.dataset} / {self.subject_id} — {self.image_path.name}"
@@ -563,53 +614,102 @@ class Image:
             _draw_nbox(ax, dct["disc_box"], disc_color_box, ls="-", lw=2.0)
             _draw_nbox(ax, dct["cup_box"], cup_color_box, ls="--", lw=2.0)
 
-            # Metrics block
-            if show_metrics:
+            # Metrics / confidences block
+            if show_metrics or show_conf:
                 use_pred = bool(dct["use_pred"])
-                cdr_v = self.cdr(use_pred=use_pred, axis="vertical")
-                cdr_h = self.cdr(use_pred=use_pred, axis="horizontal")
-                rims = self.rim_metrics(use_pred=use_pred)
+                lines: list[str] = []
 
-                lines = []
-                # Show Dice on prediction panel (GT vs Pred)
-                if use_pred:
-                    if self.mask_dice_disc is not None:
-                        lines.append(f"Dice (Disc): {self.mask_dice_disc:.3f}")
-                    if self.mask_dice_cup is not None:
-                        lines.append(f"Dice (Cup):  {self.mask_dice_cup:.3f}")
+                if show_metrics:
+                    # CDRs
+                    cdr_v = self.cdr(use_pred=use_pred, axis="vertical")
+                    cdr_h = self.cdr(use_pred=use_pred, axis="horizontal")
+                    rims = self.rim_metrics(use_pred=use_pred)
 
-                if cdr_v is not None:
-                    lines.append(f"CDR (V): {cdr_v:.3f}")
-                if cdr_h is not None:
-                    lines.append(f"CDR (H): {cdr_h:.3f}")
-                if rims is not None:
-                    if np.isfinite(rims.get("rim_over_disc", np.nan)):
-                        lines.append(f"R/D: {rims['rim_over_disc']:.3f}")
-                    if np.isfinite(rims.get("I_over_S", np.nan)):
-                        lines.append(f"I/S: {rims['I_over_S']:.3f}")
-                    ion = rims.get("I_over_N")
-                    iot = rims.get("I_over_T")
-                    if ion is not None and np.isfinite(ion):
-                        lines.append(f"I/N: {ion:.3f}")
-                    if iot is not None and np.isfinite(iot):
-                        lines.append(f"I/T: {iot:.3f}")
+                    # Show Dice on prediction panel (GT vs Pred)
+                    if use_pred:
+                        if self.mask_dice_disc is not None:
+                            lines.append(f"Dice (Disc): {self.mask_dice_disc:.3f}")
+                        if self.mask_dice_cup is not None:
+                            lines.append(f"Dice (Cup):  {self.mask_dice_cup:.3f}")
+
+                    if cdr_v is not None:
+                        lines.append(f"CDR (V): {cdr_v:.3f}")
+                    if cdr_h is not None:
+                        lines.append(f"CDR (H): {cdr_h:.3f}")
+                    if rims is not None:
+                        if np.isfinite(rims.get("rim_over_disc", np.nan)):
+                            lines.append(f"R/D: {rims['rim_over_disc']:.3f}")
+                        if np.isfinite(rims.get("I_over_S", np.nan)):
+                            lines.append(f"I/S: {rims['I_over_S']:.3f}")
+                        ion = rims.get("I_over_N")
+                        iot = rims.get("I_over_T")
+                        if ion is not None and np.isfinite(ion):
+                            lines.append(f"I/N: {ion:.3f}")
+                        if iot is not None and np.isfinite(iot):
+                            lines.append(f"I/T: {iot:.3f}")
+
+                # Confidences (only meaningful on prediction panel)
+                if show_conf and dct["use_pred"]:
+                    if lines:
+                        lines.append("")  # visual spacer
+                    if self.yolo_disc_conf is not None:
+                        lines.append(f"YOLO conf (Disc): {self.yolo_disc_conf:.3f}")
+                    if self.yolo_cup_conf is not None:
+                        lines.append(f"YOLO conf (Cup):  {self.yolo_cup_conf:.3f}")
+                    if self.sam_disc_conf is not None:
+                        lines.append(f"MedSAM conf (Disc): {self.sam_disc_conf:.3f}")
+                    if self.sam_cup_conf is not None:
+                        lines.append(f"MedSAM conf (Cup):  {self.sam_cup_conf:.3f}")
 
                 if lines:
                     ax.text(
-                        0.02, 0.02, "\n".join(lines),
+                        0.02,
+                        0.02,
+                        "\n".join(lines),
                         transform=ax.transAxes,
-                        fontsize=9, va="top", ha="left", color="white",
-                        bbox=dict(facecolor="black", alpha=0.35, boxstyle="round,pad=0.3", edgecolor="none"),
+                        fontsize=9,
+                        va="top",
+                        ha="left",
+                        color="white",
+                        bbox=dict(
+                            facecolor="black",
+                            alpha=0.35,
+                            boxstyle="round,pad=0.3",
+                            edgecolor="none",
+                        ),
                     )
 
             # Legend (only if something was drawn)
             handles = []
             if (dct["disc_m"] is not None) or (dct["disc_box"] is not None):
-                handles.append(plt.Line2D([0], [0], color=disc_color_box, lw=2, linestyle="-", label="Disc"))
+                handles.append(
+                    plt.Line2D(
+                        [0],
+                        [0],
+                        color=disc_color_box,
+                        lw=2,
+                        linestyle="-",
+                        label="Disc",
+                    )
+                )
             if (dct["cup_m"] is not None) or (dct["cup_box"] is not None):
-                handles.append(plt.Line2D([0], [0], color=cup_color_box, lw=2, linestyle="--", label="Cup"))
+                handles.append(
+                    plt.Line2D(
+                        [0],
+                        [0],
+                        color=cup_color_box,
+                        lw=2,
+                        linestyle="--",
+                        label="Cup",
+                    )
+                )
             if handles:
-                ax.legend(handles=handles, loc="lower right", fontsize=9, frameon=True)
+                ax.legend(
+                    handles=handles,
+                    loc="lower right",
+                    fontsize=9,
+                    frameon=True,
+                )
 
         fig.tight_layout(rect=(0, 0, 1, 0.96))
 
@@ -677,7 +777,7 @@ class Image:
     def to_dict(self, *, drop_none: bool = False) -> Dict[str, Any]:
         self.ensure_boxes_from_masks()  # ensure normalized GT exist if masks available
         d: Dict[str, Any] = {
-            "_schema": 5,  # bumped since format changed (added cached mask dice)
+            "_schema": 6,  # bumped: now includes YOLO / SAM confidences
 
             # identity
             "uid": self.uid,
@@ -708,9 +808,15 @@ class Image:
             "gt_cd_ratio": self.gt_cd_ratio,
             "pred_cd_ratio": self.pred_cd_ratio,
 
-            # NEW: cached dice
+            # cached dice
             "mask_dice_disc": self.mask_dice_disc,
             "mask_dice_cup": self.mask_dice_cup,
+
+            # detector / segmenter confidences
+            "yolo_disc_conf": self.yolo_disc_conf,
+            "yolo_cup_conf": self.yolo_cup_conf,
+            "sam_disc_conf": self.sam_disc_conf,
+            "sam_cup_conf": self.sam_cup_conf,
 
             # bookkeeping
             "yolo_label_path": self._path_to_str(self.yolo_label_path),
@@ -746,8 +852,8 @@ class Image:
         )
 
         # masks
-        obj.gt_disc_mask  = Image._mask_from_dict(d.get("gt_disc_mask"))
-        obj.gt_cup_mask   = Image._mask_from_dict(d.get("gt_cup_mask"))
+        obj.gt_disc_mask   = Image._mask_from_dict(d.get("gt_disc_mask"))
+        obj.gt_cup_mask    = Image._mask_from_dict(d.get("gt_cup_mask"))
         obj.pred_disc_mask = Image._mask_from_dict(d.get("pred_disc_mask"))
         obj.pred_cup_mask  = Image._mask_from_dict(d.get("pred_cup_mask"))
 
@@ -763,9 +869,15 @@ class Image:
         obj.gt_cd_ratio   = (float(d["gt_cd_ratio"])   if d.get("gt_cd_ratio")   is not None else None)
         obj.pred_cd_ratio = (float(d["pred_cd_ratio"]) if d.get("pred_cd_ratio") is not None else None)
 
-        # NEW: cached dice
+        # cached dice
         obj.mask_dice_disc = (float(d["mask_dice_disc"]) if d.get("mask_dice_disc") is not None else None)
         obj.mask_dice_cup  = (float(d["mask_dice_cup"])  if d.get("mask_dice_cup")  is not None else None)
+
+        # detector / segmenter confidences (backwards-compatible if missing)
+        obj.yolo_disc_conf = (float(d["yolo_disc_conf"]) if d.get("yolo_disc_conf") is not None else None)
+        obj.yolo_cup_conf  = (float(d["yolo_cup_conf"])  if d.get("yolo_cup_conf")  is not None else None)
+        obj.sam_disc_conf  = (float(d["sam_disc_conf"])  if d.get("sam_disc_conf")  is not None else None)
+        obj.sam_cup_conf   = (float(d["sam_cup_conf"])   if d.get("sam_cup_conf")   is not None else None)
 
         # patient info
         obj.laterality = Image._enum_from_str(Eye, d.get("eye"))
@@ -791,6 +903,37 @@ class Image:
     def from_json(s: str) -> "Image":
         return Image.from_dict(json.loads(s))
 
+    @staticmethod
+    def save_jsonl(images: Iterable["Image"], path: Path | str, *, drop_none: bool = False) -> None:
+        """
+        Serialize a collection of Image objects to a JSONL file (one JSON per line).
+        """
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("w", encoding="utf-8") as f:
+            for img in images:
+                f.write(img.to_json(drop_none=drop_none))
+                f.write("\n")
+
+    @staticmethod
+    def load_jsonl(path: Path | str) -> list["Image"]:
+        """
+        Load a list of Image objects from a JSONL file.
+        """
+        p = Path(path)
+        images: list[Image] = []
+        if not p.exists():
+            return images
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                images.append(Image.from_json(line))
+        return images
+
     def __repr__(self) -> str:
-        return (f"ImageSample(uid={self.uid!r}, ds={self.dataset!r}, subj={self.subject_id!r}, "
-                f"size=({self.width}x{self.height}), split={self.split!r})")
+        return (
+            f"ImageSample(uid={self.uid!r}, ds={self.dataset!r}, subj={self.subject_id!r}, "
+            f"size=({self.width}x{self.height}), split={self.split!r})"
+        )

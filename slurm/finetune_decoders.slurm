@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --gpus=1
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A_%a.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A_%a.err
@@ -21,7 +21,7 @@ set -euo pipefail
 REPO_DIR="/scratch/st-ipor-1/cperez/MedSAM"
 
 # Outputs (metrics, preds, etc.)
-OUT_DIR="/scratch/st-ipor-1/cperez/MedSAM/MEDSAM_TRAIN2"
+OUT_DIR="/scratch/st-ipor-1/cperez/MedSAM/OUT/MEDSAM_TRAIN_P"
 RUN_DIR="${REPO_DIR}/runs"
 RUN_NAME="FineTune_MedSAM_${SLURM_JOB_ID:-local}"
 
@@ -33,10 +33,10 @@ CKPT="${REPO_DIR}/weights/medsam_vit_b.pth"
 
 # If you have a YOLO dataset already built, point to the directory containing data.yaml.
 # finetune_medsam.py REQUIRES --yolo-ds (train/val/test come from here).
-YOLO_DS_DIR="/scratch/st-ipor-1/cperez/MedSAM/PAPILA_TRAINING_DS"
+YOLO_DS_DIR="/scratch/st-ipor-1/cperez/MedSAM/YOLO_DS_P"
 
 # Pretrained YOLO weights (two-class OD/OC detector)
-YOLO_WEIGHTS="/scratch/st-ipor-1/cperez/MedSAM/Nov12/With10%Papila/weights/best.pt"
+YOLO_WEIGHTS="/scratch/st-ipor-1/cperez/MedSAM/runs/run2/Train/Train/weights/best.pt"
 
 # Optional resume (trainable parts only, i.e., decoder)
 #RESUME="${REPO_DIR}/runs/FineTune_MedSAM/weights/last.pth"
@@ -70,7 +70,7 @@ TEST_WEIGHTS=""          # optional: path to a specific checkpoint for testing
 FULL_FINETUNE=0          # set 1 to pass --unfreeze-encoders
 
 # Python module entrypoint
-PYTHON_MODULE="src.scripts.finetune_medsam"
+PYTHON_MODULE="src.scripts.finetune_decoder"
 
 ############################
 # Environment / caches     #
@@ -133,7 +133,7 @@ ARGS=(
   --box-jitter-tr "${BOX_JITTER_TR}"
   --box-jitter-sc "${BOX_JITTER_SC}"
   --test-prompt "${TEST_PROMPT}"
-  --unfreeze-encoders
+#  --unfreeze-encoders
 )
 
 # Optional resume
@@ -158,7 +158,7 @@ fi
 if [[ "${TEST_AFTER_TRAIN}" -eq 0 ]]; then
   # Remove --test if present
   TMP=()
-  for a in "${ARGS[@]}"; do
+  for a in "${ARGS[@]}"; dot
     [[ "$a" == "--test" ]] && continue
     TMP+=("$a")
   done

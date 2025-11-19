@@ -150,7 +150,10 @@ class ImageFactory:
         self.index = {k: v for k, v in self.index.items() if k in keep}
         self.stem_index = {k: v for k, v in self.stem_index.items() if k in keep}
 
-    def filter_empty_masks(self) -> None:
+    def filter_empty_masks(
+            self,
+            remove_empty_datasets: bool = True,
+    ) -> None:
         """
         Filter datasets in-place to keep only entries (stems) that have
         all three paths present: fundus image, optic cup mask (oc_mask),
@@ -159,7 +162,10 @@ class ImageFactory:
         Notes
         -----
         - This modifies `stem_index` and rebuilds `index` accordingly.
-        - Datasets that become empty after filtering are retained (but empty).
+        - If `remove_empty_datasets` is False, datasets that become
+          empty after filtering are retained (but empty).
+        - If `remove_empty_datasets` is True, datasets with no valid stems
+          after filtering are removed entirely.
         - No file I/O is performed; filtering is path-based.
         """
         if not self.stem_index:
@@ -175,6 +181,10 @@ class ImageFactory:
 
             # Keep only stems that have all three
             valid_stems = sorted(set(f.keys()) & set(oc.keys()) & set(od.keys()))
+
+            # Optionally drop datasets that become empty
+            if not valid_stems and remove_empty_datasets:
+                continue
 
             new_stem_index[ds] = {
                 "fundus": {s: f[s] for s in valid_stems},

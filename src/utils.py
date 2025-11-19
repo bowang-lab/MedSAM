@@ -14,9 +14,20 @@ import yaml
 from skimage import io as skio  # for PNG mask writing
 
 
+
 # ======================================================================
 # Filesystem / paths
 # ======================================================================
+
+def save_images_jsonl(images, path: Path) -> None:
+    """
+    Serialize Image objects (including 'split') to a JSONL file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for im in images:
+            # Image.to_json already includes 'split'
+            f.write(im.to_json(drop_none=False) + "\n")
 
 def ensure_dir(p: Path) -> None:
     """mkdir -p."""
