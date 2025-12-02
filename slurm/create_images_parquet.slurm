@@ -70,8 +70,8 @@ case "${MODE}" in
   dev)
 ARGS_DEV=(
       --root "/arc/project/st-ipor-1/carlosp/fundus_data/All_Datasets_Organized"
-      --csv "${REPO_DIR}/src/image_data/Cleaned_Metadata.csv"
-      --out-parquet "${REPO_DIR}/src/image_data/images.parquet"
+      --csv "${REPO_DIR}/src/image_data/Cleaned_Metadata_dev.csv"
+      --out-parquet "${REPO_DIR}/src/image_data/images_dev.parquet"
       --compression "zstd"
       --no-embed-images
     )
