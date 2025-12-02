@@ -54,6 +54,6 @@ echo "[INFO] Output: ${OUTPUT_FILE}"
 
 # Using srun with cpu binding (no gpu binding needed)
 srun --cpu-bind=cores -u \
-  python -m src.tools.processing_parquet.merge_smart "${ARGS[@]}"
+  python -m src.tools.parquet_processing.merge_smart "${ARGS[@]}"
 
 echo "[INFO] Done."
