@@ -1,5 +1,5 @@
-# File: src/scripts/predict_summarize.py
 #!/usr/bin/env python3
+# File: src/scripts/predict_summarize.py
 
 from __future__ import annotations
 
@@ -13,14 +13,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.dataset as ds
-import pyarrow.parquet as pq
+import torch
 from PIL import Image as PILImage, ImageFile
 from tqdm import tqdm
 
-import torch
-
+# Use your unified Image class
 from src.imgpipe.image import Image
 from src.model.predictor import (
     Predictor,
@@ -29,13 +26,12 @@ from src.model.predictor import (
     MedSamPredictorConfig,
 )
 
-# Allow PIL to load truncated images instead of raising OSError
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 
 # =========================
 # Helpers
 # =========================
-
 
 def _ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
@@ -127,19 +123,19 @@ def _pack_pred_masks_for_parquet(img: Image) -> None:
 
 
 def _save_pred_masks_for_image(
-    img: Image,
-    *,
-    oc_mask_root: Path,
-    od_mask_root: Path,
-    rel_subdir: Path,
+        img: Image,
+        *,
+        oc_mask_root: Path,
+        od_mask_root: Path,
+        rel_subdir: Path,
 ) -> Tuple[Optional[Path], Optional[Path]]:
     """Write predicted masks as PNGs and update mref.path. Returns (disc_path, cup_path)."""
     disc_path: Optional[Path] = None
     cup_path: Optional[Path] = None
 
     for attr_name, out_root, is_disc in (
-        ("pred_disc_mask", od_mask_root, True),
-        ("pred_cup_mask", oc_mask_root, False),
+            ("pred_disc_mask", od_mask_root, True),
+            ("pred_cup_mask", oc_mask_root, False),
     ):
         mref = getattr(img, attr_name, None)
         if mref is None:
@@ -179,11 +175,12 @@ def _gather_image_files(images_dir: Path, pattern: str) -> List[Path]:
 
 
 def _make_images_from_dir(
-    images_dir: Path,
-    pattern: str = "*",
-    dataset: str = "inference",
-    split: Optional[str] = None,
+        images_dir: Path,
+        pattern: str = "*",
+        dataset: str = "inference",
+        split: Optional[str] = None,
 ) -> List[Image]:
+    """Scans directory and creates lightweight Image objects."""
     img_paths = _gather_image_files(images_dir, pattern)
     if not img_paths:
         raise RuntimeError(f"No images found under {images_dir} with pattern '{pattern}'.")
@@ -191,80 +188,30 @@ def _make_images_from_dir(
     images: List[Image] = []
     for p in img_paths:
         try:
+            # Fast header read
             with PILImage.open(p) as im:
                 W, H = im.size
         except Exception as e:
             logging.warning("Skipping unreadable image %s: %r", p, e)
             continue
 
-        uid = p.stem
-        subject_id = p.stem
-
-        im_obj: Optional[Image] = None
-        if hasattr(Image, "from_path"):
-            try:
-                im_obj = Image.from_path(
-                    image_path=p,
-                    dataset=dataset,
-                    subject_id=subject_id,
-                    uid=uid,
-                    split=split,
-                    width=W,
-                    height=H,
-                )
-            except Exception:
-                im_obj = None
-
-        if im_obj is None:
-            # Fallback constructor compatibility
-            try:
-                im_obj = Image(
-                    uid=uid,
-                    dataset=dataset,
-                    patient_id=subject_id,
-                    image_path=p,
-                    width=W,
-                    height=H,
-                    split=split,
-                    gt_disc_mask=None,
-                    gt_cup_mask=None,
-                    gt_disc_box=None,
-                    gt_cup_box=None,
-                )
-            except TypeError:
-                im_obj = Image(  # type: ignore[call-arg]
-                    uid=uid,
-                    dataset=dataset,
-                    patient_id=subject_id,
-                    image_path=p,
-                    width=W,
-                    height=H,
-                    split=split,
-                )
-
+        # Construct Image directly
+        im_obj = Image.from_path(
+            image_path=p,
+            dataset=dataset,
+            subject_id=p.stem,
+            uid=p.stem,
+            split=split,
+            width=W,
+            height=H,
+        )
         images.append(im_obj)
-
     return images
-
-
-def _iter_images_from_parquet(
-    parquet_path: Path,
-    dataset_filter: Optional[Set[str]] = None,
-    split_filter: Optional[Set[str]] = None,
-    batch_size: int = 2048,
-) -> Iterable[Image]:
-    for img in Image.iter_parquet(parquet_path, batch_size=batch_size):
-        if dataset_filter is not None and getattr(img, "dataset", None) not in dataset_filter:
-            continue
-        if split_filter is not None and getattr(img, "split", None) not in split_filter:
-            continue
-        yield img
 
 
 # =========================
 # Schema helpers (for summarization only)
 # =========================
-
 
 def append_summary_row_to_csv(csv_path: Path, pred_ref: Path, summary: Dict[str, Any]) -> None:
     csv_path = csv_path.resolve()
@@ -278,43 +225,27 @@ def append_summary_row_to_csv(csv_path: Path, pred_ref: Path, summary: Dict[str,
     header = [
         "pred_path",
         "n_images",
-        "mask_dice_disc_mean",
-        "mask_dice_disc_std",
-        "mask_dice_cup_mean",
-        "mask_dice_cup_std",
-        "box_dice_disc_mean",
-        "box_dice_disc_std",
-        "box_dice_cup_mean",
-        "box_dice_cup_std",
-        "cdr_v_mae_mean",
-        "cdr_v_mae_std",
-        "rim_over_disc_mae_mean",
-        "rim_over_disc_mae_std",
-        "I_over_S_mae_mean",
-        "I_over_S_mae_std",
-        "cdr_mae_mean",
-        "cdr_mae_std",
-        "rdr_mae_mean",
-        "rdr_mae_std",
+        "mask_dice_disc_mean", "mask_dice_disc_std",
+        "mask_dice_cup_mean", "mask_dice_cup_std",
+        "box_dice_disc_mean", "box_dice_disc_std",
+        "box_dice_cup_mean", "box_dice_cup_std",
+        "cdr_v_mae_mean", "cdr_v_mae_std",
+        "rim_over_disc_mae_mean", "rim_over_disc_mae_std",
+        "I_over_S_mae_mean", "I_over_S_mae_std",
+        "cdr_mae_mean", "cdr_mae_std",
+        "rdr_mae_mean", "rdr_mae_std",
     ]
 
     row = [
         str(pred_ref),
         summary["counts"]["images"],
-        md["disc"]["mean"],
-        md["disc"]["std"],
-        md["cup"]["mean"],
-        md["cup"]["std"],
-        bd["disc"]["mean"],
-        bd["disc"]["std"],
-        bd["cup"]["mean"],
-        bd["cup"]["std"],
-        me["cdr_v"]["mae_mean"],
-        me["cdr_v"]["mae_std"],
-        me["rim_over_disc"]["mae_mean"],
-        me["rim_over_disc"]["mae_std"],
-        me["I_over_S"]["mae_mean"],
-        me["I_over_S"]["mae_std"],
+        md["disc"]["mean"], md["disc"]["std"],
+        md["cup"]["mean"], md["cup"]["std"],
+        bd["disc"]["mean"], bd["disc"]["std"],
+        bd["cup"]["mean"], bd["cup"]["std"],
+        me["cdr_v"]["mae_mean"], me["cdr_v"]["mae_std"],
+        me["rim_over_disc"]["mae_mean"], me["rim_over_disc"]["mae_std"],
+        me["I_over_S"]["mae_mean"], me["I_over_S"]["mae_std"],
         (se.get("cdr_mae") or {}).get("mae_mean"),
         (se.get("cdr_mae") or {}).get("mae_std"),
         (se.get("rdr_mae") or {}).get("mae_mean"),
@@ -333,7 +264,6 @@ def append_summary_row_to_csv(csv_path: Path, pred_ref: Path, summary: Dict[str,
 # Distributed / Multi-GPU helpers
 # =========================
 
-
 @dataclass(frozen=True)
 class DistInfo:
     rank: int
@@ -342,48 +272,30 @@ class DistInfo:
 
 
 def _get_dist_info() -> DistInfo:
-    """
-    Works with:
-      - torchrun (RANK/WORLD_SIZE/LOCAL_RANK)
-      - Slurm (SLURM_PROCID/SLURM_NTASKS + SLURM_LOCALID)
-      - fallback: single process
-    """
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        return DistInfo(rank=rank, world_size=world_size, local_rank=local_rank)
-
-    if "SLURM_PROCID" in os.environ and "SLURM_NTASKS" in os.environ:
-        rank = int(os.environ["SLURM_PROCID"])
-        world_size = int(os.environ["SLURM_NTASKS"])
-        local_rank = int(os.environ.get("SLURM_LOCALID", "0"))
-        return DistInfo(rank=rank, world_size=world_size, local_rank=local_rank)
-
+        return DistInfo(
+            rank=int(os.environ["RANK"]),
+            world_size=int(os.environ["WORLD_SIZE"]),
+            local_rank=int(os.environ.get("LOCAL_RANK", "0"))
+        )
+    if "SLURM_PROCID" in os.environ:
+        return DistInfo(
+            rank=int(os.environ["SLURM_PROCID"]),
+            world_size=int(os.environ["SLURM_NTASKS"]),
+            local_rank=int(os.environ.get("SLURM_LOCALID", "0"))
+        )
     return DistInfo(rank=0, world_size=1, local_rank=0)
 
 
 def _maybe_init_torch_distributed(dist: DistInfo) -> bool:
-    """
-    Initialize a process group if running multi-proc and not already initialized.
-    Uses env://, which is compatible with torchrun and many Slurm+torchrun setups.
-
-    Returns True if a process group is initialized after this call.
-    """
-    if dist.world_size <= 1:
-        return False
-    if not torch.distributed.is_available():
+    if dist.world_size <= 1 or not torch.distributed.is_available():
         return False
     if torch.distributed.is_initialized():
         return True
-
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     try:
         torch.distributed.init_process_group(
-            backend=backend,
-            init_method="env://",
-            rank=dist.rank,
-            world_size=dist.world_size,
+            backend=backend, init_method="env://", rank=dist.rank, world_size=dist.world_size
         )
         return True
     except Exception:
@@ -402,15 +314,12 @@ def _device_for_rank(base_device: str, local_rank: int) -> str:
     d = (base_device or "").strip().lower()
     if not d.startswith("cuda"):
         return base_device
-
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     if cvd:
         if "," not in cvd:
             return "cuda:0"
-
     if d == "cuda":
         return f"cuda:{local_rank}"
-
     return base_device
 
 
@@ -420,21 +329,14 @@ def _pin_torch_cuda_device(device: str) -> None:
     d = (device or "").strip().lower()
     if not d.startswith("cuda"):
         return
-
     idx = 0
     if ":" in d:
         try:
             idx = int(d.split(":")[1])
         except Exception:
             idx = 0
-
-    n = torch.cuda.device_count()
-    if n <= 0:
-        return
-    if idx >= n:
-        idx = 0
-
-    torch.cuda.set_device(idx)
+    if idx < torch.cuda.device_count():
+        torch.cuda.set_device(idx)
 
 
 def _ultralytics_device_str_for_current_process(base_device: str) -> str:
@@ -498,171 +400,118 @@ def _iter_sharded_images(it: Iterable[Image], *, rank: int, world_size: int) -> 
 
 
 # =========================
-# Concatenate dataset dir -> single parquet
+# Summarization Logic (Refactored to use Image.iter_parquet)
 # =========================
-
-
-def concatenate_predictions_dataset(
-    dataset_dir: Path,
-    out_parquet: Path,
-    *,
-    compression: str = "zstd",
-    batch_size: int = 2048,
-) -> None:
-    dataset_dir = dataset_dir.resolve()
-    out_parquet = out_parquet.resolve()
-    out_parquet.parent.mkdir(parents=True, exist_ok=True)
-
-    dset = ds.dataset(str(dataset_dir), format="parquet")
-    scanner = dset.scanner(batch_size=batch_size)
-
-    writer: Optional[pq.ParquetWriter] = None
-    try:
-        for rb in scanner.to_reader():
-            table = pa.Table.from_batches([rb])
-            if writer is None:
-                writer = pq.ParquetWriter(where=str(out_parquet), schema=table.schema, compression=compression)
-            writer.write_table(table)
-    finally:
-        if writer is not None:
-            writer.close()
-
-
-# =========================
-# Summarization over Parquet DATASET (directory)
-# =========================
-
 
 def summarize_predictions_dataset(
-    dataset_dir: Path,
-    splits: Optional[Set[str]] = None,
-    datasets: Optional[Set[str]] = None,
-    batch_size: int = 2048,
+        dataset_dir: Path,
+        splits: Optional[Set[str]] = None,
+        datasets: Optional[Set[str]] = None,
+        batch_size: int = 2048,
 ) -> Dict[str, Any]:
+    """
+    Stream the entire dataset_dir using Image.iter_parquet and compute metrics.
+    """
     if not dataset_dir.exists():
         raise FileNotFoundError(f"Predictions dataset directory not found: {dataset_dir}")
 
-    dset = ds.dataset(str(dataset_dir), format="parquet")
-
     n_images = 0
     det_disc = det_cup = seg_disc = seg_cup = 0
+
+    # Metrics storage
     mask_disc_vals: List[float] = []
     mask_cup_vals: List[float] = []
     box_disc_vals: List[float] = []
     box_cup_vals: List[float] = []
-    err_abs_adv: Dict[str, List[float]] = {"cdr_v": [], "cdr_h": [], "rim_over_disc": [], "I_over_S": []}
+
+    # Absolute errors for scalar metrics
+    err_abs_adv: Dict[str, List[float]] = {
+        "cdr_v": [], "cdr_h": [], "rim_over_disc": [], "I_over_S": []
+    }
     cdr_abs_err: List[float] = []
     rdr_abs_err: List[float] = []
 
-    filt = None
-    if datasets:
-        expr = ds.field("dataset").isin(list(datasets))
-        filt = expr if filt is None else (filt & expr)
-    if splits:
-        expr = ds.field("split").isin(list(splits))
-        filt = expr if filt is None else (filt & expr)
+    # Stream efficiently from directory
+    for img in Image.iter_parquet(dataset_dir, batch_size=batch_size):
+        # Filtering
+        if datasets and getattr(img, "dataset", None) not in datasets:
+            continue
+        if splits and getattr(img, "split", None) not in splits:
+            continue
 
-    scanner = dset.scanner(filter=filt, batch_size=batch_size)
-    for rb in scanner.to_reader():
-        for r in rb.to_pylist():
-            try:
-                img = Image.from_dict(r)
-            except Exception:
-                continue
+        n_images += 1
 
-            n_images += 1
-            if getattr(img, "inter_pred_disc_box", None) is not None:
-                det_disc += 1
-            if getattr(img, "inter_pred_cup_box", None) is not None:
-                det_cup += 1
-            if getattr(img, "pred_disc_mask", None) is not None:
-                seg_disc += 1
-            if getattr(img, "pred_cup_mask", None) is not None:
-                seg_cup += 1
+        # Detection counts
+        if getattr(img, "inter_pred_disc_box", None): det_disc += 1
+        if getattr(img, "inter_pred_cup_box", None): det_cup += 1
+        if getattr(img, "pred_disc_mask", None): seg_disc += 1
+        if getattr(img, "pred_cup_mask", None): seg_cup += 1
 
-            try:
-                img.update_mask_dice(fallback_to_boxes=True)
-            except Exception:
-                pass
-            if _is_finite(getattr(img, "mask_dice_disc", None)):
-                mask_disc_vals.append(float(img.mask_dice_disc))
-            if _is_finite(getattr(img, "mask_dice_cup", None)):
-                mask_cup_vals.append(float(img.mask_dice_cup))
+        # Mask Dice (use cached or compute from mask bytes)
+        try:
+            img.update_mask_dice(fallback_to_boxes=True)
+        except Exception:
+            pass
 
-            if getattr(img, "pred_disc_box", None) is not None and getattr(img, "gt_disc_box", None) is not None:
-                box_disc_vals.append(float(img.pred_disc_box.dice(img.gt_disc_box)))
-            if getattr(img, "pred_cup_box", None) is not None and getattr(img, "gt_cup_box", None) is not None:
-                box_cup_vals.append(float(img.pred_cup_box.dice(img.gt_cup_box)))
+        if _is_finite(img.mask_dice_disc): mask_disc_vals.append(float(img.mask_dice_disc))
+        if _is_finite(img.mask_dice_cup): mask_cup_vals.append(float(img.mask_dice_cup))
 
-            try:
-                gt_cdr = getattr(img, "gt_cdr", None)
-                pr_cdr = getattr(img, "pred_cdr", None)
-                if not _is_finite(gt_cdr):
-                    gt_cdr = img.cdr(use_pred=False, axis="vertical")
-                if not _is_finite(pr_cdr):
-                    pr_cdr = img.cdr(use_pred=True, axis="vertical")
-                if _is_finite(gt_cdr) and _is_finite(pr_cdr):
-                    cdr_abs_err.append(abs(float(pr_cdr) - float(gt_cdr)))
-            except Exception:
-                pass
+        # Box Dice
+        if img.pred_disc_box and img.gt_disc_box:
+            box_disc_vals.append(float(img.pred_disc_box.dice(img.gt_disc_box)))
+        if img.pred_cup_box and img.gt_cup_box:
+            box_cup_vals.append(float(img.pred_cup_box.dice(img.gt_cup_box)))
 
-            try:
-                gt_rdr = getattr(img, "gt_rdr", None)
-                pr_rdr = getattr(img, "pred_rdr", None)
-                if not _is_finite(gt_rdr):
-                    gt_r = img.rim_metrics(use_pred=False) or {}
-                    gt_rdr = gt_r.get("rim_over_disc")
-                if not _is_finite(pr_rdr):
-                    pr_r = img.rim_metrics(use_pred=True) or {}
-                    pr_rdr = pr_r.get("rim_over_disc")
-                if _is_finite(gt_rdr) and _is_finite(pr_rdr):
-                    rdr_abs_err.append(abs(float(pr_rdr) - float(gt_rdr)))
-            except Exception:
-                pass
+        # CDR Error
+        try:
+            gt_cdr = img.gt_cdr if _is_finite(img.gt_cdr) else img.cdr(use_pred=False, axis="vertical")
+            pr_cdr = img.pred_cdr if _is_finite(img.pred_cdr) else img.cdr(use_pred=True, axis="vertical")
+            if _is_finite(gt_cdr) and _is_finite(pr_cdr):
+                cdr_abs_err.append(abs(float(pr_cdr) - float(gt_cdr)))
+        except Exception:
+            pass
 
-            try:
-                metrics = img.metrics_summary()
-            except Exception:
-                metrics = {"gt": {}, "pred": {}}
-            gt_m = metrics.get("gt", {}) or {}
-            pr_m = metrics.get("pred", {}) or {}
+        # RDR Error
+        try:
+            gt_rdr = img.gt_rdr if _is_finite(img.gt_rdr) else (img.rim_metrics(use_pred=False) or {}).get(
+                "rim_over_disc")
+            pr_rdr = img.pred_rdr if _is_finite(img.pred_rdr) else (img.rim_metrics(use_pred=True) or {}).get(
+                "rim_over_disc")
+            if _is_finite(gt_rdr) and _is_finite(pr_rdr):
+                rdr_abs_err.append(abs(float(pr_rdr) - float(gt_rdr)))
+        except Exception:
+            pass
+
+        # Advanced Metrics Error (Rim, I/S, etc)
+        try:
+            metrics = img.metrics_summary()
+            gt_m = metrics.get("gt", {})
+            pr_m = metrics.get("pred", {})
             for key in ("cdr_v", "cdr_h", "rim_over_disc", "I_over_S"):
-                gv = gt_m.get(key)
-                pv = pr_m.get(key)
+                gv, pv = gt_m.get(key), pr_m.get(key)
                 if _is_finite(gv) and _is_finite(pv):
                     err_abs_adv[key].append(abs(float(pv) - float(gv)))
+        except Exception:
+            pass
 
+    # Aggregation
     md_disc_mean, md_disc_std = _mean_std(mask_disc_vals)
     md_cup_mean, md_cup_std = _mean_std(mask_cup_vals)
     bd_disc_mean, bd_disc_std = _mean_std(box_disc_vals)
     bd_cup_mean, bd_cup_std = _mean_std(box_cup_vals)
 
-    metric_error_adv: Dict[str, Dict[str, Optional[float]]] = {}
-    for name, vals in err_abs_adv.items():
-        mae_mean, mae_std = _mean_std(vals)
-        metric_error_adv[name] = {"mae_mean": mae_mean, "mae_std": mae_std, "n": len(vals)}
-
-    cdr_mae_mean, cdr_mae_std = _mean_std(cdr_abs_err)
-    rdr_mae_mean, rdr_mae_std = _mean_std(rdr_abs_err)
-
-    det_rate_disc = det_disc / max(1, n_images)
-    det_rate_cup = det_cup / max(1, n_images)
-    seg_rate_disc = seg_disc / max(1, n_images)
-    seg_rate_cup = seg_cup / max(1, n_images)
+    metric_error_adv = {
+        k: {"mae_mean": m, "mae_std": s, "n": len(err_abs_adv[k])}
+        for k, (m, s) in {name: _mean_std(vals) for name, vals in err_abs_adv.items()}.items()
+    }
 
     return {
         "counts": {
             "images": n_images,
-            "detected_disc": det_disc,
-            "detected_cup": det_cup,
-            "segmented_disc": seg_disc,
-            "segmented_cup": seg_cup,
-        },
-        "rates": {
-            "det_rate_disc": det_rate_disc,
-            "det_rate_cup": det_rate_cup,
-            "seg_rate_disc": seg_rate_disc,
-            "seg_rate_cup": seg_rate_cup,
+            "det_rate_disc": det_disc / max(1, n_images),
+            "det_rate_cup": det_cup / max(1, n_images),
+            "seg_rate_disc": seg_disc / max(1, n_images),
+            "seg_rate_cup": seg_cup / max(1, n_images),
         },
         "mask_dice_stats": {
             "disc": {"mean": md_disc_mean, "std": md_disc_std, "n": len(mask_disc_vals)},
@@ -674,8 +523,10 @@ def summarize_predictions_dataset(
         },
         "metric_error": metric_error_adv,
         "scalar_error": {
-            "cdr_mae": {"mae_mean": cdr_mae_mean, "mae_std": cdr_mae_std, "n": len(cdr_abs_err)},
-            "rdr_mae": {"mae_mean": rdr_mae_mean, "mae_std": rdr_mae_std, "n": len(rdr_abs_err)},
+            "cdr_mae": {"mae_mean": _mean_std(cdr_abs_err)[0], "mae_std": _mean_std(cdr_abs_err)[1],
+                        "n": len(cdr_abs_err)},
+            "rdr_mae": {"mae_mean": _mean_std(rdr_abs_err)[0], "mae_std": _mean_std(rdr_abs_err)[1],
+                        "n": len(rdr_abs_err)},
         },
     }
 
@@ -684,9 +535,9 @@ def summarize_predictions_dataset(
 # CLI
 # =========================
 
-
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run YOLO+MedSAM predictions (resumable + multi-GPU) and summarize results.")
+    p = argparse.ArgumentParser(
+        description="Run YOLO+MedSAM predictions (resumable + multi-GPU) and summarize results.")
 
     p.add_argument("--images-parquet", type=Path, default=None)
     p.add_argument("--images-dir", type=Path, default=None)
@@ -731,7 +582,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=("png", "parquet", "both", "none"),
         default="parquet",
         help="Where to store predicted masks. 'parquet' stores packed masks in output parquet; "
-        "'png' writes oc_mask/od_mask PNGs; 'both' does both; 'none' stores neither.",
+             "'png' writes oc_mask/od_mask PNGs; 'both' does both; 'none' stores neither.",
     )
 
     p.add_argument(
@@ -742,8 +593,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Whether to embed raw image bytes in the output parquets (large!).",
     )
 
-    # Final parquet concatenation is now ALWAYS performed by rank 0.
-    # You can still tweak compression/batch via these args.
     p.add_argument("--final-parquet-name", type=str, default="predictions.parquet")
     p.add_argument("--final-parquet-compression", type=str, default="zstd")
     p.add_argument("--final-parquet-batch", type=int, default=2048)
@@ -754,7 +603,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 # =========================
 # Main
 # =========================
-
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -788,12 +636,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     od_mask_root = (out_dir / "od_mask" / f"gpu={dist.rank:03d}") if save_png_masks else None
     overlay_root = (out_dir / "overlay" / f"gpu={dist.rank:03d}") if save_overlays else None
 
-    if oc_mask_root is not None:
-        _ensure_dir(oc_mask_root)
-    if od_mask_root is not None:
-        _ensure_dir(od_mask_root)
-    if overlay_root is not None:
-        _ensure_dir(overlay_root)
+    if oc_mask_root is not None: _ensure_dir(oc_mask_root)
+    if od_mask_root is not None: _ensure_dir(od_mask_root)
+    if overlay_root is not None: _ensure_dir(overlay_root)
 
     progress_file = _rank_progress_path(out_dir, dist.rank)
 
@@ -803,24 +648,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         logging.info("force-recompute enabled: ignoring any resume state.")
     elif args.resume:
         done = _load_done_set(progress_file)
-        logging.info("resume enabled (rank=%d): loaded %d done items from %s", dist.rank, len(done), progress_file)
+        logging.info("resume enabled (rank=%d): loaded %d done items", dist.rank, len(done))
 
-    # Input source
-    run_predictions = (args.images_parquet is not None) or (args.images_dir is not None)
-    if not run_predictions:
+    # Input source iterator
+    if not (args.images_parquet or args.images_dir):
         raise ValueError("You must pass --images-parquet or --images-dir to run predictions.")
     if args.yolo_weights is None or args.medsam_checkpoint is None:
-        raise ValueError("--yolo-weights and --medsam-checkpoint are required when running predictions.")
+        raise ValueError("--yolo-weights and --medsam-checkpoint are required.")
 
     def input_image_iter() -> Iterable[Image]:
         if args.images_parquet is not None:
             logging.info("Reading images from Parquet: %s", args.images_parquet)
-            base_iter = _iter_images_from_parquet(
-                args.images_parquet,
-                dataset_filter=dataset_set,
-                split_filter=split_set,
-                batch_size=args.parquet_read_batch,
-            )
+            # Use Image class to stream efficiently
+            for img in Image.iter_parquet(args.images_parquet, batch_size=args.parquet_read_batch):
+                if dataset_set and getattr(img, "dataset", None) not in dataset_set: continue
+                if split_set and getattr(img, "split", None) not in split_set: continue
+                yield img
         else:
             assert args.images_dir is not None
             logging.info("Creating images from directory: %s", args.images_dir)
@@ -830,52 +673,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 dataset=args.inference_dataset,
                 split=args.inference_split,
             )
-
-            def _filtered() -> Iterable[Image]:
-                for im in images:
-                    if dataset_set is not None and getattr(im, "dataset", None) not in dataset_set:
-                        continue
-                    if split_set is not None and getattr(im, "split", None) not in split_set:
-                        continue
-                    yield im
-
-            base_iter = _filtered()
-
-        yield from _iter_sharded_images(base_iter, rank=dist.rank, world_size=dist.world_size)
+            for im in images:
+                if dataset_set and getattr(im, "dataset", None) not in dataset_set: continue
+                if split_set and getattr(im, "split", None) not in split_set: continue
+                yield im
 
     # Device for this rank
     device = _device_for_rank(args.device, dist.local_rank)
     _pin_torch_cuda_device(device)
     yolo_device = _ultralytics_device_str_for_current_process(device)
 
-    logging.info(
-        "dist: rank=%d world_size=%d local_rank=%d device=%s torch_cuda=%s yolo_device=%s mask_store=%s image_store=%s",
-        dist.rank,
-        dist.world_size,
-        dist.local_rank,
-        device,
-        (f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "n/a"),
-        yolo_device,
-        args.mask_store,
-        args.image_store,
-    )
-
-    # Predictor
+    # Predictor Setup
     yolo_kwargs: Dict[str, Any] = dict(
-        weights=args.yolo_weights,
-        device=yolo_device,
-        imgsz=args.imgsz,
-        conf=args.conf,
-        iou=args.iou,
+        weights=args.yolo_weights, device=yolo_device, imgsz=args.imgsz, conf=args.conf, iou=args.iou,
     )
     if args.yolo_batch is not None:
         yolo_kwargs["batch_size"] = int(args.yolo_batch)
 
     try:
-        yolo_cfg = YoloPredictorConfig(**yolo_kwargs)  # type: ignore[arg-type]
+        yolo_cfg = YoloPredictorConfig(**yolo_kwargs)
     except TypeError:
         yolo_kwargs.pop("batch_size", None)
-        yolo_cfg = YoloPredictorConfig(**yolo_kwargs)  # type: ignore[arg-type]
+        yolo_cfg = YoloPredictorConfig(**yolo_kwargs)
 
     use_amp = True
     if args.sam_no_amp:
@@ -883,22 +702,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     elif args.sam_amp:
         use_amp = True
 
-    sam_kwargs: Dict[str, Any] = {"checkpoint": args.medsam_checkpoint, "device": device}
-    sam_kwargs["use_amp"] = use_amp
-    sam_kwargs["resize_backend"] = args.sam_resize_backend
-
+    sam_kwargs: Dict[str, Any] = {"checkpoint": args.medsam_checkpoint, "device": device, "use_amp": use_amp,
+                                  "resize_backend": args.sam_resize_backend}
     try:
-        sam_cfg = MedSamPredictorConfig(**sam_kwargs)  # type: ignore[arg-type]
+        sam_cfg = MedSamPredictorConfig(**sam_kwargs)
     except TypeError:
         sam_kwargs.pop("use_amp", None)
         sam_kwargs.pop("resize_backend", None)
-        sam_cfg = MedSamPredictorConfig(**sam_kwargs)  # type: ignore[arg-type]
+        sam_cfg = MedSamPredictorConfig(**sam_kwargs)
 
     pred_cfg = PredictorConfig(box_pad_frac=args.box_pad_frac)
     predictor = Predictor(yolo_cfg, sam_cfg, pred_cfg)
 
-    images_root = args.images_dir.resolve() if args.images_dir is not None else None
-
+    images_root = args.images_dir.resolve() if args.images_dir else None
     part_idx = _existing_part_count(rank_dir)
 
     def process_batch(batch: List[Image]) -> None:
@@ -906,42 +722,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if not batch:
             return
 
-        # First, try to run YOLO+MedSAM on the whole batch
         try:
             preds = predictor.predict(batch)
         except Exception as e:
-            logging.error(
-                "Predict failed for batch of size %d on rank=%d: %r. "
-                "Attempting per-image fallback and skipping bad images.",
-                len(batch),
-                dist.rank,
-                e,
-            )
+            logging.error("Batch failed on rank=%d: %r. Trying per-image fallback.", dist.rank, e)
             preds = []
             for img in batch:
                 try:
-                    sub_preds = predictor.predict([img])
-                    preds.extend(sub_preds)
-                except Exception as e_img:
-                    logging.error(
-                        "Skipping corrupted/unreadable image on rank=%d: %s (%r)",
-                        dist.rank,
-                        img.image_path,
-                        e_img,
-                    )
-                    # Mark as done so resume doesn't keep retrying this image
-                    if args.resume and not args.force_recompute:
+                    preds.extend(predictor.predict([img]))
+                except Exception:
+                    # Skip bad images, mark done to avoid retry loops
+                    if args.resume:
                         ip = str(img.image_path)
-                        uid = str(getattr(img, "uid", Path(img.image_path).stem))
                         done.add(ip)
-                        _append_done(progress_file, image_path=ip, uid=uid)
-            # If nothing survived in this batch, nothing to write
-            if not preds:
-                return
+                        _append_done(progress_file, image_path=ip, uid=img.uid)
+            if not preds: return
 
         batch_done_records: List[Tuple[str, str]] = []
 
-        # Mutate predicted Image objects and then write them with Image.save_parquet
         for img in preds:
             try:
                 img.update_mask_dice(fallback_to_boxes=True)
@@ -949,51 +747,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 pass
 
             _ensure_scalar_metrics(img)
-
             rel_subdir = _relative_subdir(img.image_path, images_root=images_root)
 
-            # Store masks (PNG) if requested
-            if save_png_masks and oc_mask_root is not None and od_mask_root is not None:
-                _save_pred_masks_for_image(
-                    img=img,
-                    oc_mask_root=oc_mask_root,
-                    od_mask_root=od_mask_root,
-                    rel_subdir=rel_subdir,
-                )
+            if save_png_masks and oc_mask_root and od_mask_root:
+                _save_pred_masks_for_image(img=img, oc_mask_root=oc_mask_root, od_mask_root=od_mask_root,
+                                           rel_subdir=rel_subdir)
 
-            # Pack masks for Parquet if requested
             if save_parquet_masks:
                 _pack_pred_masks_for_parquet(img)
 
-            overlay_path_str: Optional[str] = None
-            if save_overlays and overlay_root is not None:
+            if save_overlays and overlay_root:
                 overlay_path = overlay_root / rel_subdir / img.image_path.name
                 overlay_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    img.visualize(
-                        show=False,
-                        save_path=overlay_path,
-                        dpi=140,
-                        mask_alpha=0.7,
-                        show_metrics=True,
-                        show_conf=True,
-                    )
-                    overlay_path_str = str(overlay_path)
-                except Exception:
-                    overlay_path_str = None
-
-            # Store overlay_path in extras (persisted as JSON string)
-            if overlay_path_str is not None:
-                try:
-                    if img.extras is None:
-                        img.extras = {}
-                    img.extras["overlay_path"] = overlay_path_str
+                    img.visualize(show=False, save_path=overlay_path, dpi=140, mask_alpha=0.7)
+                    if img.extras is None: img.extras = {}
+                    img.extras["overlay_path"] = str(overlay_path)
                 except Exception:
                     pass
 
-            batch_done_records.append((str(img.image_path), str(getattr(img, "uid", img.image_path.stem))))
+            batch_done_records.append((str(img.image_path), str(img.uid)))
 
-        # Write this batch as a new part file using Image.save_parquet
+        # Write part using robust Image class writer
         part_path = _rank_part_path(rank_dir, part_idx)
         Image.save_parquet(
             images=preds,
@@ -1011,17 +786,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 done.add(ip)
                 _append_done(progress_file, image_path=ip, uid=uid)
 
-    # Main loop (per rank)
+    # Main Processing Loop
     batch: List[Image] = []
     n_seen = 0
-    n_skipped = 0
 
-    for img in tqdm(input_image_iter(), desc=f"Predict (rank={dist.rank})", unit="image"):
+    # Iterate specifically over sharded subset for this rank
+    sharded_iter = _iter_sharded_images(input_image_iter(), rank=dist.rank, world_size=dist.world_size)
+
+    for img in tqdm(sharded_iter, desc=f"Predict (rank={dist.rank})", unit="img"):
         n_seen += 1
-        key = str(img.image_path)
-
-        if not args.force_recompute and args.resume and key in done:
-            n_skipped += 1
+        if not args.force_recompute and args.resume and str(img.image_path) in done:
             continue
 
         batch.append(img)
@@ -1032,47 +806,35 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if batch:
         process_batch(batch)
 
-    logging.info(
-        "rank=%d finished. seen=%d skipped=%d written_parts=%d -> %s",
-        dist.rank,
-        n_seen,
-        n_skipped,
-        part_idx,
-        rank_dir,
-    )
-
-    # Barrier so rank 0 doesn't summarize/concatenate before others finish writing.
+    logging.info("rank=%d finished. seen=%d parts=%d", dist.rank, n_seen, part_idx)
     _barrier_if_possible()
 
-    # Rank 0 post-processing
+    # Rank 0: Summarize and Concatenate
     if dist.rank == 0:
         logging.info("Summarizing predictions from dataset %s", dataset_dir)
         summary = summarize_predictions_dataset(
-            dataset_dir,
-            splits=split_set,
-            datasets=dataset_set,
-            batch_size=args.parquet_read_batch,
+            dataset_dir, splits=split_set, datasets=dataset_set, batch_size=args.parquet_read_batch
         )
 
-        summary_path = out_dir / "summary.json"
-        with open(summary_path, "w", encoding="utf-8") as f:
+        with open(out_dir / "summary.json", "w") as f:
             json.dump(summary, f, indent=2)
-        logging.info("Wrote summary JSON to %s", summary_path)
 
-        if args.summary_csv is not None:
+        if args.summary_csv:
             append_summary_row_to_csv(args.summary_csv, dataset_dir, summary)
-            logging.info("Appended summary row to CSV %s", args.summary_csv)
 
-        # ALWAYS write final concatenated parquet
         final_path = out_dir / args.final_parquet_name
-        logging.info("Concatenating dataset dir -> single parquet: %s", final_path)
-        concatenate_predictions_dataset(
-            dataset_dir=dataset_dir,
-            out_parquet=final_path,
+        logging.info("Concatenating into single file: %s", final_path)
+
+        # Use Image class to stream from dataset directory and write to single file
+        Image.save_parquet(
+            Image.iter_parquet(dataset_dir),
+            path=final_path,
+            include_image_bytes=save_parquet_images,
+            include_mask_bytes=save_parquet_masks,
             compression=args.final_parquet_compression,
-            batch_size=args.final_parquet_batch,
+            write_batch=args.final_parquet_batch
         )
-        logging.info("Wrote final concatenated Parquet: %s", final_path)
+        logging.info("Done.")
 
 
 if __name__ == "__main__":
