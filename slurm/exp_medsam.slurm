@@ -1,60 +1,58 @@
 #!/bin/bash
-#SBATCH --job-name=TRAIN_P_30
+#SBATCH --job-name=MEDSAM_ONLY
 #SBATCH --account=st-ipor-1-gpu
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
-#SBATCH --mem=64G
-#SBATCH --time=20:00:00
-#SBATCH --gpus=2
-#SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A_%a.out
-#SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A_%a.err
+#SBATCH --ntasks-per-node=2
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128G
+#SBATCH --time=100:00:00
+#SBATCH --gpus-per-node=2
+#SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.out
+#SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.err
 #SBATCH --mail-user=cperez67@student.ubc.ca
 #SBATCH --mail-type=FAIL,END
 
 set -euo pipefail
 
 ############################
-# User-configurable paths  #
+# Paths / environment
 ############################
 REPO_DIR="/scratch/st-ipor-1/cperez/MedSAM"
+DATA_ROOT="/arc/project/st-ipor-1/carlosp/fundus_data/All_Datasets_Organized"
 
-BATCH=8
+# Pre-built YOLO dataset + trained YOLO weights
+YOLO_DS="/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS"
+YOLO_WTS="/scratch/st-ipor-1/cperez/MedSAM/runs/run8/Train/Train/weights/best.pt"
 
-# Python module entrypoint
-PYTHON_MODULE="src.experiment"
+LOG_DIR="${REPO_DIR}/hpc_logs"
+mkdir -p "${LOG_DIR}"
 
-# Make project importable as `src.*`
 export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
-
-# Optional: GPU/CPU binding hints
-SRUN_BIND="--gpu-bind=closest --cpu-bind=cores"
+export PYTHONUNBUFFERED=1
 
 source "${REPO_DIR}/slurm/setup.sh"
 setup_env
 
-mkdir -p "${REPO_DIR}/logs" /scratch/st-ipor-1/cperez/MedSAM/hpc_logs
-
-ARGS_1=(
-  --yolo-ds "/scratch/st-ipor-1/cperez/MedSAM/YOLO_DS_No_P"
-  --yolo-weights "/scratch/st-ipor-1/cperez/MedSAM/runs/run3/Train/Train/weights/best.pt"
-)
-ARGS_2=(
-  --yolo-ds "/scratch/st-ipor-1/cperez/MedSAM/YOLO_DS_P"
-  --yolo-weights "/scratch/st-ipor-1/cperez/MedSAM/runs/run1/Train/Train/weights/best.pt"
-)
-ARGS_3=(
---papila
---yolo-out-dir "/scratch/st-ipor-1/cperez/MedSAM/YOLO_DS_P_30"
-)
-ARGS_4=(
---yolo-out-dir "/scratch/st-ipor-1/cperez/MedSAM/YOLO_DS_No_P"
-)
-
-########################################
-# Dispatch by MODE
-########################################
 cd "${REPO_DIR}"
 
-srun ${SRUN_BIND} -u python -m "${PYTHON_MODULE}" "${ARGS_3[@]}"
+############################
+# Experiment args
+############################
+# We only want to run the MedSAM / Fundu finetuning stage, using:
+#   - existing YOLO dataset   (--yolo-ds)
+#   - existing YOLO weights   (--yolo-weights)
+# No YOLO training or testing is requested in this job.
+ARGS=(
+  --finetune-medsam
+  --yolo-ds "${YOLO_DS}"
+  --yolo-weights "${YOLO_WTS}"
+)
+
+############################
+# Launch (multi-GPU via torchrun)
+############################
+# SLURM_GPUS_ON_NODE is set by the scheduler; we use one process per GPU.
+srun --gpu-bind=closest --cpu-bind=cores \
+  torchrun --standalone --nproc_per_node="${SLURM_GPUS_ON_NODE}" \
+    -m src.experiment "${ARGS[@]}"

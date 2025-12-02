@@ -1,10 +1,9 @@
 # src/imgpipe/binary_mask_ref.py
-# Mask holder; exposes optional convenience to compute a normalized bbox
 
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from src.imgpipe.normalized_box import NormalizedBox
@@ -14,24 +13,63 @@ import imageio.v3 as iio  # type: ignore
 import cv2  # type: ignore
 
 
+def _pack_bool_mask(mask: np.ndarray) -> Tuple[bytes, int, int]:
+    m = ensure_bool_mask(mask)
+    h, w = m.shape
+    flat = np.ascontiguousarray(m.reshape(-1).astype(np.uint8))
+    packed = np.packbits(flat, bitorder="little")
+    return packed.tobytes(), int(h), int(w)
+
+
+def _unpack_bool_mask(data: bytes, h: int, w: int) -> np.ndarray:
+    buf = np.frombuffer(data, dtype=np.uint8)
+    bits = np.unpackbits(buf, bitorder="little")
+    bits = bits[: h * w]
+    return bits.reshape(h, w).astype(bool)
+
+
 @dataclass
 class BinaryMaskRef:
     """
-    Holds a reference to a binary mask — either a file path or an in-memory array.
-    Loads lazily and caches the array when read from disk.
+    Holds a reference to a binary mask — either a file path, a packed-bytes blob, or an in-memory array.
+    Loads lazily and caches the array when decoded/read.
     """
     path: Optional[Path] = None
     array: Optional[np.ndarray] = field(default=None, repr=False)
+    packed: Optional[bytes] = field(default=None, repr=False)
+    shape: Optional[Tuple[int, int]] = field(default=None, repr=False)  # (H, W)
+    encoding: Optional[str] = field(default=None, repr=False)  # e.g. "packbits_little"
 
     def load(self) -> np.ndarray:
         """Return mask as a boolean array."""
         if self.array is not None:
             return ensure_bool_mask(self.array)
+
+        # Decode packed bytes if present
+        if self.packed is not None and self.shape is not None:
+            h, w = self.shape
+            arr = _unpack_bool_mask(self.packed, h, w)
+            self.array = ensure_bool_mask(arr)
+            return self.array
+
+        # Fall back to path
         if self.path is None:
-            raise ValueError("Mask has neither array nor path.")
+            raise ValueError("Mask has neither array nor packed bytes nor path.")
         arr = self._read_mask(self.path)
         self.array = ensure_bool_mask(arr)
         return self.array
+
+    def pack_inplace(self) -> None:
+        """
+        Convert any in-memory array into packed bytes and drop the array to reduce RAM.
+        """
+        if self.array is None:
+            return
+        data, h, w = _pack_bool_mask(self.array)
+        self.packed = data
+        self.shape = (h, w)
+        self.encoding = "packbits_little"
+        self.array = None
 
     @staticmethod
     def _read_mask(p: Path) -> np.ndarray:
@@ -58,22 +96,36 @@ class BinaryMaskRef:
         except Exception as e:
             raise RuntimeError(f"Unable to read mask at {p}: {e}") from e
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {"path": str(self.path) if self.path else None, "has_array": self.array is not None}
+    def to_dict(self, *, include_mask_bytes: bool = False) -> Dict[str, Any]:
+        """
+        JSON-safe by default. When include_mask_bytes=True, returns a Parquet-friendly dict with bytes.
+        """
+        d: Dict[str, Any] = {
+            "path": str(self.path) if self.path else None,
+            "has_array": self.array is not None,
+        }
 
-    # -------- Optional convenience (not required by Image; Image aligns sizes itself) --------
+        if include_mask_bytes:
+            # Ensure packed representation exists if we can derive it
+            if self.packed is None and self.array is not None:
+                self.pack_inplace()
+
+            d.update(
+                {
+                    "encoding": self.encoding,
+                    "h": self.shape[0] if self.shape else None,
+                    "w": self.shape[1] if self.shape else None,
+                    "data": self.packed,  # bytes (Parquet can store this; JSON cannot)
+                }
+            )
+
+        return d
 
     def bbox_norm(self, img_w: int, img_h: int) -> Optional[NormalizedBox]:
-        """
-        YOLO-normalized (xc, yc, w, h) derived from this mask.
-        NOTE: This assumes the mask is aligned to the image dimensions. If not,
-        prefer Image._mask_bbox_norm_aligned(), which pads/crops to image size first.
-        """
         m = self.load()
         if not m.any():
             return None
         ys, xs = np.nonzero(m)
-        # +1 on max edges (exclusive upper edge convention)
         x1, x2 = float(xs.min()), float(xs.max() + 1)
         y1, y2 = float(ys.min()), float(ys.max() + 1)
         return NormalizedBox.from_xyxy(x1, y1, x2, y2, img_w, img_h)

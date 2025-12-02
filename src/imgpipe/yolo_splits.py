@@ -3,11 +3,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Literal, Sequence, Tuple, Optional
+from typing import Dict, List, Literal, Sequence, Tuple, Optional, Iterable, Union
 import json
 import math
-import os
-import random
 import shutil
 from datetime import datetime
 
@@ -15,9 +13,13 @@ import numpy as np
 from PIL import Image as PILImage
 
 from src.imgpipe.image import Image  # expects Image objects produced by your ImageFactory
-from src.utils import save_images_jsonl
 
 SplitName = Literal["train", "val", "test"]
+
+
+# =============================================================================
+# Split container
+# =============================================================================
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,11 @@ class YoloSplit:
         return {k: len(v) for k, v in m.items()}
 
 
+# =============================================================================
+# Utilities
+# =============================================================================
+
+
 def _validate_ratios(train: float, val: float, test: float) -> Tuple[float, float, float]:
     s = train + val + test
     if not math.isclose(s, 1.0, rel_tol=1e-9, abs_tol=1e-9):
@@ -43,18 +50,18 @@ def _validate_ratios(train: float, val: float, test: float) -> Tuple[float, floa
     return train, val, test
 
 
-def _split_indices(n: int, train: float, val: float, test: float) -> Tuple[List[int], List[int], List[int]]:
+def _split_indices(n: int, train: float, val: float, test: float):
     """Round-splitting that exactly covers n after shuffle."""
-    # Base floors
     n_train = int(math.floor(train * n))
     n_val = int(math.floor(val * n))
-    # Assign remainder to the split with the largest fractional part
-    rem = n - (n_train + n_val + int(math.floor(test * n)))
-    # Distribute remainder using fractional parts
+    n_test_floor = int(math.floor(test * n))
+
+    rem = n - (n_train + n_val + n_test_floor)
+
     fracs = [
         ("train", train * n - n_train),
         ("val", val * n - n_val),
-        ("test", test * n - int(math.floor(test * n))),
+        ("test", test * n - n_test_floor),
     ]
     fracs.sort(key=lambda x: x[1], reverse=True)
     add = {"train": 0, "val": 0, "test": 0}
@@ -65,23 +72,26 @@ def _split_indices(n: int, train: float, val: float, test: float) -> Tuple[List[
     n_val += add["val"]
     n_test = n - n_train - n_val
 
-    # Produce slices after caller shuffles an index list
     def slicer(idx: List[int]) -> Tuple[List[int], List[int], List[int]]:
         a = idx[:n_train]
         b = idx[n_train:n_train + n_val]
         c = idx[n_train + n_val:]
         return a, b, c
 
-    return slicer  # returns a function; caller applies to shuffled index list
+    return slicer
 
 
 def _ensure_dirs(root: Path) -> None:
-    # Images / labels
-    for sub in ("images/train", "images/val", "images/test",
-                "labels/train", "labels/val", "labels/test"):
+    for sub in (
+        "images/train",
+        "images/val",
+        "images/test",
+        "labels/train",
+        "labels/val",
+        "labels/test",
+    ):
         (root / sub).mkdir(parents=True, exist_ok=True)
-    # Mask dirs are created lazily in _save_gt_masks per split,
-    # so no need to pre-create them here.
+    # Mask dirs are created lazily in _save_gt_masks per split.
 
 
 def _label_path_for(image_path: Path, labels_dir: Path) -> Path:
@@ -97,7 +107,6 @@ def _write_label_file(img: Image, label_path: Path, *, use_gt: bool) -> None:
 
 
 def _copy_image(src: Path, dst: Path) -> None:
-    """Copy image bytes; ensures dst parent exists."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
 
@@ -113,6 +122,8 @@ def _write_data_yaml(root: Path) -> None:
         "test": "images/test",
         "names": {0: "disc", 1: "cup"},
     }
+    # Keep json so you don't need a yaml dependency; Ultralytics accepts YAML, but JSON is not guaranteed.
+    # If you prefer strict YAML, swap to a tiny manual YAML writer.
     (root / "data.yaml").write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -157,19 +168,62 @@ def _save_gt_masks(img: Image, split_name: str, out_dir: Path, stem: str) -> Non
     disc_dir.mkdir(parents=True, exist_ok=True)
     cup_dir.mkdir(parents=True, exist_ok=True)
 
-    # Disc mask
     if img.gt_disc_mask is not None:
         disc_mask = _mask_to_image_size(img, img.gt_disc_mask)
         if disc_mask is not None:
             disc_arr = (disc_mask.astype(np.uint8) * 255)
             PILImage.fromarray(disc_arr).save(disc_dir / f"{stem}.png")
 
-    # Cup mask
     if img.gt_cup_mask is not None:
         cup_mask = _mask_to_image_size(img, img.gt_cup_mask)
         if cup_mask is not None:
             cup_arr = (cup_mask.astype(np.uint8) * 255)
             PILImage.fromarray(cup_arr).save(cup_dir / f"{stem}.png")
+
+
+def _coerce_split(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    s2 = str(s).strip().lower()
+    return s2 if s2 else None
+
+
+def _split_from_existing(images: Sequence[Image]) -> YoloSplit:
+    """
+    Build YoloSplit from images that already have split assigned.
+    Requires every image to have split in {"train","val","test"}.
+    """
+    tr: List[Image] = []
+    va: List[Image] = []
+    te: List[Image] = []
+    missing = 0
+    bad = 0
+
+    for im in images:
+        s = _coerce_split(getattr(im, "split", None))
+        if s is None:
+            missing += 1
+            continue
+        if s == "train":
+            tr.append(im)
+        elif s == "val":
+            va.append(im)
+        elif s == "test":
+            te.append(im)
+        else:
+            bad += 1
+
+    if missing or bad:
+        raise ValueError(
+            f"Existing-split mode requires split in {{train,val,test}} for every image; "
+            f"missing={missing}, invalid={bad}."
+        )
+    return YoloSplit(train=tr, val=va, test=te)
+
+
+# =============================================================================
+# Main entrypoints
+# =============================================================================
 
 
 def create_yolo_dataset(
@@ -185,19 +239,7 @@ def create_yolo_dataset(
     """
     Build a YOLO-ready directory (images/ & labels/) and return the split (in memory).
 
-    Inputs
-    ------
-    images : Sequence[Image]
-        Objects produced by ImageFactory.make_images(...).
-    train, val, test : float
-        Fractions summing to 1.0.
-    out_dir : Path
-        Directory to create the YOLO dataset in.
-    seed : int
-        RNG seed for reproducibility.
-    use_gt : bool
-        If True, label files use ground-truth boxes (disc=0, cup=1).
-        If False, uses intermediate predicted boxes (inter_pred_*).
+    This mode ASSIGNS splits by ratios and seed.
 
     Effects
     -------
@@ -209,11 +251,7 @@ def create_yolo_dataset(
         masks/{train,val,test}/cup/<stem>.png      (if GT cup mask exists)
         data.yaml  (Ultralytics format)
         split_meta.json
-
-    Returns
-    -------
-    YoloSplit
-        In-memory split object with train/val/test lists of Images.
+        saved_images.parquet   (Image metadata only, no pixels)
     """
     _validate_ratios(train, val, test)
 
@@ -221,13 +259,13 @@ def create_yolo_dataset(
     out_dir.mkdir(parents=True, exist_ok=True)
     _ensure_dirs(out_dir)
 
-    # Deterministic shuffle
-    rng = random.Random(seed)
-    idxs = list(range(len(images)))
+    # Shuffle indices deterministically
+    rng = np.random.default_rng(int(seed))
+    idxs = np.arange(len(images))
     rng.shuffle(idxs)
 
     slicer = _split_indices(len(images), train, val, test)
-    train_idx, val_idx, test_idx = slicer(idxs)
+    train_idx, val_idx, test_idx = slicer(idxs.tolist())
 
     split = YoloSplit(
         train=[images[i] for i in train_idx],
@@ -235,43 +273,96 @@ def create_yolo_dataset(
         test=[images[i] for i in test_idx],
     )
 
-    # Materialize images, labels, and GT masks
+    _materialize_yolo_layout(split, out_dir=out_dir, use_gt=use_gt)
+
+    parquet_path = out_dir / "saved_images.parquet"
+    Image.save_parquet(images, parquet_path, drop_none=False)
+
+    meta = {
+        "created_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "seed": seed,
+        "mode": "assign_splits",
+        "ratios": {"train": train, "val": val, "test": test},
+        "counts": split.counts(),
+        "total": len(images),
+        "use_gt": use_gt,
+        "has_gt_masks": True,
+        "saved_images_parquet": str(parquet_path),
+    }
+    (out_dir / "split_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    _write_data_yaml(out_dir)
+    return split
+
+
+def create_yolo_dataset_from_parquet(
+    in_parquet: Path,
+    *,
+    out_dir: Path,
+    batch_size: int = 2048,
+    use_gt: bool = True,
+    save_images_parquet: bool = True,
+) -> YoloSplit:
+    """
+    Build the same YOLO directory structure, but using a Parquet file that ALREADY has
+    split assigned per image (img.split in {train,val,test}).
+
+    Reads streaming via Image.iter_parquet to support nested columns and large files.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_dirs(out_dir)
+
+    # Stream in -> bucket by split (needs lists to write split_meta + optional saved_images.parquet)
+    imgs: List[Image] = []
+    for im in Image.iter_parquet(in_parquet, batch_size=int(batch_size)):
+        imgs.append(im)
+
+    split = _split_from_existing(imgs)
+    _materialize_yolo_layout(split, out_dir=out_dir, use_gt=use_gt)
+
+    parquet_path = out_dir / "saved_images.parquet"
+    if save_images_parquet:
+        Image.save_parquet(imgs, parquet_path, drop_none=False)
+
+    meta = {
+        "created_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "mode": "existing_splits",
+        "counts": split.counts(),
+        "total": len(imgs),
+        "use_gt": use_gt,
+        "has_gt_masks": True,
+        "input_parquet": str(Path(in_parquet).resolve()),
+        "saved_images_parquet": str(parquet_path) if save_images_parquet else None,
+    }
+    (out_dir / "split_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    _write_data_yaml(out_dir)
+    return split
+
+
+# =============================================================================
+# Internal: write directory layout
+# =============================================================================
+
+
+def _materialize_yolo_layout(split: YoloSplit, *, out_dir: Path, use_gt: bool) -> None:
     for split_name, imgs in split.as_mapping().items():
         img_dir = out_dir / "images" / split_name
         lbl_dir = out_dir / "labels" / split_name
 
         for im in imgs:
+            # Ensure split is consistent (important if downstream re-saves metadata)
             im.set_split(split_name)
+
             src = im.image_path
             if not src.exists():
-                # Skip missing sources defensively
                 continue
 
-            # Copy image
             dst = img_dir / src.name
             _copy_image(src, dst)
 
-            # Write label (empty file if no boxes)
             label_path = _label_path_for(dst, lbl_dir)
             _write_label_file(im, label_path, use_gt=use_gt)
 
-            # Save GT masks (if present)
             _save_gt_masks(im, split_name, out_dir, stem=dst.stem)
-
-    save_images_jsonl(images, out_dir / "saved_images.jsonl")
-    # Write metadata for reproducibility
-    meta = {
-        "created_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "seed": seed,
-        "ratios": {"train": train, "val": val, "test": test},
-        "counts": split.counts(),
-        "total": len(images),
-        "use_gt": use_gt,
-        "has_gt_masks": True,  # indicates this script is capable of exporting GT masks
-    }
-    (out_dir / "split_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    # YOLO data.yaml
-    _write_data_yaml(out_dir)
-
-    return split

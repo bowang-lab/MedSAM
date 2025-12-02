@@ -325,7 +325,7 @@ class Evaluator:
             rows.append(EvalRow(
                 uid=img.uid,
                 dataset=img.dataset,
-                subject_id=img.subject_id,
+                subject_id=img.patient_id,
                 image_path=str(img.image_path),
                 gt_cdr_v=gt,
                 pred_cdr_v=pred,

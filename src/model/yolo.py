@@ -73,20 +73,22 @@ def set_global_seed(seed: int = 42) -> None:
 def infer_data_yaml_path(out_dir: Path) -> Path:
     return out_dir / "data.yaml"
 
+
 def scan_filter(data_root: Path, out_dir: Path, papila: float):
     excluded_papila = None
 
     print("[INFO] Scanning datasets…")
     image_factory = ImageFactory(root=data_root, auto_scan=True)
+    print(image_factory.summary())
     image_factory.filter_empty_masks()
+    print(image_factory.summary())
 
     if papila == 1:
-        image_factory.filter_datasets(include=["PAPILA"])
+        image_factory.filter_datasets(include=["PAPILA", "GRAPE"])
     elif papila == 0:
-        image_factory.filter_datasets(exclude=["PAPILA"])
+        image_factory.filter_datasets(exclude=["PAPILA", "GRAPE"])
     else:
         excluded_papila = image_factory.retain_percentage_in_dataset("PAPILA", papila)
-
 
     images = image_factory.make_images()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -482,6 +484,7 @@ class YOLORunner:
             seed=42,
             run_name="run1",
             single_top_per_class=False,  # or True to restrict to one pred per class
+            papila=0.0,
         )
 
         data_yaml = runner.ensure_data()
@@ -530,9 +533,9 @@ class YOLORunner:
         self.resume = resume
         self.seed = seed
         self.single_top_per_class = single_top_per_class
-        self.train_ratio = train_ratio
-        self.val_ratio = val_ratio
-        self.test_ratio = test_ratio
+        self.train_ratio = float(train_ratio)
+        self.val_ratio = float(val_ratio)
+        self.test_ratio = float(test_ratio)
 
         self._data_yaml: Optional[Path] = None
         self._data_yaml_excluded: Optional[Path] = None
@@ -568,18 +571,29 @@ class YOLORunner:
             self._base_model = YOLO(self.model_name)
         return self._base_model
 
-
     # -------- public API --------
-    def ensure_data(self, train_ratio, val_ratio, test_ratio) -> Path:
+    def ensure_data(
+        self,
+        train_ratio: float | None = None,
+        val_ratio: float | None = None,
+        test_ratio: float | None = None,
+    ) -> Path:
         """
         Ensure a YOLO-style dataset exists and return the path to data.yaml.
 
         Behaviour:
           * If yolo_ds is provided, use that directory (expects data.yaml).
           * Otherwise, scan/filter raw datasets and create YOLO splits under out_dir.
+
+        If ratios are not provided, defaults to self.train_ratio/val_ratio/test_ratio.
         """
         if self._data_yaml is not None:
             return self._data_yaml
+
+        # Use instance defaults if not overridden
+        tr = self.train_ratio if train_ratio is None else float(train_ratio)
+        vr = self.val_ratio if val_ratio is None else float(val_ratio)
+        ter = self.test_ratio if test_ratio is None else float(test_ratio)
 
         if self.yolo_ds is not None:
             data_yaml = self.yolo_ds / "data.yaml"
@@ -598,10 +612,13 @@ class YOLORunner:
             self.out_dir,
             papila=self.papila,
         )
-        self._data_yaml = create_yolo_ds(images, self.out_dir,
-                                         train_ratio=train_ratio, val_ratio=val_ratio, test_ratio=test_ratio)
-
-        # save_images_jsonl(images, self.out_dir / "saved_images.jsonl")
+        self._data_yaml = create_yolo_ds(
+            images,
+            self.out_dir,
+            train_ratio=tr,
+            val_ratio=vr,
+            test_ratio=ter,
+        )
 
         # Create dataset for excluded PAPILA images (test-only dataset)
         if excluded:
@@ -646,6 +663,7 @@ class YOLORunner:
             freeze=5,
             imgsz=self.imgsz,
             batch=self.batch,
+            amp=False
         )
 
         weights_dir = project_dir / run_name / "weights"

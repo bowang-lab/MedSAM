@@ -1,41 +1,144 @@
+#!/usr/bin/env python3
 # src/imgpipe/image.py
-# Image record storing ONLY normalized boxes; metrics/vis preserved.
+# Image record storing normalized boxes; metrics/vis preserved.
+# Uses Parquet as canonical persistence format with a stable Arrow schema.
 
 from __future__ import annotations
 
+import io
 import json
+import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Optional, Tuple
 from enum import Enum
-
-import numpy as np
 from pathlib import Path
-from PIL import Image as PILImage
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+
 import matplotlib.pyplot as plt
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 from matplotlib.patches import Rectangle
+from PIL import Image as PILImage
 
 from .binary_mask_ref import BinaryMaskRef
+from .enums import Eye, Ethnicity, LabelType, Structure
 from .normalized_box import NormalizedBox
-from .enums import LabelType, Structure, Eye, Ethnicity
 from src.utils import gen_uid, read_image_size
+
+
+# =============================================================================
+# Media ref: optional image bytes stored alongside paths
+# =============================================================================
+
+
+@dataclass
+class ImageDataRef:
+    """
+    Reference to an image payload:
+      - path: where the image lives on disk (retained)
+      - packed: optional raw file bytes (stored in Parquet)
+      - encoding: how 'packed' bytes should be interpreted
+          - "raw_file" means bytes are exactly the file contents (best for fidelity)
+      - ext: original file extension (".jpg", ".png", ...)
+    """
+
+    path: Optional[Path] = None
+    packed: Optional[bytes] = None
+    encoding: str = "raw_file"
+    ext: Optional[str] = None
+
+    def has_bytes(self) -> bool:
+        return self.packed is not None and len(self.packed) > 0
+
+    def load_bytes(self) -> Optional[bytes]:
+        if self.packed is not None:
+            return self.packed
+        if self.path is None:
+            return None
+        try:
+            return self.path.read_bytes()
+        except Exception:
+            return None
+
+    def load_pil(self) -> PILImage.Image:
+        """
+        Load to PIL.Image. Prefers packed bytes when present, else uses path.
+        Always returns an RGB image.
+        """
+        b = self.load_bytes()
+        if b is not None:
+            with PILImage.open(io.BytesIO(b)) as im:
+                return im.convert("RGB").copy()
+        if self.path is None:
+            raise FileNotFoundError("ImageDataRef has neither packed bytes nor a valid path.")
+        with PILImage.open(self.path) as im:
+            return im.convert("RGB")
+
+    def to_dict(self, *, include_image_bytes: bool = False) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "path": str(self.path) if self.path is not None else None,
+            "encoding": str(self.encoding) if self.encoding is not None else None,
+            "ext": str(self.ext) if self.ext is not None else None,
+        }
+        out["data"] = self.load_bytes() if include_image_bytes else None
+        return out
+
+    @staticmethod
+    def from_dict(d: Optional[Dict[str, Any]]) -> Optional["ImageDataRef"]:
+        if not d:
+            return None
+        path = d.get("path")
+        enc = d.get("encoding") or "raw_file"
+        ext = d.get("ext")
+        data = d.get("data")
+
+        packed: Optional[bytes] = None
+        if data is not None:
+            if isinstance(data, (bytes, bytearray)):
+                packed = bytes(data)
+            elif isinstance(data, memoryview):
+                packed = data.tobytes()
+
+        return ImageDataRef(
+            path=Path(path) if path else None,
+            packed=packed,
+            encoding=str(enc),
+            ext=str(ext) if ext else None,
+        )
+
+
+# =============================================================================
+# Image record
+# =============================================================================
 
 
 @dataclass
 class Image:
     """
     All metadata and annotations for a single fundus image.
-    Masks are optional; boxes are stored as normalized YOLO (xc,yc,w,h).
+
+    - Boxes are stored as normalized YOLO (xc,yc,w,h) in [0,1].
+    - Masks are stored as BinaryMaskRef (path and/or packed bytes).
+    - Paths are always retained.
+    - Parquet is the canonical persistence format (save_parquet/load_parquet/iter_parquet).
+
+    IMPORTANT: `extras` is persisted as JSON string (nullable) under the Parquet column name "extras".
+    This avoids Parquet limitations with empty structs while keeping forward flexibility.
     """
+
     # Identity / dataset
     uid: str
     dataset: str
-    subject_id: str
+    patient_id: str
 
     # Image payload
     image_path: Path
     width: int
     height: int
     split: Optional[str] = None  # "train" | "val" | "test" | None
+
+    # Optional embedded image payload (bytes) in addition to path
+    image_ref: Optional[ImageDataRef] = None
 
     # GT masks
     gt_disc_mask: Optional[BinaryMaskRef] = None
@@ -58,9 +161,10 @@ class Image:
     # Detector / segmenter confidences
     yolo_disc_conf: Optional[float] = None
     yolo_cup_conf: Optional[float] = None
-    sam_disc_conf: Optional[float] = None  # currently unused → None
-    sam_cup_conf: Optional[float] = None   # currently unused → None
+    sam_disc_conf: Optional[float] = None
+    sam_cup_conf: Optional[float] = None
 
+    # Ratios / cached metrics
     gt_cd_ratio: Optional[float] = None
     pred_cd_ratio: Optional[float] = None
 
@@ -81,10 +185,45 @@ class Image:
     gt_rdr: Optional[float] = None
     pred_rdr: Optional[float] = None
 
+    # Lazy-loaded image cache (not serialized)
+    _pil_image: Optional[PILImage.Image] = field(default=None, init=False, repr=False, compare=False)
+
+    # ----------------- lazy image loading -----------------
+
+    def ensure_image_ref(self) -> ImageDataRef:
+        if self.image_ref is None:
+            ext = self.image_path.suffix.lower() if self.image_path is not None else None
+            self.image_ref = ImageDataRef(path=self.image_path, ext=ext)
+        else:
+            if self.image_ref.path is None:
+                self.image_ref.path = self.image_path
+            if self.image_ref.ext is None:
+                self.image_ref.ext = self.image_path.suffix.lower()
+        return self.image_ref
+
+    @property
+    def image(self) -> PILImage.Image:
+        """
+        Lazy-load and cache the PIL image.
+        Prefers embedded bytes (if present) over filesystem path.
+        """
+        if self._pil_image is None:
+            ref = self.ensure_image_ref()
+            self._pil_image = ref.load_pil()
+        return self._pil_image
+
+    def unload_image(self) -> None:
+        """Release the cached PIL image from memory."""
+        if self._pil_image is not None:
+            try:
+                self._pil_image.close()
+            finally:
+                self._pil_image = None
+
     # ----------------- construction -----------------
 
     @staticmethod
-    def _coerce_maskref(mask: BinaryMaskRef | Path | np.ndarray) -> BinaryMaskRef:
+    def _coerce_maskref(mask: Union[BinaryMaskRef, Path, np.ndarray]) -> BinaryMaskRef:
         if isinstance(mask, BinaryMaskRef):
             return mask
         if isinstance(mask, Path):
@@ -106,21 +245,37 @@ class Image:
             w, h = read_image_size(p)
         else:
             w, h = int(width), int(height)
-        return Image(
+
+        obj = Image(
             uid=uid or gen_uid(),
             dataset=dataset,
-            subject_id=subject_id,
+            patient_id=subject_id,
             image_path=p,
             width=w,
             height=h,
             split=split,
         )
+        obj.ensure_image_ref()
+        return obj
+
+    # ----------------- normalized box helpers -----------------
+
+    def _box_attr_name(self, component: Structure, kind: LabelType) -> str:
+        return {
+            (Structure.DISC, LabelType.GT): "gt_disc_box",
+            (Structure.DISC, LabelType.PRED): "inter_pred_disc_box",
+            (Structure.CUP, LabelType.GT): "gt_cup_box",
+            (Structure.CUP, LabelType.PRED): "inter_pred_cup_box",
+        }[(component, kind)]
+
+    def set_box(self, component: Structure, kind: LabelType, nbox: Optional[NormalizedBox]) -> None:
+        setattr(self, self._box_attr_name(component, kind), nbox)
 
     def set_box_norm(
         self,
         component: Structure,
         kind: LabelType,
-        nbox: Optional[NormalizedBox | Tuple[float, float, float, float] | Dict[str, float]],
+        nbox: Optional[Union[NormalizedBox, Tuple[float, float, float, float], Dict[str, float]]],
     ) -> None:
         """
         Set a normalized YOLO box (xc,yc,w,h in [0,1]) for the given component/kind.
@@ -135,7 +290,6 @@ class Image:
             nb = nbox
         elif isinstance(nbox, (tuple, list)) and len(nbox) == 4:
             xc, yc, w, h = (float(nbox[0]), float(nbox[1]), float(nbox[2]), float(nbox[3]))
-            # Clip to [0,1] and enforce non-negativity for robustness against tiny drift.
             xc, yc = float(np.clip(xc, 0.0, 1.0)), float(np.clip(yc, 0.0, 1.0))
             w, h = float(np.clip(w, 0.0, 1.0)), float(np.clip(h, 0.0, 1.0))
             nb = NormalizedBox(xc, yc, w, h)
@@ -151,15 +305,23 @@ class Image:
 
         setattr(self, self._box_attr_name(component, kind), nb)
 
-    # ----------------- setters -----------------
+    def get_box_norm(self, component: Structure, kind: LabelType) -> Optional[NormalizedBox]:
+        return getattr(self, self._box_attr_name(component, kind))
 
-    def set_mask(self, component: Structure, kind: LabelType, mask: BinaryMaskRef | Path | np.ndarray) -> None:
+    def set_split(self, split: Optional[str]) -> None:
+        if split not in (None, "train", "val", "test"):
+            raise ValueError("split must be one of None, 'train', 'val', 'test'")
+        self.split = split
+
+    # ----------------- mask setters -----------------
+
+    def set_mask(self, component: Structure, kind: LabelType, mask: Union[BinaryMaskRef, Path, np.ndarray]) -> None:
         ref = self._coerce_maskref(mask)
         attr_map = {
             (Structure.DISC, LabelType.GT): "gt_disc_mask",
             (Structure.DISC, LabelType.PRED): "pred_disc_mask",
-            (Structure.CUP,  LabelType.GT): "gt_cup_mask",
-            (Structure.CUP,  LabelType.PRED): "pred_cup_mask",
+            (Structure.CUP, LabelType.GT): "gt_cup_mask",
+            (Structure.CUP, LabelType.PRED): "pred_cup_mask",
         }
         try:
             setattr(self, attr_map[(component, kind)], ref)
@@ -185,22 +347,6 @@ class Image:
         }
         return {k: v for k, v in paths.items() if v is not None} if drop_none else paths
 
-    def _box_attr_name(self, component: Structure, kind: LabelType) -> str:
-        return {
-            (Structure.DISC, LabelType.GT):   "gt_disc_box",
-            (Structure.DISC, LabelType.PRED): "inter_pred_disc_box",
-            (Structure.CUP,  LabelType.GT):   "gt_cup_box",
-            (Structure.CUP,  LabelType.PRED): "inter_pred_cup_box",
-        }[(component, kind)]
-
-    def set_box(self, component: Structure, kind: LabelType, nbox: Optional[NormalizedBox]) -> None:
-        setattr(self, self._box_attr_name(component, kind), nbox)
-
-    def set_split(self, split: Optional[str]) -> None:
-        if split not in (None, "train", "val", "test"):
-            raise ValueError("split must be one of None, 'train', 'val', 'test'")
-        self.split = split
-
     # ----------------- mask → normalized box -----------------
 
     def _mask_to_image_size(self, mref: Optional[BinaryMaskRef]) -> Optional[np.ndarray]:
@@ -221,20 +367,17 @@ class Image:
         return out
 
     def _mask_bbox_norm_aligned(self, mref: Optional[BinaryMaskRef]) -> Optional[NormalizedBox]:
-        """
-        Compute a normalized bbox from a mask AFTER aligning it to image (H,W).
-        """
+        """Compute a normalized bbox from a mask AFTER aligning it to image (H,W)."""
         m = self._mask_to_image_size(mref)
         if m is None or not m.any():
             return None
         ys, xs = np.nonzero(m)
-        # +1 on max edges (exclusive upper edge convention)
         x1, x2 = float(xs.min()), float(xs.max() + 1)
         y1, y2 = float(ys.min()), float(ys.max() + 1)
         return NormalizedBox.from_xyxy(x1, y1, x2, y2, self.width, self.height)
 
-    # Helper: rasterize a normalized box into a bool mask at (H,W)
     def _rasterize_box(self, nbox: Optional[NormalizedBox]) -> Optional[np.ndarray]:
+        """Rasterize a normalized box into a bool mask at (H,W)."""
         if nbox is None:
             return None
         x1, y1, x2, y2 = nbox.to_pixel_xyxy(self.width, self.height)
@@ -258,22 +401,17 @@ class Image:
         if self.pred_cup_box is None:
             self.pred_cup_box = self._mask_bbox_norm_aligned(self.pred_cup_mask)
 
-    # ----------------- normalized accessors -----------------
-
-    def get_box_norm(self, component: Structure, kind: LabelType) -> Optional[NormalizedBox]:
-        return getattr(self, self._box_attr_name(component, kind))
-
     # ----------------- YOLO export -----------------
 
-    def yolo_lines_2class(self, use_gt: bool = True) -> Iterable[str]:
+    def yolo_lines_2class(self, use_gt: bool = True) -> Iterator[str]:
         """
         Yield YOLO-normalized lines: '<cls> <xc> <yc> <w> <h>' (0=disc, 1=cup).
         """
         self.ensure_boxes_from_masks()
         boxes = (
-            (0, self.gt_disc_box), (1, self.gt_cup_box)
-        ) if use_gt else (
-            (0, self.inter_pred_disc_box), (1, self.inter_pred_cup_box)
+            ((0, self.gt_disc_box), (1, self.gt_cup_box))
+            if use_gt
+            else ((0, self.inter_pred_disc_box), (1, self.inter_pred_cup_box))
         )
         for cls_id, nbox in boxes:
             if nbox is None:
@@ -283,23 +421,34 @@ class Image:
 
     # ----------------- metrics -----------------
 
+    @staticmethod
+    def _dice_from_bool(pred: Optional[np.ndarray], gt: Optional[np.ndarray]) -> Optional[float]:
+        if pred is None or gt is None:
+            return None
+        p = pred.astype(bool)
+        g = gt.astype(bool)
+        if not p.any() and not g.any():
+            return 1.0
+        inter = float((p & g).sum())
+        denom = float(p.sum() + g.sum())
+        return (2.0 * inter / denom) if denom > 0 else 0.0
+
     def cdr(self, *, use_pred: bool = False, axis: str = "vertical") -> Optional[float]:
         """
         Cup-to-Disc Ratio (mask-based preferred; box-based fallback).
         axis: "vertical" (default) or "horizontal".
         """
-        assert axis in ("vertical", "horizontal")
-        # Prefer masks
+        if axis not in ("vertical", "horizontal"):
+            raise ValueError("axis must be 'vertical' or 'horizontal'")
+
         dm = self._mask_to_image_size(self.pred_disc_mask if use_pred else self.gt_disc_mask)
-        cm = self._mask_to_image_size(self.pred_cup_mask  if use_pred else self.gt_cup_mask)
+        cm = self._mask_to_image_size(self.pred_cup_mask if use_pred else self.gt_cup_mask)
 
         def _extent(mask: np.ndarray, kind: str) -> Optional[float]:
             ys, xs = np.nonzero(mask)
             if ys.size == 0:
                 return None
-            if kind == "vertical":
-                return float(ys.max() - ys.min() + 1)
-            return float(xs.max() - xs.min() + 1)
+            return float(ys.max() - ys.min() + 1) if kind == "vertical" else float(xs.max() - xs.min() + 1)
 
         if dm is not None and cm is not None:
             d = _extent(dm, axis)
@@ -307,9 +456,8 @@ class Image:
             if d and d > 0:
                 return (c or 0.0) / d
 
-        # Fallback to normalized boxes (ratio is scale-invariant)
-        dbox = (self.pred_disc_box if use_pred else self.gt_disc_box)
-        cbox = (self.pred_cup_box if use_pred else self.gt_cup_box)
+        dbox = self.pred_disc_box if use_pred else self.gt_disc_box
+        cbox = self.pred_cup_box if use_pred else self.gt_cup_box
         if dbox and cbox:
             if axis == "vertical":
                 d = max(0.0, dbox.height)
@@ -320,35 +468,13 @@ class Image:
             return (c / d) if d > 0 else None
         return None
 
-    @staticmethod
-    def _dice_from_bool(pred: Optional[np.ndarray], gt: Optional[np.ndarray]) -> Optional[float]:
-        if pred is None or gt is None:
-            return None
-        p = pred.astype(bool)
-        g = gt.astype(bool)
-        if not p.any() and not g.any():
-            return 1.0  # both empty → perfect agreement
-        inter = float((p & g).sum())
-        denom = float(p.sum() + g.sum())
-        return (2.0 * inter / denom) if denom > 0 else 0.0
+    def compute_mask_dice(self, component: Structure, *, fallback_to_boxes: bool = True) -> Optional[float]:
+        if component not in (Structure.DISC, Structure.CUP):
+            raise ValueError("component must be Structure.DISC or Structure.CUP")
 
-    def compute_mask_dice(
-        self,
-        component: Structure,
-        *,
-        fallback_to_boxes: bool = True
-    ) -> Optional[float]:
-        """
-        Compute (and return) Dice between predicted and GT masks for a component.
-        If masks are missing and fallback_to_boxes is True, rasterize available boxes.
-        Does not change existing fields except updating the cached dice attribute.
-        """
-        assert component in (Structure.DISC, Structure.CUP)
-        # Load masks aligned to image size
         pred_m = self._mask_to_image_size(self.pred_disc_mask if component is Structure.DISC else self.pred_cup_mask)
-        gt_m   = self._mask_to_image_size(self.gt_disc_mask   if component is Structure.DISC else self.gt_cup_mask)
+        gt_m = self._mask_to_image_size(self.gt_disc_mask if component is Structure.DISC else self.gt_cup_mask)
 
-        # Optional fallbacks from boxes
         if pred_m is None and fallback_to_boxes:
             nb = self.pred_disc_box if component is Structure.DISC else self.pred_cup_box
             pred_m = self._rasterize_box(nb)
@@ -364,44 +490,28 @@ class Image:
         return d
 
     def update_mask_dice(self, *, fallback_to_boxes: bool = True) -> Dict[str, Optional[float]]:
-        """
-        Compute Dice for both classes and cache them.
-        """
         return {
             "disc": self.compute_mask_dice(Structure.DISC, fallback_to_boxes=fallback_to_boxes),
-            "cup":  self.compute_mask_dice(Structure.CUP,  fallback_to_boxes=fallback_to_boxes),
+            "cup": self.compute_mask_dice(Structure.CUP, fallback_to_boxes=fallback_to_boxes),
         }
 
     def rim_metrics(self, *, use_pred: bool = False) -> Optional[Dict[str, Optional[float]]]:
-        """
-        Compute neuroretinal rim metrics from masks:
-          - Rim-to-Disc area ratio (R/D)
-          - I/S : Inferior-to-Superior rim area ratio
-          - I/N : Inferior-to-Nasal rim area ratio (requires known laterality)
-          - I/T : Inferior-to-Temporal rim area ratio (requires known laterality)
-        """
         disc = self._mask_to_image_size(self.pred_disc_mask if use_pred else self.gt_disc_mask)
-        cup  = self._mask_to_image_size(self.pred_cup_mask  if use_pred else self.gt_cup_mask)
-        if disc is None or cup is None:
+        cup = self._mask_to_image_size(self.pred_cup_mask if use_pred else self.gt_cup_mask)
+        if disc is None or cup is None or not disc.any():
             return None
 
         H, W = self.height, self.width
-        if not disc.any():
-            return None
-
         rim = disc & (~cup)
 
-        # Areas
         disc_area = float(disc.sum())
-        rim_area  = float(rim.sum())
-        r_over_d  = rim_area / disc_area if disc_area > 0 else np.nan
+        rim_area = float(rim.sum())
+        r_over_d = rim_area / disc_area if disc_area > 0 else np.nan
 
-        # Disc center from disc mask
         ys, xs = np.nonzero(disc)
         yc = float(ys.mean()) if ys.size else (H / 2.0)
         xc = float(xs.mean()) if xs.size else (W / 2.0)
 
-        # Superior/Inferior split
         superior = (np.arange(H)[:, None] < yc)
         inferior = ~superior
 
@@ -416,7 +526,6 @@ class Image:
             "I_over_S": _safe(rim_inf, rim_sup),
             "I_over_N": None,
             "I_over_T": None,
-            # Optional raw areas
             "rim_area": rim_area,
             "disc_area": disc_area,
             "inferior_area": rim_inf,
@@ -425,9 +534,8 @@ class Image:
             "temporal_area": None,
         }
 
-        # Only compute Nasal/Temporal if laterality is known
         if self.laterality is not None:
-            left  = (np.arange(W)[None, :] <  xc)
+            left = (np.arange(W)[None, :] < xc)
             right = ~left
             if str(self.laterality.name).upper() == "OD":
                 nasal, temporal = left, right
@@ -446,10 +554,10 @@ class Image:
 
     def metrics_summary(self) -> Dict[str, Dict[str, Optional[float]]]:
         out: Dict[str, Dict[str, Optional[float]]] = {"gt": {}, "pred": {}}
-        out["gt"]["cdr_v"]   = self.cdr(use_pred=False, axis="vertical")
-        out["gt"]["cdr_h"]   = self.cdr(use_pred=False, axis="horizontal")
-        out["pred"]["cdr_v"] = self.cdr(use_pred=True,  axis="vertical")
-        out["pred"]["cdr_h"] = self.cdr(use_pred=True,  axis="horizontal")
+        out["gt"]["cdr_v"] = self.cdr(use_pred=False, axis="vertical")
+        out["gt"]["cdr_h"] = self.cdr(use_pred=False, axis="horizontal")
+        out["pred"]["cdr_v"] = self.cdr(use_pred=True, axis="vertical")
+        out["pred"]["cdr_h"] = self.cdr(use_pred=True, axis="horizontal")
 
         gt_r = self.rim_metrics(use_pred=False)
         pr_r = self.rim_metrics(use_pred=True)
@@ -460,61 +568,37 @@ class Image:
         return out
 
     # ----------------- visualization -----------------
-    def visualize(
-            self,
-            *,
-            show: bool = True,
-            save_path: Optional[Path] = None,
-            dpi: int = 150,
-            figsize: Tuple[int, int] = (14, 6),
-            mask_alpha: float = 0.35,
-            show_metrics: bool = True,
-            show_conf: bool = True,
-    ) -> None:
-        """
-        Render 1–2 panels:
-          • Panel 1 (if available): Ground-truth disc/cup masks + GT metrics.
-          • Panel 2 (if available): Predicted disc/cup masks + detector inter_pred boxes
-            + predicted metrics (+ optional confidences).
 
-        The function is robust to partial annotations:
-          - If only GT is present, shows only the GT panel.
-          - If only predictions are present, shows only the predictions panel.
-          - If neither is present, shows just the raw fundus image.
-        """
-        # Load base image
-        img = PILImage.open(self.image_path).convert("RGB")
+    def visualize(
+        self,
+        *,
+        show: bool = True,
+        save_path: Optional[Path] = None,
+        dpi: int = 150,
+        figsize: Tuple[int, int] = (14, 6),
+        mask_alpha: float = 0.35,
+        show_metrics: bool = True,
+        show_conf: bool = True,
+    ) -> None:
+        img = self.image
         W, H = img.size
 
-        # Helpers
         def _mask_arr(mref: Optional[BinaryMaskRef]) -> Optional[np.ndarray]:
             return self._mask_to_image_size(mref)
 
-        def _draw_mask(ax, mask: np.ndarray, color: str, alpha: float):
+        def _draw_mask(ax, mask: np.ndarray, color: str, alpha: float) -> None:
             overlay = np.zeros((H, W, 4), dtype=float)
             rgba = plt.matplotlib.colors.to_rgba(color, alpha=alpha)
             overlay[mask] = rgba
             ax.imshow(overlay, origin="upper")
 
-        def _draw_nbox(ax, nbox: Optional[NormalizedBox], color: str,
-                       ls: str = "-", lw: float = 2.0):
+        def _draw_nbox(ax, nbox: Optional[NormalizedBox], color: str, ls: str = "-", lw: float = 2.0) -> None:
             if nbox is None:
                 return
             x1, y1, x2, y2 = nbox.to_pixel_xyxy(W, H)
             w, h = max(0.0, x2 - x1), max(0.0, y2 - y1)
-            ax.add_patch(
-                Rectangle(
-                    (x1, y1),
-                    w,
-                    h,
-                    fill=False,
-                    edgecolor=color,
-                    linewidth=lw,
-                    linestyle=ls,
-                )
-            )
+            ax.add_patch(Rectangle((x1, y1), w, h, fill=False, edgecolor=color, linewidth=lw, linestyle=ls))
 
-        # Determine availability
         gt_disc_m = _mask_arr(self.gt_disc_mask)
         gt_cup_m = _mask_arr(self.gt_cup_mask)
         pred_disc_m = _mask_arr(self.pred_disc_mask)
@@ -522,20 +606,14 @@ class Image:
 
         has_gt = (gt_disc_m is not None) or (gt_cup_m is not None)
         has_pred = (
-                (pred_disc_m is not None)
-                or (pred_cup_m is not None)
-                or (self.inter_pred_disc_box is not None)
-                or (self.inter_pred_cup_box is not None)
+            (pred_disc_m is not None)
+            or (pred_cup_m is not None)
+            or (self.inter_pred_disc_box is not None)
+            or (self.inter_pred_cup_box is not None)
         )
 
-        # Nothing to show → single image only
         if not has_gt and not has_pred:
-            fig, ax = plt.subplots(
-                1,
-                1,
-                figsize=(figsize[0] / 2, figsize[1]),
-                dpi=dpi,
-            )
+            fig, ax = plt.subplots(1, 1, figsize=(figsize[0] / 2, figsize[1]), dpi=dpi)
             ax.imshow(img, origin="upper")
             ax.set_axis_off()
             if save_path is not None:
@@ -547,19 +625,12 @@ class Image:
                 plt.close(fig)
             return
 
-        # Assemble panels: strictly at most two
-        panels = []
+        panels: List[Tuple[str, Dict[str, Any]]] = []
         if has_gt:
             panels.append(
                 (
                     "Ground Truth",
-                    {
-                        "disc_m": gt_disc_m,
-                        "cup_m": gt_cup_m,
-                        "disc_box": None,
-                        "cup_box": None,
-                        "use_pred": False,
-                    },
+                    {"disc_m": gt_disc_m, "cup_m": gt_cup_m, "disc_box": None, "cup_box": None, "use_pred": False},
                 )
             )
         if has_pred:
@@ -585,17 +656,13 @@ class Image:
             squeeze=False,
         )
 
-        # Figure title
-        suptitle = f"{self.dataset} / {self.subject_id} — {self.image_path.name}"
-        fig.suptitle(suptitle, fontsize=12)
+        fig.suptitle(f"{self.dataset} / {self.patient_id} — {self.image_path.name}", fontsize=12)
 
-        # Colors
         disc_color_mask = "tab:red"
         cup_color_mask = "tab:blue"
         disc_color_box = "red"
         cup_color_box = "blue"
 
-        # Update cached Dice (non-intrusive; uses masks and optional box fallbacks)
         self.update_mask_dice(fallback_to_boxes=True)
 
         for j, (title, dct) in enumerate(panels):
@@ -604,28 +671,23 @@ class Image:
             ax.set_axis_off()
             ax.set_title(title, fontsize=11)
 
-            # Masks
             if dct["disc_m"] is not None:
                 _draw_mask(ax, dct["disc_m"], disc_color_mask, mask_alpha)
             if dct["cup_m"] is not None:
                 _draw_mask(ax, dct["cup_m"], cup_color_mask, mask_alpha)
 
-            # Boxes (only inter_pred on predictions panel as requested)
             _draw_nbox(ax, dct["disc_box"], disc_color_box, ls="-", lw=2.0)
             _draw_nbox(ax, dct["cup_box"], cup_color_box, ls="--", lw=2.0)
 
-            # Metrics / confidences block
             if show_metrics or show_conf:
                 use_pred = bool(dct["use_pred"])
-                lines: list[str] = []
+                lines: List[str] = []
 
                 if show_metrics:
-                    # CDRs
                     cdr_v = self.cdr(use_pred=use_pred, axis="vertical")
                     cdr_h = self.cdr(use_pred=use_pred, axis="horizontal")
                     rims = self.rim_metrics(use_pred=use_pred)
 
-                    # Show Dice on prediction panel (GT vs Pred)
                     if use_pred:
                         if self.mask_dice_disc is not None:
                             lines.append(f"Dice (Disc): {self.mask_dice_disc:.3f}")
@@ -648,10 +710,9 @@ class Image:
                         if iot is not None and np.isfinite(iot):
                             lines.append(f"I/T: {iot:.3f}")
 
-                # Confidences (only meaningful on prediction panel)
                 if show_conf and dct["use_pred"]:
                     if lines:
-                        lines.append("")  # visual spacer
+                        lines.append("")
                     if self.yolo_disc_conf is not None:
                         lines.append(f"YOLO conf (Disc): {self.yolo_disc_conf:.3f}")
                     if self.yolo_cup_conf is not None:
@@ -671,45 +732,16 @@ class Image:
                         va="top",
                         ha="left",
                         color="white",
-                        bbox=dict(
-                            facecolor="black",
-                            alpha=0.35,
-                            boxstyle="round,pad=0.3",
-                            edgecolor="none",
-                        ),
+                        bbox=dict(facecolor="black", alpha=0.35, boxstyle="round,pad=0.3", edgecolor="none"),
                     )
 
-            # Legend (only if something was drawn)
-            handles = []
+            handles: List[Any] = []
             if (dct["disc_m"] is not None) or (dct["disc_box"] is not None):
-                handles.append(
-                    plt.Line2D(
-                        [0],
-                        [0],
-                        color=disc_color_box,
-                        lw=2,
-                        linestyle="-",
-                        label="Disc",
-                    )
-                )
+                handles.append(plt.Line2D([0], [0], color=disc_color_box, lw=2, linestyle="-", label="Disc"))
             if (dct["cup_m"] is not None) or (dct["cup_box"] is not None):
-                handles.append(
-                    plt.Line2D(
-                        [0],
-                        [0],
-                        color=cup_color_box,
-                        lw=2,
-                        linestyle="--",
-                        label="Cup",
-                    )
-                )
+                handles.append(plt.Line2D([0], [0], color=cup_color_box, lw=2, linestyle="--", label="Cup"))
             if handles:
-                ax.legend(
-                    handles=handles,
-                    loc="lower right",
-                    fontsize=9,
-                    frameon=True,
-                )
+                ax.legend(handles=handles, loc="lower right", fontsize=9, frameon=True)
 
         fig.tight_layout(rect=(0, 0, 1, 0.96))
 
@@ -722,7 +754,7 @@ class Image:
         else:
             plt.close(fig)
 
-    # ----------------- serialization -----------------
+    # ----------------- serialization helpers -----------------
 
     @staticmethod
     def _path_to_str(p: Optional[Path]) -> Optional[str]:
@@ -731,30 +763,6 @@ class Image:
     @staticmethod
     def _path_from_str(s: Optional[str]) -> Optional[Path]:
         return Path(s) if s else None
-
-    @staticmethod
-    def _mask_to_dict(m: Optional[BinaryMaskRef]) -> Optional[Dict[str, Any]]:
-        return m.to_dict() if m is not None else None
-
-    @staticmethod
-    def _mask_from_dict(dct: Optional[Dict[str, Any]]) -> Optional[BinaryMaskRef]:
-        if not dct:
-            return None
-        path = dct.get("path")
-        return BinaryMaskRef(path=Path(path) if path else None)
-
-    @staticmethod
-    def _boxn_to_dict(nbox: Optional[NormalizedBox]) -> Optional[Dict[str, float]]:
-        if nbox is None:
-            return None
-        xc, yc, w, h = nbox.as_tuple()
-        return {"xc": float(xc), "yc": float(yc), "w": float(w), "h": float(h)}
-
-    @staticmethod
-    def _boxn_from_dict(dct: Optional[Dict[str, Any]]) -> Optional[NormalizedBox]:
-        if not dct:
-            return None
-        return NormalizedBox(float(dct["xc"]), float(dct["yc"]), float(dct["w"]), float(dct["h"]))
 
     @staticmethod
     def _enum_to_str(e: Optional[Enum]) -> Optional[str]:
@@ -774,54 +782,147 @@ class Image:
             except Exception:
                 return None
 
-    def to_dict(self, *, drop_none: bool = False) -> Dict[str, Any]:
-        self.ensure_boxes_from_masks()  # ensure normalized GT exist if masks available
-        d: Dict[str, Any] = {
-            "_schema": 6,  # bumped: now includes YOLO / SAM confidences
+    @staticmethod
+    def _boxn_to_dict(nbox: Optional[NormalizedBox]) -> Optional[Dict[str, float]]:
+        if nbox is None:
+            return None
+        xc, yc, w, h = nbox.as_tuple()
+        return {"xc": float(xc), "yc": float(yc), "w": float(w), "h": float(h)}
 
+    @staticmethod
+    def _boxn_from_dict(dct: Optional[Dict[str, Any]]) -> Optional[NormalizedBox]:
+        if not dct:
+            return None
+        return NormalizedBox(float(dct["xc"]), float(dct["yc"]), float(dct["w"]), float(dct["h"]))
+
+    @staticmethod
+    def _mask_to_dict(m: Optional[BinaryMaskRef], *, include_mask_bytes: bool = False) -> Optional[Dict[str, Any]]:
+        return m.to_dict(include_mask_bytes=include_mask_bytes) if m is not None else None
+
+    @staticmethod
+    def _mask_from_dict(dct: Optional[Dict[str, Any]]) -> Optional[BinaryMaskRef]:
+        if not dct:
+            return None
+
+        path = dct.get("path")
+        data = dct.get("data")
+        h = dct.get("h")
+        w = dct.get("w")
+        enc = dct.get("encoding")
+
+        packed: Optional[bytes] = None
+        if data is not None:
+            if isinstance(data, (bytes, bytearray)):
+                packed = bytes(data)
+            elif isinstance(data, memoryview):
+                packed = data.tobytes()
+
+        if packed is not None and h is not None and w is not None:
+            return BinaryMaskRef(
+                path=Path(path) if path else None,
+                packed=packed,
+                shape=(int(h), int(w)),
+                encoding=str(enc) if enc else "packbits_little",
+            )
+
+        return BinaryMaskRef(path=Path(path) if path else None)
+
+    @staticmethod
+    def _extras_to_storage(extras: Dict[str, Any]) -> Optional[str]:
+        """
+        Persist extras as JSON string (nullable). This avoids Parquet errors from empty structs
+        and keeps future flexibility for arbitrary nested content.
+        """
+        if not extras:
+            return None
+        try:
+            return json.dumps(extras, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str)
+        except Exception:
+            # Fallback: last resort stringification (still stored as a string)
+            try:
+                return json.dumps({"_unserializable_extras": str(extras)}, ensure_ascii=False)
+            except Exception:
+                return str(extras)
+
+    @staticmethod
+    def _extras_from_storage(v: Any) -> Dict[str, Any]:
+        if v is None:
+            return {}
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            try:
+                v = bytes(v).decode("utf-8", errors="replace")
+            except Exception:
+                return {}
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return {}
+            try:
+                obj = json.loads(s)
+                return obj if isinstance(obj, dict) else {"_extras": obj}
+            except Exception:
+                return {"_extras_raw": s}
+        return {"_extras": v}
+
+    # ----------------- dict API (for Parquet) -----------------
+
+    def to_dict(
+        self,
+        *,
+        drop_none: bool = False,
+        include_mask_bytes: bool = False,
+        include_image_bytes: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Convert to a plain Python dict suitable for Arrow/Parquet.
+
+        For Parquet, prefer drop_none=False so all columns appear with nulls.
+        Schema is fixed by Image._canonical_arrow_schema().
+        """
+        self.ensure_boxes_from_masks()
+        img_ref = self.ensure_image_ref()
+
+        d: Dict[str, Any] = {
+            "_schema": 7,
             # identity
             "uid": self.uid,
             "dataset": self.dataset,
-            "subject_id": self.subject_id,
-
-            # image payload
+            "subject_id": self.patient_id,
+            # image payload (path retained + optional embedded bytes)
             "image_path": str(self.image_path),
+            "image": img_ref.to_dict(include_image_bytes=include_image_bytes),
             "width": int(self.width),
             "height": int(self.height),
             "split": self.split,
-
             # masks
-            "gt_disc_mask": self._mask_to_dict(self.gt_disc_mask),
-            "gt_cup_mask": self._mask_to_dict(self.gt_cup_mask),
-            "pred_disc_mask": self._mask_to_dict(self.pred_disc_mask),
-            "pred_cup_mask": self._mask_to_dict(self.pred_cup_mask),
-
-            # boxes (normalized only)
+            "gt_disc_mask": self._mask_to_dict(self.gt_disc_mask, include_mask_bytes=include_mask_bytes),
+            "gt_cup_mask": self._mask_to_dict(self.gt_cup_mask, include_mask_bytes=include_mask_bytes),
+            "pred_disc_mask": self._mask_to_dict(self.pred_disc_mask, include_mask_bytes=include_mask_bytes),
+            "pred_cup_mask": self._mask_to_dict(self.pred_cup_mask, include_mask_bytes=include_mask_bytes),
+            # boxes (normalized)
             "gt_disc_box": self._boxn_to_dict(self.gt_disc_box),
-            "gt_cup_box":  self._boxn_to_dict(self.gt_cup_box),
+            "gt_cup_box": self._boxn_to_dict(self.gt_cup_box),
             "inter_pred_disc_box": self._boxn_to_dict(self.inter_pred_disc_box),
-            "inter_pred_cup_box":  self._boxn_to_dict(self.inter_pred_cup_box),
+            "inter_pred_cup_box": self._boxn_to_dict(self.inter_pred_cup_box),
             "pred_disc_box": self._boxn_to_dict(self.pred_disc_box),
-            "pred_cup_box":  self._boxn_to_dict(self.pred_cup_box),
-
+            "pred_cup_box": self._boxn_to_dict(self.pred_cup_box),
             # lightweight cached metrics
             "gt_cd_ratio": self.gt_cd_ratio,
             "pred_cd_ratio": self.pred_cd_ratio,
-
             # cached dice
             "mask_dice_disc": self.mask_dice_disc,
             "mask_dice_cup": self.mask_dice_cup,
-
             # detector / segmenter confidences
             "yolo_disc_conf": self.yolo_disc_conf,
             "yolo_cup_conf": self.yolo_cup_conf,
             "sam_disc_conf": self.sam_disc_conf,
             "sam_cup_conf": self.sam_cup_conf,
-
             # bookkeeping
             "yolo_label_path": self._path_to_str(self.yolo_label_path),
-            "extras": self.extras or {},
-
+            # IMPORTANT: persist as JSON string (nullable)
+            "extras": Image._extras_to_storage(self.extras),
             # patient info
             "eye": self._enum_to_str(self.laterality),
             "age": self.age,
@@ -832,6 +933,7 @@ class Image:
             "gt_rdr": self.gt_rdr,
             "pred_rdr": self.pred_rdr,
         }
+
         if drop_none:
             d = {k: v for k, v in d.items() if v is not None}
         return d
@@ -839,101 +941,356 @@ class Image:
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Image":
         P = Image._path_from_str
+
+        image_path = P(d.get("image_path")) or Path(".")
         obj = Image(
-            uid=d["uid"],
-            dataset=d["dataset"],
-            subject_id=d["subject_id"],
-            image_path=P(d.get("image_path")) or Path("."),
-            width=int(d["width"]),
-            height=int(d["height"]),
+            uid=d.get("uid", ""),
+            dataset=d.get("dataset", ""),
+            patient_id=d.get("subject_id", d.get("patient_id", "")) or "",
+            image_path=image_path,
+            width=int(d.get("width", 0) or 0),
+            height=int(d.get("height", 0) or 0),
             split=d.get("split"),
             yolo_label_path=P(d.get("yolo_label_path")),
-            extras=d.get("extras") or {},
+            extras=Image._extras_from_storage(d.get("extras")),
         )
 
-        # masks
-        obj.gt_disc_mask   = Image._mask_from_dict(d.get("gt_disc_mask"))
-        obj.gt_cup_mask    = Image._mask_from_dict(d.get("gt_cup_mask"))
-        obj.pred_disc_mask = Image._mask_from_dict(d.get("pred_disc_mask"))
-        obj.pred_cup_mask  = Image._mask_from_dict(d.get("pred_cup_mask"))
+        # Image bytes (optional)
+        img_ref = ImageDataRef.from_dict(d.get("image"))
+        if img_ref is None:
+            img_ref = ImageDataRef(path=image_path, ext=image_path.suffix.lower())
+        if img_ref.path is None:
+            img_ref.path = image_path
+        if img_ref.ext is None:
+            img_ref.ext = image_path.suffix.lower()
+        obj.image_ref = img_ref
 
-        # boxes (normalized only)
-        obj.gt_disc_box         = Image._boxn_from_dict(d.get("gt_disc_box"))
-        obj.gt_cup_box          = Image._boxn_from_dict(d.get("gt_cup_box"))
+        # masks
+        obj.gt_disc_mask = Image._mask_from_dict(d.get("gt_disc_mask"))
+        obj.gt_cup_mask = Image._mask_from_dict(d.get("gt_cup_mask"))
+        obj.pred_disc_mask = Image._mask_from_dict(d.get("pred_disc_mask"))
+        obj.pred_cup_mask = Image._mask_from_dict(d.get("pred_cup_mask"))
+
+        # boxes
+        obj.gt_disc_box = Image._boxn_from_dict(d.get("gt_disc_box"))
+        obj.gt_cup_box = Image._boxn_from_dict(d.get("gt_cup_box"))
         obj.inter_pred_disc_box = Image._boxn_from_dict(d.get("inter_pred_disc_box"))
-        obj.inter_pred_cup_box  = Image._boxn_from_dict(d.get("inter_pred_cup_box"))
-        obj.pred_disc_box       = Image._boxn_from_dict(d.get("pred_disc_box"))
-        obj.pred_cup_box        = Image._boxn_from_dict(d.get("pred_cup_box"))
+        obj.inter_pred_cup_box = Image._boxn_from_dict(d.get("inter_pred_cup_box"))
+        obj.pred_disc_box = Image._boxn_from_dict(d.get("pred_disc_box"))
+        obj.pred_cup_box = Image._boxn_from_dict(d.get("pred_cup_box"))
 
         # cached metrics
-        obj.gt_cd_ratio   = (float(d["gt_cd_ratio"])   if d.get("gt_cd_ratio")   is not None else None)
-        obj.pred_cd_ratio = (float(d["pred_cd_ratio"]) if d.get("pred_cd_ratio") is not None else None)
+        obj.gt_cd_ratio = float(d["gt_cd_ratio"]) if d.get("gt_cd_ratio") is not None else None
+        obj.pred_cd_ratio = float(d["pred_cd_ratio"]) if d.get("pred_cd_ratio") is not None else None
 
         # cached dice
-        obj.mask_dice_disc = (float(d["mask_dice_disc"]) if d.get("mask_dice_disc") is not None else None)
-        obj.mask_dice_cup  = (float(d["mask_dice_cup"])  if d.get("mask_dice_cup")  is not None else None)
+        obj.mask_dice_disc = float(d["mask_dice_disc"]) if d.get("mask_dice_disc") is not None else None
+        obj.mask_dice_cup = float(d["mask_dice_cup"]) if d.get("mask_dice_cup") is not None else None
 
-        # detector / segmenter confidences (backwards-compatible if missing)
-        obj.yolo_disc_conf = (float(d["yolo_disc_conf"]) if d.get("yolo_disc_conf") is not None else None)
-        obj.yolo_cup_conf  = (float(d["yolo_cup_conf"])  if d.get("yolo_cup_conf")  is not None else None)
-        obj.sam_disc_conf  = (float(d["sam_disc_conf"])  if d.get("sam_disc_conf")  is not None else None)
-        obj.sam_cup_conf   = (float(d["sam_cup_conf"])   if d.get("sam_cup_conf")   is not None else None)
+        # confidences
+        obj.yolo_disc_conf = float(d["yolo_disc_conf"]) if d.get("yolo_disc_conf") is not None else None
+        obj.yolo_cup_conf = float(d["yolo_cup_conf"]) if d.get("yolo_cup_conf") is not None else None
+        obj.sam_disc_conf = float(d["sam_disc_conf"]) if d.get("sam_disc_conf") is not None else None
+        obj.sam_cup_conf = float(d["sam_cup_conf"]) if d.get("sam_cup_conf") is not None else None
 
         # patient info
         obj.laterality = Image._enum_from_str(Eye, d.get("eye"))
-        obj.age        = (int(d["age"]) if d.get("age") is not None else None)
-        obj.ethnicity  = Image._enum_from_str(Ethnicity, d.get("ethnicity"))
-        obj.glaucoma   = (bool(d["glaucoma"]) if d.get("glaucoma") is not None else None)
-        obj.gt_cdr     = (float(d["gt_cdr"]) if d.get("gt_cdr") is not None else None)
-        obj.pred_cdr   = (float(d["pred_cdr"]) if d.get("pred_cdr") is not None else None)
-        obj.gt_rdr     = (float(d["gt_rdr"]) if d.get("gt_rdr") is not None else None)
-        obj.pred_rdr   = (float(d["pred_rdr"]) if d.get("pred_rdr") is not None else None)
+
+        age_val = d.get("age")
+        if isinstance(age_val, float) and math.isnan(age_val):
+            obj.age = None
+        elif age_val is None:
+            obj.age = None
+        else:
+            try:
+                obj.age = int(age_val)
+            except (TypeError, ValueError):
+                obj.age = None
+
+        obj.ethnicity = Image._enum_from_str(Ethnicity, d.get("ethnicity"))
+
+        glau_val = d.get("glaucoma")
+        if isinstance(glau_val, float) and math.isnan(glau_val):
+            obj.glaucoma = None
+        elif glau_val is None:
+            obj.glaucoma = None
+        else:
+            obj.glaucoma = bool(glau_val)
+
+        obj.gt_cdr = float(d["gt_cdr"]) if d.get("gt_cdr") is not None else None
+        obj.pred_cdr = float(d["pred_cdr"]) if d.get("pred_cdr") is not None else None
+        obj.gt_rdr = float(d["gt_rdr"]) if d.get("gt_rdr") is not None else None
+        obj.pred_rdr = float(d["pred_rdr"]) if d.get("pred_rdr") is not None else None
 
         return obj
 
-    def to_json(self, *, drop_none: bool = False) -> str:
-        return json.dumps(
-            self.to_dict(drop_none=drop_none),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
+    # ----------------- Arrow schema normalisation helpers -----------------
+
+    @staticmethod
+    def _make_field_nullable(field: pa.Field) -> pa.Field:
+        t = field.type
+
+        if pa.types.is_struct(t):
+            new_fields = [Image._make_field_nullable(sf) for sf in t]
+            return pa.field(field.name, pa.struct(new_fields), nullable=True, metadata=field.metadata)
+
+        if pa.types.is_list(t):
+            vf = t.value_field
+            new_vf = Image._make_field_nullable(vf)
+            return pa.field(field.name, pa.list_(new_vf), nullable=True, metadata=field.metadata)
+
+        if pa.types.is_large_list(t):
+            vf = t.value_field
+            new_vf = Image._make_field_nullable(vf)
+            return pa.field(field.name, pa.large_list(new_vf), nullable=True, metadata=field.metadata)
+
+        # key must remain non-nullable in Arrow map types
+        if pa.types.is_map(t):
+            kf = t.key_field
+            vf = t.item_field
+            new_vf = Image._make_field_nullable(vf)
+            return pa.field(field.name, pa.map_(kf.type, new_vf.type), nullable=True, metadata=field.metadata)
+
+        return pa.field(field.name, t, nullable=True, metadata=field.metadata)
+
+    @staticmethod
+    def _schema_all_nullable(schema: pa.Schema) -> pa.Schema:
+        return pa.schema([Image._make_field_nullable(f) for f in schema], metadata=schema.metadata)
+
+    @staticmethod
+    def _normalize_value_to_type(value: Any, dtype: pa.DataType) -> Any:
+        if value is None:
+            return None
+
+        if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+            if isinstance(value, Path):
+                return str(value)
+            return value if isinstance(value, str) else str(value)
+
+        if pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype):
+            if isinstance(value, memoryview):
+                return value.tobytes()
+            if isinstance(value, bytearray):
+                return bytes(value)
+            return value
+
+        if pa.types.is_struct(dtype):
+            if isinstance(value, dict):
+                out: Dict[str, Any] = {}
+                for f in dtype:
+                    out[f.name] = Image._normalize_value_to_type(value.get(f.name), f.type)
+                return out
+            return value
+
+        if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
+            if not isinstance(value, list):
+                return value
+            elem_t = dtype.value_type
+            return [Image._normalize_value_to_type(v, elem_t) for v in value]
+
+        if hasattr(value, "item") and callable(getattr(value, "item")):
+            try:
+                return value.item()
+            except Exception:
+                pass
+
+        return value
+
+    @staticmethod
+    def _normalize_row_to_schema(d: Dict[str, Any], schema: pa.Schema) -> Dict[str, Any]:
+        """
+        Produce a dict whose keys and value types are aligned with the target schema.
+        Missing keys become None. Values are normalised recursively for nested types.
+        """
+        out: Dict[str, Any] = {}
+        for f in schema:
+            out[f.name] = Image._normalize_value_to_type(d.get(f.name), f.type)
+        return out
+
+    # ----------------- Canonical Arrow schema (stable, Parquet-safe) -----------------
+
+    @staticmethod
+    def _canonical_arrow_schema() -> pa.Schema:
+        """
+        Stable, Parquet-safe schema for Image records.
+
+        Key decisions:
+          - `extras` stored as LARGE_STRING (nullable) JSON; avoids empty-struct Parquet limitation.
+          - Nested structs for image/masks/boxes are explicitly defined.
+          - All fields are later made nullable for robustness across partial records.
+        """
+        s = pa.large_string()
+        i32 = pa.int32()
+        f64 = pa.float64()
+        b = pa.binary()
+        bl = pa.bool_()
+
+        box_struct = pa.struct(
+            [
+                pa.field("xc", f64, nullable=True),
+                pa.field("yc", f64, nullable=True),
+                pa.field("w", f64, nullable=True),
+                pa.field("h", f64, nullable=True),
+            ]
         )
 
-    @staticmethod
-    def from_json(s: str) -> "Image":
-        return Image.from_dict(json.loads(s))
+        mask_struct = pa.struct(
+            [
+                pa.field("path", s, nullable=True),
+                pa.field("data", b, nullable=True),
+                pa.field("h", i32, nullable=True),
+                pa.field("w", i32, nullable=True),
+                pa.field("encoding", s, nullable=True),
+            ]
+        )
+
+        image_struct = pa.struct(
+            [
+                pa.field("path", s, nullable=True),
+                pa.field("encoding", s, nullable=True),
+                pa.field("ext", s, nullable=True),
+                pa.field("data", b, nullable=True),
+            ]
+        )
+
+        return pa.schema(
+            [
+                pa.field("_schema", i32, nullable=True),
+
+                pa.field("uid", s, nullable=True),
+                pa.field("dataset", s, nullable=True),
+                pa.field("subject_id", s, nullable=True),
+
+                pa.field("image_path", s, nullable=True),
+                pa.field("image", image_struct, nullable=True),
+                pa.field("width", i32, nullable=True),
+                pa.field("height", i32, nullable=True),
+                pa.field("split", s, nullable=True),
+
+                pa.field("gt_disc_mask", mask_struct, nullable=True),
+                pa.field("gt_cup_mask", mask_struct, nullable=True),
+                pa.field("pred_disc_mask", mask_struct, nullable=True),
+                pa.field("pred_cup_mask", mask_struct, nullable=True),
+
+                pa.field("gt_disc_box", box_struct, nullable=True),
+                pa.field("gt_cup_box", box_struct, nullable=True),
+                pa.field("inter_pred_disc_box", box_struct, nullable=True),
+                pa.field("inter_pred_cup_box", box_struct, nullable=True),
+                pa.field("pred_disc_box", box_struct, nullable=True),
+                pa.field("pred_cup_box", box_struct, nullable=True),
+
+                pa.field("gt_cd_ratio", f64, nullable=True),
+                pa.field("pred_cd_ratio", f64, nullable=True),
+
+                pa.field("mask_dice_disc", f64, nullable=True),
+                pa.field("mask_dice_cup", f64, nullable=True),
+
+                pa.field("yolo_disc_conf", f64, nullable=True),
+                pa.field("yolo_cup_conf", f64, nullable=True),
+                pa.field("sam_disc_conf", f64, nullable=True),
+                pa.field("sam_cup_conf", f64, nullable=True),
+
+                pa.field("yolo_label_path", s, nullable=True),
+                pa.field("extras", s, nullable=True),
+
+                pa.field("eye", s, nullable=True),
+                pa.field("age", i32, nullable=True),
+                pa.field("ethnicity", s, nullable=True),
+                pa.field("glaucoma", bl, nullable=True),
+
+                pa.field("gt_cdr", f64, nullable=True),
+                pa.field("pred_cdr", f64, nullable=True),
+                pa.field("gt_rdr", f64, nullable=True),
+                pa.field("pred_rdr", f64, nullable=True),
+            ]
+        )
+
+    # ----------------- Parquet helpers -----------------
 
     @staticmethod
-    def save_jsonl(images: Iterable["Image"], path: Path | str, *, drop_none: bool = False) -> None:
+    def save_parquet(
+        images: Iterable["Image"],
+        path: Union[Path, str],
+        *,
+        drop_none: bool = False,  # kept for API compatibility; should remain False for Parquet
+        include_image_bytes: bool = False,
+        include_mask_bytes: bool = True,
+        compression: str = "zstd",
+        write_batch: int = 1024,
+    ) -> None:
         """
-        Serialize a collection of Image objects to a JSONL file (one JSON per line).
+        Save Image objects to a Parquet file using a robust, streaming writer.
+
+        Guarantees:
+          - Stable schema (does NOT depend on batch inference).
+          - Nested structs written safely.
+          - `extras` is always a nullable string column (JSON), never an empty struct.
         """
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("w", encoding="utf-8") as f:
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Writer uses a stable schema; make it fully nullable to accept partial rows.
+        writer_schema = Image._schema_all_nullable(Image._canonical_arrow_schema())
+
+        writer: Optional[pq.ParquetWriter] = None
+        buffer_rows: List[Dict[str, Any]] = []
+
+        def flush_rows(rows: List[Dict[str, Any]]) -> None:
+            nonlocal writer
+            if not rows:
+                return
+
+            if writer is None:
+                writer = pq.ParquetWriter(where=str(out_path), schema=writer_schema, compression=compression)
+
+            assert writer is not None
+
+            rows_norm = [Image._normalize_row_to_schema(r, writer_schema) for r in rows]
+            table = pa.Table.from_pylist(rows_norm)
+            writer.write_table(table.cast(writer_schema, safe=False))
+
+        try:
             for img in images:
-                f.write(img.to_json(drop_none=drop_none))
-                f.write("\n")
+                row = img.to_dict(
+                    drop_none=bool(drop_none),  # generally keep False
+                    include_image_bytes=include_image_bytes,
+                    include_mask_bytes=include_mask_bytes,
+                )
+                buffer_rows.append(row)
+
+                if len(buffer_rows) >= int(write_batch):
+                    flush_rows(buffer_rows)
+                    buffer_rows = []
+
+            flush_rows(buffer_rows)
+
+        finally:
+            if writer is not None:
+                writer.close()
 
     @staticmethod
-    def load_jsonl(path: Path | str) -> list["Image"]:
-        """
-        Load a list of Image objects from a JSONL file.
-        """
+    def load_parquet(path: Union[Path, str]) -> List["Image"]:
         p = Path(path)
-        images: list[Image] = []
         if not p.exists():
-            return images
-        with p.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                images.append(Image.from_json(line))
-        return images
+            return []
+        table = pq.read_table(p)
+        return [Image.from_dict(rec) for rec in table.to_pylist()]
+
+    @staticmethod
+    def iter_parquet(path: Union[Path, str], batch_size: int = 1024) -> Iterator["Image"]:
+        """
+        Stream Image objects from a Parquet file in batches.
+        Uses ParquetFile.iter_batches() (robust for nested structs).
+        """
+        pf = pq.ParquetFile(str(path))
+        for batch in pf.iter_batches(batch_size=int(batch_size)):
+            for rec in batch.to_pylist():
+                yield Image.from_dict(rec)
+
+    # ----------------- repr -----------------
 
     def __repr__(self) -> str:
         return (
-            f"ImageSample(uid={self.uid!r}, ds={self.dataset!r}, subj={self.subject_id!r}, "
+            f"ImageSample(uid={self.uid!r}, ds={self.dataset!r}, subj={self.patient_id!r}, "
             f"size=({self.width}x{self.height}), split={self.split!r})"
         )

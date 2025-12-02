@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from random import Random
 from typing import Dict, List, Optional, Iterable, Tuple, Set
+import csv
 
-from src.imgpipe.enums import Structure, LabelType
+from src.imgpipe.enums import Structure, LabelType, Eye
 from src.imgpipe.image import Image
 
 _ALLOWED_EXTS: Set[str] = {".png"}
@@ -454,6 +455,153 @@ class ImageFactory:
                 items.append(img)
 
         return items
+
+    def make_images_from_csv(
+            self,
+            csv_path: Path | str,
+            *,
+            dataset_col: str = "Dataset",
+            uid_col: str = "uid",
+            fundus_col: str = "fundus",
+            od_mask_col: str = "od_mask",
+            oc_mask_col: str = "oc_mask",
+            patient_id_col: str = "patient_id",
+            eye_col: str = "eye",
+            age_col: str = "age",
+            vcdr_col: str = "vcdr",
+            split: Optional[str] = None,
+            require_fundus: bool = True,
+            sample_n: Optional[int] = None,
+    ) -> List[Image]:
+        csv_path = Path(csv_path)
+        if not csv_path.exists():
+            raise FileNotFoundError(csv_path)
+
+        # Load all rows first so we can optionally subsample
+        all_rows: List[Dict[str, str]] = []
+        with csv_path.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row:
+                    continue
+                all_rows.append(row)
+
+        # Optional random subsampling of rows for quick testing
+        rows: List[Dict[str, str]]
+        if sample_n is not None and sample_n > 0 and all_rows:
+            rng = Random(self.seed)
+            k = min(sample_n, len(all_rows))
+            rows = rng.sample(all_rows, k)
+        else:
+            rows = all_rows
+
+        images: List[Image] = []
+
+        for row in rows:
+            fundus_rel = (row.get(fundus_col) or "").strip()
+            if require_fundus and not fundus_rel:
+                # No fundus image specified → skip row
+                continue
+
+            # Dataset name (e.g., "OIA-ODIR")
+            dataset = (row.get(dataset_col) or "").strip() or "UNKNOWN"
+
+            # Subject/patient identifier: prefer patient_id; fall back to fundus name
+            subj_id = (row.get(patient_id_col) or "").strip()
+            if not subj_id:
+                subj_id = fundus_rel or "UNKNOWN"
+
+            # Resolve fundus path (relative to root unless absolute)
+            fundus_path = Path(fundus_rel) if fundus_rel else None
+            if fundus_path is not None and not fundus_path.is_absolute():
+                fundus_path = self.root / fundus_rel
+
+            if fundus_path is None:
+                # This should only happen if require_fundus=False
+                continue
+
+            # Image UID: use the CSV uid column directly (no dataset prefixing)
+            uid_str = (row.get(uid_col) or "").strip()
+            if not uid_str:
+                # Fallbacks if uid is missing
+                uid_str = subj_id or fundus_rel or "UNKNOWN"
+
+            img = Image.from_path(
+                image_path=fundus_path,
+                dataset=dataset,
+                subject_id=subj_id,
+                uid=uid_str,
+                split=split,
+            )
+
+            # Attach masks if present
+            od_rel = (row.get(od_mask_col) or "").strip()
+            if od_rel:
+                od_path = Path(od_rel)
+                if not od_path.is_absolute():
+                    od_path = self.root / od_rel
+                img.set_mask(Structure.DISC, LabelType.GT, od_path)
+
+            oc_rel = (row.get(oc_mask_col) or "").strip()
+            if oc_rel:
+                oc_path = Path(oc_rel)
+                if not oc_path.is_absolute():
+                    oc_path = self.root / oc_rel
+                img.set_mask(Structure.CUP, LabelType.GT, oc_path)
+
+            # Patient info: eye / laterality
+            eye_str = (row.get(eye_col) or "").strip()
+            if eye_str:
+                # Typical values: "OD", "OS"
+                try:
+                    img.laterality = Eye[eye_str.upper()]
+                except Exception:
+                    img.laterality = None
+
+            # Age (may be empty)
+            age_str = (row.get(age_col) or "").strip()
+            if age_str:
+                try:
+                    # Some CSVs store age as float; coerce robustly
+                    img.age = int(float(age_str))
+                except ValueError:
+                    img.age = None
+
+            # Vertical CDR ground truth
+            vcdr_str = (row.get(vcdr_col) or "").strip()
+            if vcdr_str:
+                try:
+                    img.gt_cdr = float(vcdr_str)
+                except ValueError:
+                    img.gt_cdr = None
+
+            # Store all remaining metadata into extras, excluding columns already used
+            used_cols = {
+                dataset_col,
+                uid_col,
+                fundus_col,
+                od_mask_col,
+                oc_mask_col,
+                patient_id_col,
+                eye_col,
+                age_col,
+                vcdr_col,
+            }
+            for k, v in row.items():
+                if k in used_cols:
+                    continue
+                if v is None:
+                    continue
+                v_clean = v.strip()
+                if v_clean == "":
+                    continue
+                # Do not overwrite anything that may already be in extras
+                if k not in img.extras:
+                    img.extras[k] = v_clean
+
+            images.append(img)
+
+        return images
 
     def save_images(
             self,

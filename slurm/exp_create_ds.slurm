@@ -4,9 +4,9 @@
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
-#SBATCH --mem=64G
-#SBATCH --time=72:00:00
+#SBATCH --cpus-per-task=10
+#SBATCH --mem=128G
+#SBATCH --time=80:00:00
 #SBATCH --gpus=1
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A_%a.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A_%a.err
@@ -20,7 +20,7 @@ set -euo pipefail
 ############################
 REPO_DIR="/scratch/st-ipor-1/cperez/MedSAM"
 
-BATCH=12
+BATCH=10
 
 # Python module entrypoint
 PYTHON_MODULE="src.experiment"
