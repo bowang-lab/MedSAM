@@ -13,7 +13,7 @@ from src.imgpipe.image import Image
 # =========================
 # Global configuration
 # =========================
-PARQUET_PATH = Path("/Users/carlosperez/PycharmProjects/MedSAM/src/image_data/images.parquet")
+PARQUET_PATH = Path("/Users/carlosperez/PycharmProjects/MedSAM/OUT/PARQUET_PROCESSING/merged_hpc.parquet")
 N_PREVIEW = 3
 BATCH_SIZE = 256
 

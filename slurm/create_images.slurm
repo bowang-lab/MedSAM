@@ -1,13 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=create_images
-#SBATCH --account=st-ipor-1-gpu
-#SBATCH --partition=gpu
+#SBATCH --account=st-ipor-1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gpus=1
-#SBATCH --mem=60G
-#SBATCH --time=5:00:00
+#SBATCH --mem=64G
+#SBATCH --time=05:00:00
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.err
 #SBATCH --mail-user=cperez67@student.ubc.ca
@@ -31,23 +29,21 @@ mkdir -p "${REPO_DIR}/hpc_logs"
 ############################
 # Experiment args
 ############################
-# YOLO_DEVICES is set by setup_env based on Slurm's GPU allocation
+# Note: Adjusted paths to match your scratch directory structure
 ARGS=(
   --root "/arc/project/st-ipor-1/carlosp/fundus_data/All_Datasets_Organized"
-  --csv "/scratch/st-ipor-1/cperez/MedSAM/src/image_data/Cleaned_Metadata.csv"
-  --out-parquet "/scratch/st-ipor-1/cperez/MedSAM/src/image_data/images.parquet"
-)
-
-ARGS2=(
-  /arc/project/st-ipor-1/Fundus/Data/EYEPACS
-  ${REPO_DIR}/data/EYEPACS
+  --csv "${REPO_DIR}/src/image_data/Cleaned_Metadata_dev.csv"
+  --out-parquet "${REPO_DIR}/src/image_data/images_dev.parquet"
+  --compression "zstd"
 )
 
 ############################
 # Run
 ############################
-#srun --gpu-bind=closest --cpu-bind=cores -u \
-#  python -m src.tools.jpg_to_png "${ARGS[@]}"
+# Using srun with cpu binding. No GPU requested or bound.
+echo "Creating Parquet dataset on $(hostname)..."
 
-srun --gpu-bind=closest --cpu-bind=cores -u \
+srun --cpu-bind=cores -u \
   python -m src.tools.create_images "${ARGS[@]}"
+
+echo "Done."

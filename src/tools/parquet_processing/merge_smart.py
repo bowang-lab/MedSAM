@@ -30,7 +30,6 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import pyarrow.parquet as pq
 
-# Ensure src is in pythonpath
 from src.imgpipe.image import Image
 
 
