@@ -2,7 +2,7 @@
 #SBATCH --job-name=Predict_Summarize_MGPU
 #SBATCH --account=st-ipor-1-gpu
 #SBATCH --partition=gpu
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --gpus-per-task=1
