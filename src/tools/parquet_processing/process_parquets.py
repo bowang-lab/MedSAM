@@ -46,9 +46,8 @@ from __future__ import annotations
 import argparse
 import logging
 from collections import Counter
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Iterable, Iterator, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -126,22 +125,9 @@ def log_counter(title: str, ctr: Counter) -> None:
 # Parquet streaming IO (nested-safe)
 # ============================================================
 
-def iter_parquet_files(in_path: Path) -> List[Path]:
-    in_path = Path(in_path).resolve()
-    if in_path.is_file():
-        if in_path.suffix.lower() != ".parquet":
-            raise ValueError(f"Expected a .parquet file, got: {in_path}")
-        return [in_path]
-    if not in_path.is_dir():
-        raise FileNotFoundError(f"Input not found: {in_path}")
-    files = sorted(in_path.rglob("*.parquet"))
-    if not files:
-        raise RuntimeError(f"No .parquet files found under: {in_path}")
-    return files
-
 
 def iter_images_streaming(in_path: Path, *, batch_size: int) -> Iterator[Image]:
-    for f in iter_parquet_files(in_path):
+    for f in Image.iter_parquet(in_path):
         pf = pq.ParquetFile(str(f))
         for rb in pf.iter_batches(batch_size=int(batch_size)):
             for rec in rb.to_pylist():
@@ -341,7 +327,7 @@ def filter_and_postprocess_stream(
     n_true_gt_dropped = 0
     n_no_gt_kept = 0
 
-    for img in iter_images_streaming(pred_in, batch_size=READ_BATCH):
+    for img in Image.iter_parquet(pred_in, batch_size=READ_BATCH):
         n_in += 1
         per_ds_in[dataset_name(img)] += 1
 

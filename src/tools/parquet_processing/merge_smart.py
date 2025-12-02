@@ -26,35 +26,9 @@ import argparse
 import dataclasses
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence
-
-import pyarrow.parquet as pq
+from typing import Dict, Iterator, Optional, Sequence
 
 from src.imgpipe.image import Image
-
-
-def iter_parquet_files(in_path: Path) -> List[Path]:
-    """Resolve a path to a list of .parquet files (single file or directory)."""
-    in_path = in_path.resolve()
-    if in_path.is_file():
-        if in_path.suffix.lower() != ".parquet":
-            raise ValueError(f"Expected a .parquet file, got: {in_path}")
-        return [in_path]
-    if not in_path.is_dir():
-        raise FileNotFoundError(f"Input not found: {in_path}")
-    files = sorted(in_path.rglob("*.parquet"))
-    if not files:
-        raise RuntimeError(f"No .parquet files found under: {in_path}")
-    return files
-
-
-def iter_images_streaming(in_path: Path, batch_size: int = 2048) -> Iterator[Image]:
-    """Yield Image objects efficiently from one or more parquet files."""
-    for f in iter_parquet_files(in_path):
-        pf = pq.ParquetFile(str(f))
-        for rb in pf.iter_batches(batch_size=int(batch_size)):
-            for rec in rb.to_pylist():
-                yield Image.from_dict(rec)
 
 
 def intelligent_merge(primary: Image, secondary: Image) -> Image:
@@ -110,7 +84,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     b_map: Dict[str, Image] = {}
     b_count = 0
 
-    for img in iter_images_streaming(args.in_b, batch_size=args.batch_size):
+    for img in Image.iter_parquet(args.in_b, batch_size=args.batch_size):
         k = getattr(img, match_key, None)
         if k:
             b_map[str(k)] = img
@@ -127,7 +101,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         merged_count = 0
 
         # Stream A
-        for img_a in iter_images_streaming(args.in_a, batch_size=args.batch_size):
+        for img_a in Image.iter_parquet(args.in_a, batch_size=args.batch_size):
             a_count += 1
             k = getattr(img_a, match_key, None)
 

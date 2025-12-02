@@ -38,22 +38,9 @@ from src.imgpipe.image import Image
 # -------------------------
 
 
-def iter_parquet_files(in_path: Path) -> List[Path]:
-    in_path = in_path.resolve()
-    if in_path.is_file():
-        if in_path.suffix.lower() != ".parquet":
-            raise ValueError(f"Expected a .parquet file, got: {in_path}")
-        return [in_path]
-    if not in_path.is_dir():
-        raise FileNotFoundError(f"Input not found: {in_path}")
-    files = sorted(in_path.rglob("*.parquet"))
-    if not files:
-        raise RuntimeError(f"No .parquet files found under: {in_path}")
-    return files
-
 
 def iter_rows_streaming(in_path: Path, *, batch_size: int) -> Iterator[Dict[str, Any]]:
-    for f in iter_parquet_files(in_path):
+    for f in Image.iter_parquet(in_path):
         pf = pq.ParquetFile(str(f))
         for rb in pf.iter_batches(batch_size=int(batch_size)):
             for rec in rb.to_pylist():

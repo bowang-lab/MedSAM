@@ -81,44 +81,6 @@ def log_counter(title: str, ctr: Counter) -> None:
         logging.info("  %-24s %d", k, int(ctr[k]))
 
 
-# -------------------------
-# Parquet streaming IO
-# -------------------------
-
-
-def iter_parquet_files(in_path: Path) -> List[Path]:
-    """
-    Supports:
-      - a single .parquet file
-      - a directory containing many *.parquet parts
-    """
-    in_path = in_path.resolve()
-    if in_path.is_file():
-        if in_path.suffix.lower() != ".parquet":
-            raise ValueError(f"Expected a .parquet file, got: {in_path}")
-        return [in_path]
-    if not in_path.is_dir():
-        raise FileNotFoundError(f"Input not found: {in_path}")
-
-    files = sorted(in_path.rglob("*.parquet"))
-    if not files:
-        raise RuntimeError(f"No .parquet files found under: {in_path}")
-    return files
-
-
-def iter_images_streaming(in_path: Path, *, batch_size: int) -> Iterable[Image]:
-    """
-    Robust streaming reader for nested struct columns.
-
-    Uses ParquetFile.iter_batches() over files
-    (avoids dataset Scanner paths that can crash on nested+chunked outputs).
-    """
-    for f in iter_parquet_files(in_path):
-        pf = pq.ParquetFile(str(f))
-        for rb in pf.iter_batches(batch_size=int(batch_size)):
-            for rec in rb.to_pylist():
-                yield Image.from_dict(rec)
-
 
 # -------------------------
 # GT + pseudo-label utilities
@@ -631,7 +593,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         nonlocal n_out
         kept_row_id_local = 0
 
-        for img in iter_images_streaming(in_path, batch_size=cfg.read_batch):
+        for img in Image.iter_parquet(in_path, batch_size=cfg.read_batch):
             keep, has_gt = passes_all_filters_and_get_has_gt(img, cfg)
             if not keep:
                 continue

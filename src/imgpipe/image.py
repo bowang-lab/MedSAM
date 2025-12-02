@@ -1276,16 +1276,35 @@ class Image:
         table = pq.read_table(p)
         return [Image.from_dict(rec) for rec in table.to_pylist()]
 
+
     @staticmethod
     def iter_parquet(path: Union[Path, str], batch_size: int = 1024) -> Iterator["Image"]:
         """
-        Stream Image objects from a Parquet file in batches.
-        Uses ParquetFile.iter_batches() (robust for nested structs).
+        Stream Image objects from a Parquet file OR a directory of Parquet files.
+        Robustly handles nested structs by using iter_batches().
         """
-        pf = pq.ParquetFile(str(path))
-        for batch in pf.iter_batches(batch_size=int(batch_size)):
-            for rec in batch.to_pylist():
-                yield Image.from_dict(rec)
+        p = Path(path).resolve()
+
+        # 1. Resolve input to a list of files
+        files: List[Path] = []
+        if p.is_file():
+            if p.suffix.lower() != ".parquet":
+                raise ValueError(f"Expected .parquet file, got: {p}")
+            files = [p]
+        elif p.is_dir():
+            files = sorted(p.rglob("*.parquet"))
+            if not files:
+                # It is valid to have an empty directory, just yield nothing
+                return
+        else:
+            raise FileNotFoundError(f"Input path not found: {p}")
+
+        # 2. Stream from all files
+        for f in files:
+            pf = pq.ParquetFile(str(f))
+            for batch in pf.iter_batches(batch_size=int(batch_size)):
+                for rec in batch.to_pylist():
+                    yield Image.from_dict(rec)
 
     # ----------------- repr -----------------
 
