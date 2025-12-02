@@ -50,7 +50,6 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional, Sequence, Set, Tuple
 
 import numpy as np
-import pyarrow.parquet as pq
 
 from src.imgpipe.image import Image
 
@@ -119,20 +118,6 @@ def log_counter(title: str, ctr: Counter) -> None:
     logging.info("%s (total=%d)", title, total)
     for k in sorted(ctr.keys()):
         logging.info("  %-24s %d", k, int(ctr[k]))
-
-
-# ============================================================
-# Parquet streaming IO (nested-safe)
-# ============================================================
-
-
-def iter_images_streaming(in_path: Path, *, batch_size: int) -> Iterator[Image]:
-    for f in Image.iter_parquet(in_path):
-        pf = pq.ParquetFile(str(f))
-        for rb in pf.iter_batches(batch_size=int(batch_size)):
-            for rec in rb.to_pylist():
-                yield Image.from_dict(rec)
-
 
 # ============================================================
 # GT / pseudo-label utilities
@@ -373,7 +358,7 @@ def filter_and_postprocess_stream(
 
     def gen() -> Iterable[Image]:
         nonlocal n_written
-        for img in iter_images_streaming(pred_in, batch_size=READ_BATCH):
+        for img in Image.iter_parquet(pred_in, batch_size=READ_BATCH):
             if not dataset_allowed(getattr(img, "dataset", None), exclude=exclude_datasets):
                 continue
 
@@ -433,14 +418,14 @@ def combine_streams(
         nonlocal n_in_extra, n_in_filtered, n_out
 
         # EXTRA first (resampled)
-        for img in iter_images_streaming(extra_in, batch_size=READ_BATCH):
+        for img in Image.iter_parquet(extra_in, batch_size=READ_BATCH):
             n_in_extra += 1
             for _ in range(int(repeat_resample)):
                 n_out += 1
                 yield img
 
         # FILTERED once (never resampled)
-        for img in iter_images_streaming(filtered_in, batch_size=READ_BATCH):
+        for img in Image.iter_parquet(filtered_in, batch_size=READ_BATCH):
             n_in_filtered += 1
             n_out += 1
             yield img

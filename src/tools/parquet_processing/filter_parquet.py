@@ -534,7 +534,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     kept_gt_row_ids: List[int] = []
     kept_row_id = 0
 
-    for img in iter_images_streaming(in_path, batch_size=cfg.read_batch):
+    for img in Image.iter_parquet(in_path, batch_size=cfg.read_batch):
         n_in += 1
         ds_display = dataset_name(img)
         per_ds_in[ds_display] += 1
