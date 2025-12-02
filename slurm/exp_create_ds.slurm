@@ -1,12 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=YOLO_CREATE_DS
 #SBATCH --account=st-ipor-1
-#SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=60G
-#SBATCH --time=4:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.err
 #SBATCH --mail-user=cperez67@student.ubc.ca
@@ -28,18 +27,11 @@ cd "${REPO_DIR}"
 mkdir -p "${REPO_DIR}/hpc_logs"
 
 ############################
-# FIX: define YOLO_DEVICES safely (do NOT rely on it being pre-set)
+# Device Configuration (CPU Only)
 ############################
-# Preferred source is CUDA_VISIBLE_DEVICES, which Slurm typically sets per job/step.
-# Ultralytics accepts comma-separated GPU indices, e.g. "0,1,2,3".
-if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  YOLO_DEVICES="${CUDA_VISIBLE_DEVICES}"
-else
-  # If Slurm didn't set it for some reason, fall back to "0,1,2,3" for 4 GPUs.
-  # (Not a resource change; this just prevents -u from crashing.)
-  YOLO_DEVICES="0,1,2,3"
-fi
-export YOLO_DEVICES
+# Force the experiment script to use CPU.
+# This prevents it from looking for GPUs or occupying GPU resources.
+YOLO_DEVICES="cpu"
 echo "YOLO_DEVICES=${YOLO_DEVICES}"
 
 ############################
@@ -55,5 +47,10 @@ ARGS=(
 ############################
 # Run
 ############################
-srun --gpu-bind=closest --cpu-bind=cores -u \
+# Removed --gpu-bind=closest since we are running on CPU nodes.
+echo "Starting Dataset Creation on CPU..."
+
+srun --cpu-bind=cores -u \
   python -m src.experiment "${ARGS[@]}"
+
+echo "Job Finished"
