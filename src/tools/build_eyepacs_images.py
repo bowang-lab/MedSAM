@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 """
-Build a Parquet file of Image metadata from an EYEPACS CSV and images, using Image.save_parquet()
-(stable schema, streaming, nested-safe).
+Build a Parquet file of Image metadata from an EYEPACS CSV and images.
+Uses Image.save_parquet() for canonical schema consistency and streaming IO.
 
-Key speed/robustness features:
-- Pre-index images in IMG_DIR once (avoid 90k Path.is_file() stats).
-- Multiprocessing to construct Image objects.
-- Uses Pillow to read (W,H) from headers (avoids imageio/SimpleITK failures).
-- Bad/corrupt images are skipped (logged), won't crash the whole job.
-
-Images expected in:
-  --root-dir/
-    EYEPACS_<image_id>.png
-or if --fundus-subdir is provided:
-  --root-dir/<fundus-subdir>/EYEPACS_<image_id>.png
+Key Features:
+- Pre-indexes image files for O(1) lookup.
+- Uses Multiprocessing to process rows and read image headers.
+- Uses Pillow for fast header-only size reading.
+- Handles metadata parsing (Eye, Glaucoma, Extras) robustly.
 """
 
 from __future__ import annotations
@@ -23,20 +17,20 @@ import logging
 import multiprocessing as mp
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pandas as pd
 from PIL import Image as PILImage, ImageFile
 
+# Ensure these match your project structure
 from src.imgpipe.enums import Eye
 from src.imgpipe.image import Image
 
-# Allow Pillow to parse headers even if the file is slightly truncated.
-# (Still may fail on truly corrupt/non-image files; those are skipped.)
+# Allow Pillow to parse headers even if the file is slightly truncated
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
-# ------------------------- helpers -------------------------
+# ------------------------- Helpers -------------------------
 
 def infer_eye(image_type: object) -> Optional[Eye]:
     if not isinstance(image_type, str):
@@ -53,9 +47,6 @@ def safe_int(x: object) -> Optional[int]:
     try:
         if pd.isna(x):
             return None
-    except Exception:
-        pass
-    try:
         return int(x)
     except Exception:
         return None
@@ -106,10 +97,7 @@ def normalize_image_id(image_id: object) -> Optional[str]:
 
 
 def fast_image_size_pil(p: Path) -> Tuple[int, int]:
-    """
-    Fast header-only size read using Pillow.
-    Does not decode full image.
-    """
+    """Fast header-only size read using Pillow."""
     with PILImage.open(p) as im:
         w, h = im.size
     return int(w), int(h)
@@ -118,22 +106,27 @@ def fast_image_size_pil(p: Path) -> Tuple[int, int]:
 def build_image_index(img_dir: Path) -> Dict[str, Path]:
     """
     Map image_id -> path by scanning directory once.
-    Expects filenames: EYEPACS_<image_id>.png
+    Expects filenames like: EYEPACS_<image_id>.png
     """
     idx: Dict[str, Path] = {}
-    for p in img_dir.glob("EYEPACS_*.png"):
-        stem = p.stem  # EYEPACS_<id>
-        # split once from left
-        parts = stem.split("_", 1)
-        if len(parts) != 2:
-            continue
-        image_id = parts[1].strip()
-        if image_id:
-            idx[image_id] = p
+    # Scan for common extensions
+    for ext in ["*.png", "*.jpg", "*.jpeg"]:
+        for p in img_dir.glob(ext):
+            stem = p.stem  # e.g. "EYEPACS_123_h"
+            # Logic: assume <dataset>_<id> or just <id> depending on your naming convention
+            # Here we follow the logic: EYEPACS_<id>
+            parts = stem.split("_", 1)
+            if len(parts) == 2:
+                image_id = parts[1].strip()
+                if image_id:
+                    idx[image_id] = p
+            else:
+                # Fallback: if filename is just the ID
+                idx[stem] = p
     return idx
 
 
-# ------------------------- multiprocessing work unit -------------------------
+# ------------------------- Multiprocessing Work Unit -------------------------
 
 @dataclass(frozen=True)
 class WorkItem:
@@ -141,7 +134,7 @@ class WorkItem:
     img_path: Path
     dataset_name: str
     subject_id: str
-    laterality: Optional[str]   # Eye name or None ("OD"/"OS")
+    laterality: Optional[str]  # "OD" or "OS"
     age: Optional[int]
     glaucoma: Optional[bool]
     extras: Dict[str, Any]
@@ -149,9 +142,8 @@ class WorkItem:
 
 def _worker_make_image(w: WorkItem) -> Tuple[str, Optional[Image], Optional[str], Optional[str]]:
     """
-    Returns:
-      ("ok", image, None, None)
-      ("bad", None, image_path, error_string)
+    Worker function to construct an Image object.
+    Returns: ("ok", image, None, None) or ("bad", None, path, error)
     """
     try:
         if not w.img_path.is_file() or w.img_path.stat().st_size <= 0:
@@ -159,21 +151,23 @@ def _worker_make_image(w: WorkItem) -> Tuple[str, Optional[Image], Optional[str]
 
         width, height = fast_image_size_pil(w.img_path)
 
+        # Create Image using the factory method from Image class
         img = Image.from_path(
             image_path=w.img_path,
             dataset=w.dataset_name,
             subject_id=w.subject_id,
             width=width,
             height=height,
+            uid=None,  # Auto-generate UID
         )
 
-        # Assign metadata
+        # Set Metadata
         img.laterality = None
         if w.laterality:
             try:
                 img.laterality = Eye[w.laterality]
             except Exception:
-                img.laterality = None
+                pass
 
         img.age = w.age
         img.glaucoma = w.glaucoma
@@ -184,171 +178,150 @@ def _worker_make_image(w: WorkItem) -> Tuple[str, Optional[Image], Optional[str]
         return ("bad", None, str(w.img_path), f"{type(e).__name__}: {e}")
 
 
-# ------------------------- streaming builder -------------------------
+# ------------------------- Streaming Builder -------------------------
 
 def iter_images_from_csv(
-    csv_path: Path,
-    img_dir: Path,
-    dataset_name: str,
-    *,
-    mp_workers: int,
-    mp_chunksize: int,
-    log_every: int,
+        csv_path: Path,
+        img_dir: Path,
+        dataset_name: str,
+        *,
+        mp_workers: int,
+        mp_chunksize: int,
+        log_every: int,
 ) -> Iterator[Image]:
+    logging.info("Reading CSV: %s", csv_path)
     df = pd.read_csv(csv_path, engine="python")
     n_rows = len(df)
-    logging.info("CSV rows scanned: %d", n_rows)
+    logging.info("CSV rows: %d", n_rows)
 
-    # One directory scan instead of N filesystem stats
+    logging.info("Indexing images in: %s", img_dir)
     idx = build_image_index(img_dir)
-    logging.info("Indexed %d images under: %s", len(idx), img_dir)
+    logging.info("Indexed %d images.", len(idx))
 
     work: List[WorkItem] = []
-    missing = 0
+    missing_count = 0
 
-    # itertuples is faster than iterrows
-    cols = set(df.columns)
-
-    def _get(row, name: str) -> Any:
-        return getattr(row, name) if name in cols else None
-
-    # Keep only extras you care about (avoid huge dicts)
+    # Columns we want to capture in 'extras'
     extras_cols = [
-        "site_id",
-        "case_id",
-        "gender",
-        "ethnicity",
-        "years_with_diabetes",
-        "hba1c",
-        "cholesterol",
-        "triglycerides",
-        "insulin_dependent",
-        "dr_level",
-        "dr_icd10",
-        "image_quality",
-        "image_quality_factor",
-        "assessment_and_recommendation",
-        "referral_time_assessment",
+        "site_id", "case_id", "gender", "ethnicity", "years_with_diabetes",
+        "hba1c", "cholesterol", "triglycerides", "insulin_dependent",
+        "dr_level", "dr_icd10", "image_quality", "image_quality_factor",
+        "assessment_and_recommendation"
     ]
 
+    # Optimization: pre-check column existence
+    cols = set(df.columns)
+    valid_extras_cols = [c for c in extras_cols if c in cols]
+
+    def _get(row, name):
+        return getattr(row, name) if name in cols else None
+
     for row in df.itertuples(index=False):
-        image_id_str = normalize_image_id(_get(row, "image_id"))
+        raw_id = _get(row, "image_id")
+        image_id_str = normalize_image_id(raw_id)
         if not image_id_str:
             continue
 
         p = idx.get(image_id_str)
         if p is None:
-            missing += 1
+            missing_count += 1
             continue
 
-        patient_id = _get(row, "patient_id")
-        subject_id = ""
-        if patient_id is not None:
-            try:
-                if not pd.isna(patient_id):
-                    subject_id = str(patient_id)
-            except Exception:
-                subject_id = str(patient_id)
+        # Subject ID
+        pat_id = _get(row, "patient_id")
+        subject_id = str(pat_id) if (pat_id is not None and not pd.isna(pat_id)) else ""
 
-        laterality = infer_eye(_get(row, "image_type"))
-        laterality_s = laterality.name if laterality is not None else None
+        # Metadata
+        lat_enum = infer_eye(_get(row, "image_type"))
+        lat_str = lat_enum.name if lat_enum else None
 
         age = safe_int(_get(row, "age_at_encounter"))
         glaucoma = parse_glaucoma_flag(_get(row, "glaucoma_hx"))
 
-        ethnicity_raw = clean_extras_value(_get(row, "ethnicity"))
-        extras: Dict[str, Any] = {}
-        for c in extras_cols:
-            if c not in cols:
-                continue
-            v = clean_extras_value(_get(row, c))
-            if c == "ethnicity":
-                extras["ethnicity_raw"] = ethnicity_raw
-            else:
-                extras[c] = v
+        # Extras
+        extras = {}
+        for c in valid_extras_cols:
+            val = clean_extras_value(_get(row, c))
+            if val is not None:
+                extras[c] = val
 
-        work.append(
-            WorkItem(
-                image_id=image_id_str,
-                img_path=p,
-                dataset_name=dataset_name,
-                subject_id=subject_id,
-                laterality=laterality_s,
-                age=age,
-                glaucoma=glaucoma,
-                extras=extras,
-            )
-        )
+        work.append(WorkItem(
+            image_id=image_id_str,
+            img_path=p,
+            dataset_name=dataset_name,
+            subject_id=subject_id,
+            laterality=lat_str,
+            age=age,
+            glaucoma=glaucoma,
+            extras=extras
+        ))
 
-    logging.info("Work items: %d (missing images by id: %d)", len(work), missing)
+    logging.info("Work items prepared: %d (Missing images: %d)", len(work), missing_count)
 
+    # Serial Execution
     if mp_workers <= 0 or mp_workers == 1:
-        bad = 0
-        for j, w in enumerate(work, start=1):
-            status, img, bad_path, err = _worker_make_image(w)
-            if status == "ok" and img is not None:
-                if log_every and (j % log_every == 0):
-                    logging.info("Processed %d/%d (bad=%d)", j, len(work), bad)
+        bad_count = 0
+        for i, w in enumerate(work, 1):
+            status, img, _, _ = _worker_make_image(w)
+            if status == "ok" and img:
+                if log_every and i % log_every == 0:
+                    logging.info("Processed %d/%d", i, len(work))
                 yield img
             else:
-                bad += 1
-                if bad_path:
-                    logging.warning("Bad image skipped: %s | %s", bad_path, err)
+                bad_count += 1
         return
 
-    # Multiprocessing path
-    ctx = mp.get_context("fork")  # linux HPC; fastest startup
-    bad_paths: List[str] = []
-    bad = 0
-    processed = 0
+    # Parallel Execution
+    ctx = mp.get_context("fork")
+    bad_count = 0
+    processed_count = 0
+    bad_paths = []
 
-    logging.info("Multiprocessing enabled: workers=%d, tasks=%d", mp_workers, len(work))
-
+    logging.info("Starting pool with %d workers...", mp_workers)
     with ctx.Pool(processes=mp_workers, maxtasksperchild=2000) as pool:
         for status, img, bad_path, err in pool.imap_unordered(_worker_make_image, work, chunksize=mp_chunksize):
-            processed += 1
-            if status == "ok" and img is not None:
-                if log_every and (processed % log_every == 0):
-                    logging.info("Processed %d/%d (bad=%d)", processed, len(work), bad)
+            processed_count += 1
+            if status == "ok" and img:
+                if log_every and processed_count % log_every == 0:
+                    logging.info("Processed %d/%d (bad=%d)", processed_count, len(work), bad_count)
                 yield img
             else:
-                bad += 1
+                bad_count += 1
                 if bad_path:
-                    bad_paths.append(bad_path)
-                    logging.warning("Bad image skipped: %s | %s", bad_path, err)
+                    bad_paths.append(f"{bad_path} | {err}")
 
     if bad_paths:
-        sidecar = img_dir / "bad_images_skipped.txt"
+        log_file = img_dir / "bad_images_log.txt"
         try:
-            sidecar.write_text("\n".join(bad_paths) + "\n")
-            logging.info("Wrote bad image list: %s (n=%d)", sidecar, len(bad_paths))
+            log_file.write_text("\n".join(bad_paths))
+            logging.warning("Wrote %d bad image errors to %s", len(bad_paths), log_file)
         except Exception:
-            logging.info("Failed to write bad image list (n=%d)", len(bad_paths))
+            pass
 
-    logging.info("Finished: processed=%d bad_skipped=%d", processed, bad)
+    logging.info("Finished. Total: %d, Bad/Skipped: %d", processed_count, bad_count)
 
 
-# ------------------------- main -------------------------
+# ------------------------- Main -------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build EYEPACS Image parquet from CSV + images (fast, CPU, robust).")
+    p = argparse.ArgumentParser(description="Build EYEPACS Parquet using Image class writer.")
     p.add_argument("--csv", type=Path, required=True)
     p.add_argument("--root-dir", type=Path, required=True)
     p.add_argument("--fundus-subdir", type=str, default=None)
     p.add_argument("--dataset-name", type=str, default="EYEPACS")
     p.add_argument("--out-parquet", type=Path, required=True)
 
-    # speed knobs
-    p.add_argument("--mp-workers", type=int, default=0, help="0 disables multiprocessing; else worker count.")
+    p.add_argument("--mp-workers", type=int, default=16)
     p.add_argument("--mp-chunksize", type=int, default=256)
     p.add_argument("--write-batch", type=int, default=8192)
     p.add_argument("--compression", type=str, default="zstd")
+
     p.add_argument("--log-level", type=str, default="INFO")
     p.add_argument("--log-every", type=int, default=10000)
 
-    # typically OFF
-    p.add_argument("--include-image-bytes", action="store_true")
-    p.add_argument("--include-mask-bytes", action="store_true")
+    # Consistency args matching Image.save_parquet signature
+    p.add_argument("--include-image-bytes", action="store_true", help="Embed raw image bytes in Parquet.")
+    p.add_argument("--include-mask-bytes", action="store_true", help="Embed mask bytes (if any).")
 
     return p.parse_args()
 
@@ -360,33 +333,34 @@ def main() -> None:
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    img_dir = args.root_dir if not args.fundus_subdir else (args.root_dir / args.fundus_subdir)
-    if not img_dir.is_dir():
-        raise FileNotFoundError(f"IMG_DIR not found: {img_dir}")
+    img_dir = args.root_dir
+    if args.fundus_subdir:
+        img_dir = img_dir / args.fundus_subdir
 
-    logging.info("CSV:      %s", args.csv)
-    logging.info("IMG_DIR:  %s", img_dir)
-    logging.info("OUT:      %s", args.out_parquet)
-    logging.info("DATASET:  %s", args.dataset_name)
-    logging.info("mp_workers=%d write_batch=%d", int(args.mp_workers), int(args.write_batch))
+    logging.info("Configuration:")
+    logging.info("  CSV: %s", args.csv)
+    logging.info("  Root: %s", img_dir)
+    logging.info("  Out: %s", args.out_parquet)
+    logging.info("  Workers: %d", args.mp_workers)
 
-    images_iter = iter_images_from_csv(
+    images_generator = iter_images_from_csv(
         csv_path=args.csv,
         img_dir=img_dir,
-        dataset_name=str(args.dataset_name),
-        mp_workers=int(args.mp_workers),
-        mp_chunksize=int(args.mp_chunksize),
-        log_every=int(args.log_every),
+        dataset_name=args.dataset_name,
+        mp_workers=args.mp_workers,
+        mp_chunksize=args.mp_chunksize,
+        log_every=args.log_every,
     )
 
+    # Use the consistent class method for writing
     Image.save_parquet(
-        images_iter,
+        images_generator,
         path=args.out_parquet,
-        drop_none=False,
-        include_image_bytes=bool(args.include_image_bytes),
-        include_mask_bytes=bool(args.include_mask_bytes),
-        compression=str(args.compression),
-        write_batch=int(args.write_batch),
+        drop_none=False,  # Keep schema consistent with full definition
+        include_image_bytes=args.include_image_bytes,
+        include_mask_bytes=args.include_mask_bytes,
+        compression=args.compression,
+        write_batch=args.write_batch,
     )
 
     logging.info("Done.")
