@@ -13,8 +13,8 @@ from src.imgpipe.image import Image
 # =========================
 # Global configuration
 # =========================
-PARQUET_PATH = Path("/PREDICT/predictions_dev_fixed.parquet")
-N_PREVIEW = 0
+PARQUET_PATH = Path("/Users/carlosperez/PycharmProjects/MedSAM/src/image_data/images.parquet")
+N_PREVIEW = 3
 BATCH_SIZE = 256
 
 # Where to save preview masks (and small metadata)
