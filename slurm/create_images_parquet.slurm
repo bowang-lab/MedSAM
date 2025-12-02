@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=create_ds
+#SBATCH --job-name=create_parquet_images
 #SBATCH --account=st-ipor-1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
