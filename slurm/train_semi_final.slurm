@@ -32,8 +32,7 @@ mkdir -p "${REPO_DIR}/hpc_logs"
 # 2. Configuration
 ############################
 # Input: The final parquet file from the previous processing step
-INPUT_PARQUET="${REPO_DIR}/src/image_data/processed_semi_supervised/final_semi_supervised_dataset.parquet"
-
+INPUT_PARQUET="${REPO_DIR}/src/image_data/parquet/processed_semi_supervised/final_semi_supervised_dataset_88.parquet"
 # Output: Where to materialize the dataset
 OUT_YOLO_DS="${REPO_DIR}/DS/YOLO_SEMI_FINAL_V1"
 
