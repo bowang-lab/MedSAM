@@ -73,7 +73,7 @@ def main() -> None:
 
     # Promote to GT and force split to 'train'
     proc_preds.promote_predictions_to_gt()
-    proc_preds.set_split_for_all("train")  # <--- UPDATED: Ensures pseudo-labels are train set
+    proc_preds.set_split_for_all("train")
 
     # ---------------------------------------------------------
     # 2. Process YOLO Split (The Real GT Branch)
@@ -106,11 +106,13 @@ def main() -> None:
     # Summarize final state
     proc_split.summarize()
 
-    # Save
-    out_path = args.out_dir / f"semi_supervised_dataset.parquet"
+    # Save with clean filename (e.g., final_semi_supervised_dataset_88.parquet)
+    conf_pct = int(round(args.conf * 100))
+    out_path = args.out_dir / f"final_semi_supervised_dataset_{conf_pct}.parquet"
+
     proc_split.save(
         out_path,
-        include_mask_bytes=True,
+        include_mask_bytes=True,  # Need masks for training
         include_image_bytes=False
     )
 
