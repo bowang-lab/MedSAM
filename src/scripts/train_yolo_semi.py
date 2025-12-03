@@ -2,10 +2,8 @@
 # File: src/scripts/train_yolo_semi.py
 """
 Simplified Semi-Supervised YOLO Trainer.
-Assumes input parquet is fully prepared (GTs valid, splits assigned).
-1. Reads Parquet.
-2. Materializes YOLO dataset (images/labels) based on 'split' column.
-3. Fine-tunes YOLO model (Multi-GPU ready).
+1. (Optional) Reads Parquet and Materializes YOLO dataset.
+2. Fine-tunes YOLO model (Multi-GPU ready).
 """
 
 from __future__ import annotations
@@ -21,7 +19,7 @@ import yaml
 from ultralytics import YOLO
 
 from src.imgpipe.image import Image
-from src.utils import ultralytics_device_arg  # Helper for multi-GPU detection
+from src.utils import ultralytics_device_arg
 
 SEED_DEFAULT = 42
 
@@ -74,7 +72,6 @@ def materialize_image_file(img: Image, dst_img_path: Path) -> None:
         return
     src = Path(img.image_path)
     if not src.exists():
-        # Skip if source file missing
         return
     shutil.copy2(src, dst_img_path)
 
@@ -83,9 +80,6 @@ def build_yolo_dataset_from_processed_parquet(
         images: list[Image],
         out_dir: Path,
 ) -> Path:
-    """
-    Materialize dataset assuming `img.split` and `gt_*_box` are already set.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     ensure_dirs(out_dir)
 
@@ -98,21 +92,17 @@ def build_yolo_dataset_from_processed_parquet(
         if split not in counts:
             continue
 
-        # Determine extension
         ext = (img.image_path.suffix or "").lower()
         if not ext:
             ext = getattr(img.image_ref, "ext", None) or ".png"
         if not ext.startswith("."):
             ext = "." + ext
 
-        # Paths
         dst_img = out_dir / "images" / split / f"{img.uid}{ext}"
         dst_lbl = out_dir / "labels" / split / f"{img.uid}.txt"
 
-        # Write Image
         materialize_image_file(img, dst_img)
 
-        # Write Labels
         lines = []
         if img.gt_disc_box:
             xc, yc, w, h = img.gt_disc_box.as_tuple()
@@ -148,7 +138,6 @@ def run_train(
     run_root.mkdir(parents=True, exist_ok=False)
 
     print(f"[INFO] Loading weights for fine-tuning: {init_weights}")
-    print(f"[INFO] Target Device(s): {device}")
     model = YOLO(str(init_weights))
 
     print(f"[INFO] Starting training... Output: {run_root}")
@@ -164,7 +153,6 @@ def run_train(
         exist_ok=False,
         resume=False,
         freeze=freeze,
-        # Ultralytics DDP handles distributed training if device is a list/comma-string
     )
 
     weights_dir = run_root / "weights"
@@ -184,6 +172,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default=None, help='Device e.g. "0,1,2,3". Auto-detected if None.')
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
+    p.add_argument("--skip-materialization", action="store_true", help="Use existing YOLO dataset if found.")
     return p.parse_args()
 
 
@@ -191,16 +180,24 @@ def main() -> None:
     args = parse_args()
     set_global_seed(args.seed)
 
-    # Auto-detect device if not provided
     target_device = args.device if args.device is not None else ultralytics_device_arg()
 
-    print(f"[INFO] Loading Parquet: {args.images_parquet}")
-    images = Image.load_parquet(args.images_parquet)
+    # Check if we can skip materialization
+    data_yaml = args.out_yolo_ds / "data.yaml"
 
-    data_yaml = build_yolo_dataset_from_processed_parquet(
-        images,
-        out_dir=args.out_yolo_ds
-    )
+    if args.skip_materialization and data_yaml.exists():
+        print(f"[INFO] Skipping materialization. Using existing dataset: {data_yaml}")
+    else:
+        if args.skip_materialization:
+            print(f"[WARN] --skip-materialization set but {data_yaml} not found. Proceeding with creation.")
+
+        print(f"[INFO] Loading Parquet: {args.images_parquet}")
+        images = Image.load_parquet(args.images_parquet)
+
+        data_yaml = build_yolo_dataset_from_processed_parquet(
+            images,
+            out_dir=args.out_yolo_ds
+        )
 
     best_weights = run_train(
         data_yaml=data_yaml,
