@@ -1,22 +1,57 @@
+#!/usr/bin/env python3
+# File: src/tools/parquet_processing/run_parquet_processing.py
+"""
+Script to merge development and eyepacs datasets using the ParquetProcessor API.
+
+Logic:
+1. Loads 'images_dev_yolo_split.parquet' (Primary for Dev).
+2. Merges 'images_dev.parquet' into it (Secondary for Dev - fills missing fields).
+   Result: A complete Dev dataset with splits and metadata.
+3. Merges 'images_eyepacs.parquet' into the result.
+   Result: A combined dataset containing both Dev and Eyepacs records.
+4. Saves the final merged dataset.
+"""
+
+import argparse
+import logging
+from pathlib import Path
 from src.tools.parquet_processing.parquet_processor import ParquetProcessor
 
-# Initialize
-processor = ParquetProcessor()
 
-# 1. Merge existing datasets (HPC dataset takes priority)
-processor.merge(
-    "src/image_data/images_hpc.parquet",
-    "src/image_data/yolo_ds_images_dev_hpc.parquet"
-)
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# 2. Filter out low confidence predictions
-processor.filter_by_confidence(threshold=0.5)
+    parser = argparse.ArgumentParser(description="Merge Dev and Eyepacs datasets.")
+    parser.add_argument("--dev-split", type=Path, required=True, help="Path to images_dev_yolo_split.parquet")
+    parser.add_argument("--dev-base", type=Path, required=True, help="Path to images_dev.parquet")
+    parser.add_argument("--eyepacs", type=Path, required=True, help="Path to images_eyepacs.parquet")
+    parser.add_argument("--out", type=Path, required=True, help="Output path for the merged parquet.")
 
-# 3. Keep only training data
-# processor.filter_by_split(['train'])
+    args = parser.parse_args()
 
-# 4. Check stats
-processor.summarize()
+    # 1. Initialize with the split file (Primary)
+    processor = ParquetProcessor()
+    processor.load(args.dev_split)
 
-# 5. Save result (without massive mask bytes if running locally)
-processor.save("src/image_data/cleaned_merged.parquet", include_mask_bytes=False)
+    # 2. Merge the base dev file (Secondary - fills nulls)
+    # Priority: dev_split > dev_base
+    processor.merge(args.dev_base)
+
+    # 3. Merge Eyepacs
+    # Since UIDs should be distinct between Dev and Eyepacs, this acts as an append.
+    # If there were overlaps, Dev would take priority.
+    processor.merge(args.eyepacs)
+
+    # 4. Summarize
+    processor.summarize()
+
+    # 5. Save
+    processor.save(
+        args.out,
+        include_mask_bytes=True,  # Preserve masks
+        include_image_bytes=False  # Keep file size small (metadata only)
+    )
+
+
+if __name__ == "__main__":
+    main()

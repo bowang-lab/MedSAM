@@ -48,7 +48,7 @@ echo "YOLO_DEVICES=${YOLO_DEVICES}"
 SPLITS_PARQUET="/scratch/st-ipor-1/cperez/MedSAM/data/combined.parquet"
 
 # Output: Where to materialize the YOLO directory (images/labels/data.yaml)
-YOLO_DS_OUT="/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS_V4 _FROM_PARQUET"
+YOLO_DS_OUT="/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS_V4_FROM_PARQUET"
 
 ############################
 # 4. Experiment Arguments
