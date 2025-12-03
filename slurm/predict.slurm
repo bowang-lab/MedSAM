@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --gpus-per-task=1
-#SBATCH --cpus-per-task=6q
+#SBATCH --cpus-per-task=6
 #SBATCH --mem=0
 #SBATCH --time=8:00:00
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.out
