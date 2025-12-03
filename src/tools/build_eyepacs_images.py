@@ -158,7 +158,7 @@ def _worker_make_image(w: WorkItem) -> Tuple[str, Optional[Image], Optional[str]
             subject_id=w.subject_id,
             width=width,
             height=height,
-            uid=None,  # Auto-generate UID
+            uid=f"{w.dataset_name}:{w.img_path.stem}",
         )
 
         # Set Metadata

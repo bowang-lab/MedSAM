@@ -70,8 +70,8 @@ case "${MODE}" in
   dev)
 ARGS_DEV=(
       --root "/arc/project/st-ipor-1/carlosp/fundus_data/All_Datasets_Organized"
-      --csv "${REPO_DIR}/src/image_data/Cleaned_Metadata_dev.csv"
-      --out-parquet "${REPO_DIR}/src/image_data/images_dev.parquet"
+      --csv "${REPO_DIR}/src/image_data/csv/Cleaned_Metadata_dev.csv"
+      --out-parquet "${REPO_DIR}/src/image_data/parquet/og_images/images_dev.parquet"
       --compression "zstd"
       --no-embed-images
     )
@@ -91,10 +91,10 @@ ARGS_DEV=(
     WORKERS=28
 
     ARGS_EYEPACS=(
-      --csv "${REPO_DIR}/src/image_data/UBC_data_concatonatedV2.csv"
+      --csv "/home/cperez67/medsam/src/image_data/csv/UBC_data_concatonated.csv"
       --root-dir "/scratch/st-ipor-1/cperez/MedSAM/data/EYEPACS_fundus_png2"
       --dataset-name "EYEPACS"
-      --out-parquet "${REPO_DIR}/src/image_data/eyepacs_images.parquet"
+      --out-parquet "/home/cperez67/medsam/src/image_data/parquet/og_images/images_eyepacs.parquet"
       --mp-workers "${WORKERS}"
       --write-batch 8192
       --compression "zstd"
