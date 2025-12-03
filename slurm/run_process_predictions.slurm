@@ -73,7 +73,7 @@ echo "  - Dup Factor:   $DUP_FACTOR"
 mkdir -p "$OUT_DIR"
 
 srun --cpu-bind=cores -u \
-  python -m src.tools.parquet_processing.process_predictions \
+  python -m src.tools.parquet_processing.run_process_predictions \
     --pred-dev "${PRED_DEV}" \
     --pred-eyepacs "${PRED_EYEPACS}" \
     --yolo-split "${YOLO_SPLIT_PARQUET}" \
