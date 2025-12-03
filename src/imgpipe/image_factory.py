@@ -126,9 +126,9 @@ class ImageFactory:
         return [(f.get(s), oc.get(s), od.get(s)) for s in all_stems]
 
     def filter_datasets(
-        self,
-        include: Optional[List[str]] = None,
-        exclude: Optional[List[str]] = None,
+            self,
+            include: Optional[List[str]] = None,
+            exclude: Optional[List[str]] = None,
     ) -> None:
         """
         Filter the indexed datasets in-place, keeping only those that match the given
@@ -356,11 +356,13 @@ class ImageFactory:
                     continue  # safety
                 if require_complete and not (s in oc_map and s in od_map):
                     continue
+
+                # Standardize UID here as well
                 img = Image.from_path(
                     image_path=fundus_path,
                     dataset=ds,
                     subject_id=s,
-                    uid=f"{ds}:{s}",
+                    uid=f"{ds}:{s}",  # Ensure consistency
                 )
                 oc_path = oc_map.get(s)
                 if oc_path is not None:
@@ -433,6 +435,7 @@ class ImageFactory:
                     # Skip if no fundus image (shouldn't happen under either branch, but safe)
                     continue
 
+                # Standardize UID: Dataset:Stem
                 img = Image.from_path(
                     image_path=fundus_path,
                     dataset=ds,
@@ -520,11 +523,23 @@ class ImageFactory:
                 # This should only happen if require_fundus=False
                 continue
 
-            # Image UID: use the CSV uid column directly (no dataset prefixing)
-            uid_str = (row.get(uid_col) or "").strip()
-            if not uid_str:
-                # Fallbacks if uid is missing
-                uid_str = subj_id or fundus_rel or "UNKNOWN"
+            raw_uid = (row.get(uid_col) or "").strip()
+
+            # If CSV has no ID, fallback to filename stem (canonical for folder scans) or subject
+            if not raw_uid:
+                if fundus_path:
+                    raw_uid = fundus_path.stem
+                else:
+                    raw_uid = subj_id
+
+            # Ensure prefix exists. This fixes the discrepancy between CSV-loaded
+            # and folder-scanned datasets.
+            prefix = f"{dataset}:"
+            if not raw_uid.startswith(prefix):
+                uid_str = f"{prefix}{raw_uid}"
+            else:
+                uid_str = raw_uid
+            # -------------------------------------------------------------------------
 
             img = Image.from_path(
                 image_path=fundus_path,
