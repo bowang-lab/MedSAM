@@ -45,10 +45,10 @@ echo "YOLO_DEVICES=${YOLO_DEVICES}"
 # 3. Dataset Paths
 ############################
 # Input: Parquet file containing 'split' column (train/val/test)
-SPLITS_PARQUET="/scratch/st-ipor-1/cperez/MedSAM/data/combined.parquet"
+SPLITS_PARQUET="/home/cperez67/medsam/src/image_data/parquet/combined.parquet"
 
 # Output: Where to materialize the YOLO directory (images/labels/data.yaml)
-YOLO_DS_OUT="/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS_V4_FROM_PARQUET"
+YOLO_DS_OUT="/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS_CONF_0.85_FROM_PARQUET"
 
 ############################
 # 4. Experiment Arguments
