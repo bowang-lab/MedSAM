@@ -56,7 +56,7 @@ PRED_EYEPACS="${REPO_DIR}/src/image_data/parquet/predictions/predictions_eyepacs
 YOLO_SPLIT_PARQUET="${REPO_DIR}/src/image_data/parquet/images_dev_yolo_split.parquet"
 
 # Where to save the final semi-supervised dataset
-OUT_DIR="${REPO_DIR}/src/image_data/processed_semi_supervised"
+OUT_DIR="${REPO_DIR}/src/image_data/parquet/processed_semi_supervised"
 
 ############################
 # 4. Execution
