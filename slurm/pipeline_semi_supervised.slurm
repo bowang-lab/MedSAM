@@ -71,7 +71,7 @@ OUT_YOLO_DS="${REPO_DIR}/DS/YOLO_SEMI_FINAL_CONF${CONF_PCT}"
 RUNS_ROOT="${REPO_DIR}/runs/semi_supervised_conf${CONF_PCT}"
 
 # --- Weights ---
-INIT_WEIGHTS="${REPO_DIR}/weights/yolo12x.pt"
+INIT_WEIGHTS="/home/cperez67/medsam/runs/run12/Train/Train/weights/best.pt"
 
 ############################
 # 4. Step 1: Process & Filter Predictions
