@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=YOLO_TRAIN_multi_GPU_from_parquet
+#SBATCH --job-name=YOLO_TRAIN_PARQUET
 #SBATCH --account=st-ipor-1-gpu
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
@@ -8,15 +8,15 @@
 #SBATCH --mem=160G
 #SBATCH --time=72:00:00
 #SBATCH --gpus=4
-#SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.out
-#SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.err
+#SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.out
+#SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.err
 #SBATCH --mail-user=cperez67@student.ubc.ca
 #SBATCH --mail-type=FAIL,END
 
 set -euo pipefail
 
 ############################
-# Repo / env
+# 1. Environment Setup
 ############################
 REPO_DIR="/scratch/st-ipor-1/cperez/MedSAM"
 export REPO_DIR
@@ -29,53 +29,63 @@ cd "${REPO_DIR}"
 mkdir -p "${REPO_DIR}/hpc_logs"
 
 ############################
-# FIX: define YOLO_DEVICES safely (do NOT rely on it being pre-set)
+# 2. Device Configuration
 ############################
-# Preferred source is CUDA_VISIBLE_DEVICES, which Slurm typically sets per job/step.
-# Ultralytics accepts comma-separated GPU indices, e.g. "0,1,2,3".
+# Determine GPU indices for Ultralytics (e.g., "0,1,2,3") based on Slurm allocation.
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  # If Slurm sets visibility, we just pass that list.
   YOLO_DEVICES="${CUDA_VISIBLE_DEVICES}"
 else
+  # Fallback if not explicitly set (rare in proper Slurm config)
   YOLO_DEVICES="0,1,2,3"
 fi
-export YOLO_DEVICES
 echo "YOLO_DEVICES=${YOLO_DEVICES}"
 
 ############################
-# NEW: Parquet with existing splits (train/val/test already assigned)
+# 3. Dataset Paths
 ############################
-# Point this at your saved_images.parquet (or similar) where Image.split is set.
-SPLITS_PARQUET="/scratch/st-ipor-1/cperez/MedSAM/data/combined_new.parquet"
+# Input: Parquet file containing 'split' column (train/val/test)
+SPLITS_PARQUET="/scratch/st-ipor-1/cperez/MedSAM/data/combined.parquet"
 
-# Where to CREATE the YOLO dataset from the parquet (will contain data.yaml).
-YOLO_DS_OUT="/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS_V3_FROM_PARQUET"
+# Output: Where to materialize the YOLO directory (images/labels/data.yaml)
+YOLO_DS_OUT="/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS_V4 _FROM_PARQUET"
 
 ############################
-# Experiment args
+# 4. Experiment Arguments
 ############################
+# We call the unified script with explicit stage flags.
 ARGS=(
-  --papila 0
+  # Data Source
   --splits-parquet "${SPLITS_PARQUET}"
   --yolo-out-dir "${YOLO_DS_OUT}"
   --splits-batch-size 2048
-  --yolo-device "${YOLO_DEVICES}"
+  --require-both-gt-boxes       # Filter out rows missing GT boxes
 
-  # Optional: explicitly run stages (otherwise your script's defaults apply)
-  # --create-ds
-  # --train-yolo
-  # --test-yolo
+  # Model Config
+  --yolo-device "${YOLO_DEVICES}"
+  --epochs 400
+  --batch 16                    # Batch size per GPU (effective batch = 16 * 4 = 64)
+  --imgsz 640
+
+  # Workflow Stages (Explicitly enabled)
+  --create-ds
+  --train-yolo
+  --test-yolo
 )
 
 ############################
-# Sanity checks
+# 5. Execution
 ############################
 if [[ ! -f "${SPLITS_PARQUET}" ]]; then
-  echo "[ERROR] splits parquet not found: ${SPLITS_PARQUET}" >&2
+  echo "[ERROR] Splits parquet not found: ${SPLITS_PARQUET}" >&2
   exit 2
 fi
 
-############################
-# Run
-############################
+echo "[INFO] Starting YOLO Training Pipeline from Parquet..."
+echo "[INFO] Source: ${SPLITS_PARQUET}"
+echo "[INFO] Destination: ${YOLO_DS_OUT}"
+
 srun --gpu-bind=closest --cpu-bind=cores -u \
-  python -m src.experiment_2 "${ARGS[@]}"
+  python -m src.experiment_unified "${ARGS[@]}"
+
+echo "[INFO] Job Finished"
