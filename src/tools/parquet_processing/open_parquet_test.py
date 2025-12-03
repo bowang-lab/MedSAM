@@ -13,7 +13,7 @@ from src.imgpipe.image import Image
 # =========================
 # Global configuration
 # =========================
-PARQUET_PATH = Path("/src/image_data/yolo_ds_images_dev_hpc.parquet")
+PARQUET_PATH = Path("/Users/carlosperez/PycharmProjects/MedSAM/PREDICT/DEC01_hpc/predictions_dev_fixed.parquet")
 N_PREVIEW = 3
 BATCH_SIZE = 256
 

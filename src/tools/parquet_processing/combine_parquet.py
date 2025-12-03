@@ -33,24 +33,6 @@ import pyarrow.parquet as pq
 from src.imgpipe.image import Image
 
 
-# -------------------------
-# Streaming read (rows -> Image)
-# -------------------------
-
-
-
-def iter_rows_streaming(in_path: Path, *, batch_size: int) -> Iterator[Dict[str, Any]]:
-    for f in Image.iter_parquet(in_path):
-        pf = pq.ParquetFile(str(f))
-        for rb in pf.iter_batches(batch_size=int(batch_size)):
-            for rec in rb.to_pylist():
-                yield rec
-
-
-def iter_images_streaming(in_path: Path, *, batch_size: int) -> Iterator[Image]:
-    for rec in iter_rows_streaming(in_path, batch_size=batch_size):
-        yield Image.from_dict(rec)
-
 
 # -------------------------
 # Dedup
@@ -153,7 +135,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         nonlocal n_in_a, n_in_b, n_out
 
         # A: repeat or dedup
-        for img in iter_images_streaming(args.in_a, batch_size=int(args.batch_size)):
+        for img in Image.iter_parquet(args.in_a, batch_size=int(args.batch_size)):
             n_in_a += 1
 
             if do_dedup:
@@ -170,7 +152,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 yield img
 
         # B: once, subject to dedup
-        for img in iter_images_streaming(args.in_b, batch_size=int(args.batch_size)):
+        for img in Image.iter_parquet(args.in_b, batch_size=int(args.batch_size)):
             n_in_b += 1
             if not maybe_yield(img):
                 continue
