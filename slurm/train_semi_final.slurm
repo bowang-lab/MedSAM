@@ -30,7 +30,7 @@ cd "${REPO_DIR}"
 INPUT_PARQUET="${REPO_DIR}/src/image_data/processed_semi_supervised/final_semi_supervised_dataset_85.parquet"
 
 OUT_YOLO_DS="${REPO_DIR}/DS/YOLO_SEMI_FINAL_CONF85"
-RUNS_ROOT="${REPO_DIR}/runs/semi_supervised_conf85"
+RUNS_ROOT="${REPO_DIR}/runs/semi_supervised_conf85_2"
 
 # --- CORRECT WEIGHTS HERE ---
 INIT_WEIGHTS="/home/cperez67/medsam/runs/run12/Train/Train/weights/best.pt"
