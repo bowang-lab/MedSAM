@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=process_parquet_pipeline
-#SBATCH --account=st-ipor-11
+#SBATCH --account=st-ipor-1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
