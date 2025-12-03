@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
 # File: src/tools/parquet_processing/parquet_processor.py
-"""
-A unified class for processing, merging, filtering, and summarizing Image Parquet datasets.
-This replaces standalone scripts like merge_smart.py and open_parquet_test.py with a Python API.
-
-Usage Example:
-    from src.tools.parquet_processing.parquet_processor import ParquetProcessor
-
-    # 1. Merge multiple files (first file has priority)
-    processor = ParquetProcessor()
-    processor.merge("data/primary.parquet", "data/secondary.parquet")
-
-    # 2. Filter
-    processor.filter_by_split(["train", "val"])
-    processor.filter_by_confidence(0.5)
-
-    # 3. Summarize
-    processor.summarize(check_embedded_masks=True)
-
-    # 4. Save
-    processor.save("data/final_merged.parquet")
-"""
 
 from __future__ import annotations
 
@@ -127,7 +106,7 @@ class ParquetProcessor:
                 setattr(primary, name, val_b)
 
     # =========================================================================
-    # FILTERING LOGIC
+    # FILTERING & MODIFICATION LOGIC
     # =========================================================================
 
     def filter_by_split(self, splits: Sequence[str]) -> 'ParquetProcessor':
@@ -139,6 +118,26 @@ class ParquetProcessor:
         self.images = [img for img in self.images if img.split in valid_splits]
         self._rebuild_map()
         self.logger.info(f"Filter Splits {splits}: {original_len} -> {len(self.images)} images.")
+        return self
+
+    def filter_by_dataset(self, datasets: Sequence[str], mode: str = 'include') -> 'ParquetProcessor':
+        """
+        Filter images based on their dataset name.
+        :param datasets: List of dataset names to filter.
+        :param mode: 'include' to keep only these datasets, 'exclude' to drop them.
+        """
+        original_len = len(self.images)
+        target_sets = set(datasets)
+
+        if mode == 'include':
+            self.images = [img for img in self.images if img.dataset in target_sets]
+        elif mode == 'exclude':
+            self.images = [img for img in self.images if img.dataset not in target_sets]
+        else:
+            raise ValueError(f"Invalid mode '{mode}'. Use 'include' or 'exclude'.")
+
+        self._rebuild_map()
+        self.logger.info(f"Filter Dataset ({mode} {datasets}): {original_len} -> {len(self.images)} images.")
         return self
 
     def filter_non_null_fields(self, fields: Sequence[str], mode: str = 'any') -> 'ParquetProcessor':
@@ -185,6 +184,46 @@ class ParquetProcessor:
         self.images = new_images
         self._rebuild_map()
         self.logger.info(f"Filter Confidence >={threshold}: {original_len} -> {len(self.images)} images.")
+        return self
+
+    def duplicate(self, factor: int) -> 'ParquetProcessor':
+        """
+        Duplicate the entire dataset 'factor' times.
+        e.g., factor=2 means result size is 2x original (Original + 1 copy).
+
+        UIDs of copies are modified:
+        - Original: {uid}
+        - Copy 1:   {uid}_copy_1
+        - ...
+        - Copy N:   {uid}_copy_{factor-1}
+        """
+        if factor < 1:
+            raise ValueError("Duplication factor must be >= 1.")
+        if factor == 1:
+            return self
+
+        original_len = len(self.images)
+        self.logger.info(f"Duplicating dataset by factor {factor}...")
+
+        new_images = []
+
+        for img in self.images:
+            # 1. Keep Original
+            new_images.append(img)
+
+            # 2. Create copies
+            for i in range(1, factor):
+                # Shallow copy via replace is fine for immutable Image fields,
+                # but we copy mutable extras to be safe.
+                new_uid = f"{img.uid}_copy_{i}"
+                new_extras = img.extras.copy() if img.extras else {}
+
+                copy_img = dataclasses.replace(img, uid=new_uid, extras=new_extras)
+                new_images.append(copy_img)
+
+        self.images = new_images
+        self._rebuild_map()
+        self.logger.info(f"Duplication complete: {original_len} -> {len(self.images)} images.")
         return self
 
     # =========================================================================
@@ -292,3 +331,13 @@ class ParquetProcessor:
             compression="zstd"
         )
         self.logger.info("Save complete.")
+
+
+if __name__ == "__main__":
+    # Simple CLI wrapper for testing
+    import sys
+
+    if len(sys.argv) > 1:
+        proc = ParquetProcessor()
+        proc.load(sys.argv[1])
+        proc.summarize()
