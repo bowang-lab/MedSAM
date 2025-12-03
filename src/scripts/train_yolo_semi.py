@@ -5,7 +5,7 @@ Simplified Semi-Supervised YOLO Trainer.
 Assumes input parquet is fully prepared (GTs valid, splits assigned).
 1. Reads Parquet.
 2. Materializes YOLO dataset (images/labels) based on 'split' column.
-3. Fine-tunes YOLO model.
+3. Fine-tunes YOLO model (Multi-GPU ready).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import yaml
 from ultralytics import YOLO
 
 from src.imgpipe.image import Image
+from src.utils import ultralytics_device_arg  # Helper for multi-GPU detection
 
 SEED_DEFAULT = 42
 
@@ -73,7 +74,7 @@ def materialize_image_file(img: Image, dst_img_path: Path) -> None:
         return
     src = Path(img.image_path)
     if not src.exists():
-        # Skip if source file missing (shouldn't happen if pipeline is robust)
+        # Skip if source file missing
         return
     shutil.copy2(src, dst_img_path)
 
@@ -95,7 +96,7 @@ def build_yolo_dataset_from_processed_parquet(
     for img in images:
         split = img.split
         if split not in counts:
-            continue  # Skip if split is None or invalid
+            continue
 
         # Determine extension
         ext = (img.image_path.suffix or "").lower()
@@ -111,7 +112,7 @@ def build_yolo_dataset_from_processed_parquet(
         # Write Image
         materialize_image_file(img, dst_img)
 
-        # Write Labels (Expects GT boxes to be present)
+        # Write Labels
         lines = []
         if img.gt_disc_box:
             xc, yc, w, h = img.gt_disc_box.as_tuple()
@@ -147,6 +148,7 @@ def run_train(
     run_root.mkdir(parents=True, exist_ok=False)
 
     print(f"[INFO] Loading weights for fine-tuning: {init_weights}")
+    print(f"[INFO] Target Device(s): {device}")
     model = YOLO(str(init_weights))
 
     print(f"[INFO] Starting training... Output: {run_root}")
@@ -162,6 +164,7 @@ def run_train(
         exist_ok=False,
         resume=False,
         freeze=freeze,
+        # Ultralytics DDP handles distributed training if device is a list/comma-string
     )
 
     weights_dir = run_root / "weights"
@@ -178,7 +181,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--imgsz", type=int, default=640)
-    p.add_argument("--device", type=str, default="0")
+    p.add_argument("--device", type=str, default=None, help='Device e.g. "0,1,2,3". Auto-detected if None.')
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
     return p.parse_args()
@@ -187,6 +190,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     set_global_seed(args.seed)
+
+    # Auto-detect device if not provided
+    target_device = args.device if args.device is not None else ultralytics_device_arg()
 
     print(f"[INFO] Loading Parquet: {args.images_parquet}")
     images = Image.load_parquet(args.images_parquet)
@@ -200,7 +206,7 @@ def main() -> None:
         data_yaml=data_yaml,
         runs_root=args.runs_root,
         init_weights=args.init_weights,
-        device=args.device,
+        device=target_device,
         epochs=args.epochs,
         batch=args.batch,
         imgsz=args.imgsz,

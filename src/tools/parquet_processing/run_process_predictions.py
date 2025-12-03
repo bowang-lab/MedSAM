@@ -107,7 +107,7 @@ def main() -> None:
     proc_split.summarize()
 
     # Save
-    out_path = args.out_dir / f"semi_supervised_dataset_{args.conf}.parquet"
+    out_path = args.out_dir / f"semi_supervised_dataset.parquet"
     proc_split.save(
         out_path,
         include_mask_bytes=True,
