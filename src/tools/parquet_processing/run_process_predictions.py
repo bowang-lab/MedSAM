@@ -110,7 +110,7 @@ def main() -> None:
     out_path = args.out_dir / f"semi_supervised_dataset_{args.conf}.parquet"
     proc_split.save(
         out_path,
-        include_mask_bytes=True,  # Need masks for training
+        include_mask_bytes=True,
         include_image_bytes=False
     )
 
