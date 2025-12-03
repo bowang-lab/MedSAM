@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=process_parquet_pipeline
-#SBATCH --account=st-ipor-1
+#SBATCH --account=st-ipor-11
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=60G
-#SBATCH --time=04:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.err
 #SBATCH --mail-user=cperez67@student.ubc.ca
@@ -73,7 +73,7 @@ echo "  - Dup Factor:   $DUP_FACTOR"
 mkdir -p "$OUT_DIR"
 
 srun --cpu-bind=cores -u \
-  python -m src.tools.parquet_processing.run_parquet_processing \
+  python -m src.tools.parquet_processing.process_predictions \
     --pred-dev "${PRED_DEV}" \
     --pred-eyepacs "${PRED_EYEPACS}" \
     --yolo-split "${YOLO_SPLIT_PARQUET}" \
