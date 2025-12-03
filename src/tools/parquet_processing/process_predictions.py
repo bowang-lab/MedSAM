@@ -1,22 +1,49 @@
 #!/usr/bin/env python3
-# File: src/tools/parquet_processing/process_predictions.py
+# File: src/tools/parquet_processing/run_process_predictions.py
 """
-Pipeline for Semi-Supervised Dataset Creation:
-1. PREDICTIONS: Merge Dev & Eyepacs preds -> Filter by Conf -> Promote to GT (Pseudo-labels).
+Pipeline for Semi-Supervised Dataset Creation (Memory Optimized).
+
+1. PREDICTIONS: Stream Dev & Eyepacs -> Filter by Conf ON-THE-FLY -> Promote to GT.
 2. REAL GT: Load YOLO Split -> Filter Datasets -> Duplicate Train set.
-3. MERGE: Combine Real GT (Priority) with Pseudo-labels (Append).
+3. MERGE: Combine Real GT (Priority) with Pseudo-labels.
 """
 
 import argparse
 import logging
 from pathlib import Path
+from typing import Iterator
+
+# Import Image directly for streaming
+from src.imgpipe.image import Image
 from src.tools.parquet_processing.parquet_processor import ParquetProcessor
+
+
+def iter_filtered_preds(path: Path, conf_thresh: float) -> Iterator[Image]:
+    """
+    Generator that streams images and yields only those meeting the confidence threshold.
+    This prevents loading millions of low-confidence rows into RAM.
+    """
+    logging.info(f"Streaming and filtering {path} (conf >= {conf_thresh})...")
+    for img in Image.iter_parquet(path):
+        # Check valid confidence (float and non-None)
+        d_conf = img.yolo_disc_conf
+        c_conf = img.yolo_cup_conf
+
+        # Skip if missing or below threshold
+        if d_conf is None or c_conf is None:
+            continue
+
+        try:
+            if float(d_conf) >= conf_thresh and float(c_conf) >= conf_thresh:
+                yield img
+        except (ValueError, TypeError):
+            continue
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-    parser = argparse.ArgumentParser(description="Merge and process predictions and splits.")
+    parser = argparse.ArgumentParser(description="Merge and process predictions and splits (Memory Optimized).")
 
     # Input files
     parser.add_argument("--pred-dev", type=Path, required=True, help="Path to dev predictions parquet.")
@@ -37,21 +64,25 @@ def main() -> None:
     # ---------------------------------------------------------
     # 1. Process Predictions (The Pseudo-Label Branch)
     # ---------------------------------------------------------
-    logging.info("--- Step 1: Processing Predictions ---")
+    logging.info("--- Step 1: Processing Predictions (Streaming Mode) ---")
+
+    # Initialize processor without loading data yet
     proc_preds = ParquetProcessor()
 
-    # Load and Merge Predictions
-    proc_preds.load(args.pred_dev)
-    proc_preds.merge(args.pred_eyepacs)
+    # A. Merge Dev (Priority) - Filter on load
+    # Using merge_images with a generator avoids loading the whole file first
+    proc_preds.merge_images(iter_filtered_preds(args.pred_dev, args.conf))
 
-    # Filter by Confidence
-    proc_preds.filter_by_confidence(threshold=args.conf)
+    # B. Merge Eyepacs (Append) - Filter on load
+    # This is the critical memory fix: garbage rows never touch the list
+    proc_preds.merge_images(iter_filtered_preds(args.pred_eyepacs, args.conf))
 
-    # Promote Predictions to Ground Truth (Pseudo-labeling)
+    logging.info(f"High-confidence predictions kept in memory: {len(proc_preds.images)}")
+
+    # Promote to GT
     proc_preds.promote_predictions_to_gt()
 
-    # Explicitly set these to 'train' so they can be used for training
-    # (Optional but good practice for semi-supervised logic)
+    # Explicitly set split to 'train' for these pseudo-labels
     for img in proc_preds.images:
         img.split = "train"
 
@@ -77,6 +108,11 @@ def main() -> None:
     # Merge pseudo-labels INTO the real GT processor.
     # Real GT (proc_split) takes priority in case of ID collisions.
     proc_split.merge_images(proc_preds.images)
+
+    # Clear the prediction processor to free memory immediately
+    del proc_preds
+    import gc
+    gc.collect()
 
     # Summarize final state
     proc_split.summarize()
