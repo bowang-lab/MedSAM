@@ -30,9 +30,9 @@ cd "${REPO_DIR}"
 # Configuration
 ############################
 # Adjust these input/output paths as needed
-INPUT_A_PRIMARY="/home/cperez67/medsam/src/image_data/eyepacs_images.parquet"
-INPUT_B_SECONDARY="/home/cperez67/medsam/src/image_data/images_dev.parquet"
-OUTPUT_FILE="/scratch/st-ipor-1/cperez/MedSAM/src/image_data/all_images.parquet"
+INPUT_A_PRIMARY="/home/cperez67/medsam/src/image_data/parquet/og_image/seyepacs_images.parquet"
+INPUT_B_SECONDARY="/home/cperez67/medsam/src/image_data/parquet/og_images/images_dev.parquet"
+OUTPUT_FILE="/home/cperez67/medsam/src/image_data/parquet/og_images/images.parquet"
 
 ARGS=(
   --in-a "${INPUT_A_PRIMARY}"
