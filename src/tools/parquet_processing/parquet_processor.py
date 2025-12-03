@@ -62,7 +62,6 @@ class ParquetProcessor:
               pre_filter: Optional[Callable[[Image], bool]] = None) -> 'ParquetProcessor':
         """
         Merge images from files into current state.
-        :param pre_filter: Filter applied on-the-fly during read to reduce memory usage.
         """
         for p in paths:
             self.logger.info(f"Merging data from file {p}...")
@@ -196,6 +195,15 @@ class ParquetProcessor:
         self.logger.info(f"Promoted predictions to GT for {count} images.")
         return self
 
+    def set_split_for_all(self, split: str) -> 'ParquetProcessor':
+        """
+        Forcibly set the 'split' attribute for all currently loaded images.
+        """
+        for img in self.images:
+            img.split = split
+        self.logger.info(f"Set split to '{split}' for {len(self.images)} images.")
+        return self
+
     # =========================================================================
     # SUMMARIZATION
     # =========================================================================
@@ -247,8 +255,6 @@ class ParquetProcessor:
                         new_uid = f"{img.uid}_copy_{i}"
                         # Shallow copy with modified fields
                         copy_img = dataclasses.replace(img, uid=new_uid)
-                        # Note: extras/nested mutable objects are shared by default in replace
-                        # deep copy them only if you plan to mutate them per-copy
                         if img.extras:
                             copy_img.extras = img.extras.copy()
                         yield copy_img

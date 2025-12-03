@@ -3,7 +3,7 @@
 """
 Pipeline for Semi-Supervised Dataset Creation (Memory Optimized).
 
-1. PREDICTIONS: Merge Dev & Eyepacs -> Filter by Conf ON-THE-FLY -> Promote to GT.
+1. PREDICTIONS: Stream Dev & Eyepacs -> Filter by Conf ON-THE-FLY -> Promote to GT -> Force Split='train'.
 2. REAL GT: Load YOLO Split -> Filter Datasets -> Lazy Duplicate Train set.
 3. MERGE: Combine Real GT (Priority) with Pseudo-labels.
 """
@@ -11,6 +11,9 @@ Pipeline for Semi-Supervised Dataset Creation (Memory Optimized).
 import argparse
 import logging
 from pathlib import Path
+from typing import Iterator
+
+# Import Image directly for streaming
 from src.imgpipe.image import Image
 from src.tools.parquet_processing.parquet_processor import ParquetProcessor
 
@@ -35,12 +38,19 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
     parser = argparse.ArgumentParser(description="Merge and process predictions and splits (Memory Optimized).")
-    parser.add_argument("--pred-dev", type=Path, required=True, help="Path to dev predictions.")
-    parser.add_argument("--pred-eyepacs", type=Path, required=True, help="Path to eyepacs predictions.")
-    parser.add_argument("--yolo-split", type=Path, required=True, help="Path to existing YOLO split.")
-    parser.add_argument("--out-dir", type=Path, required=True, help="Output directory.")
-    parser.add_argument("--conf", type=float, default=0.5, help="Confidence threshold.")
-    parser.add_argument("--duplication-factor", type=int, default=2, help="Factor to duplicate training data.")
+
+    # Input files
+    parser.add_argument("--pred-dev", type=Path, required=True, help="Path to dev predictions parquet.")
+    parser.add_argument("--pred-eyepacs", type=Path, required=True, help="Path to eyepacs predictions parquet.")
+    parser.add_argument("--yolo-split", type=Path, required=True, help="Path to existing YOLO split parquet.")
+
+    # Output
+    parser.add_argument("--out-dir", type=Path, required=True, help="Directory to save output files.")
+
+    # Parameters
+    parser.add_argument("--conf", type=float, default=0.5, help="Confidence threshold for predictions.")
+    parser.add_argument("--duplication-factor", type=int, default=2,
+                        help="Factor to duplicate training data (e.g., 2).")
 
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -48,23 +58,22 @@ def main() -> None:
     # ---------------------------------------------------------
     # 1. Process Predictions (The Pseudo-Label Branch)
     # ---------------------------------------------------------
-    logging.info("--- Step 1: Processing Predictions ---")
+    logging.info("--- Step 1: Processing Predictions (Streaming Mode) ---")
 
-    # Create the filter function
     conf_filter = make_conf_filter(args.conf)
-
     proc_preds = ParquetProcessor()
 
-    # Load & Filter ON INGRESS (Saves Memory)
-    proc_preds.load(args.pred_dev, pre_filter=conf_filter)
-    proc_preds.merge(args.pred_eyepacs, pre_filter=conf_filter)
+    # A. Merge Dev (Priority) - Filter on load
+    proc_preds.merge_images(Image.iter_parquet(args.pred_dev), pre_filter=conf_filter)
 
-    # Promote to GT
+    # B. Merge Eyepacs (Append) - Filter on load
+    proc_preds.merge_images(Image.iter_parquet(args.pred_eyepacs), pre_filter=conf_filter)
+
+    logging.info(f"High-confidence predictions kept in memory: {len(proc_preds.images)}")
+
+    # Promote to GT and force split to 'train'
     proc_preds.promote_predictions_to_gt()
-
-    # Set pseudo-labels to 'train'
-    for img in proc_preds.images:
-        img.split = "train"
+    proc_preds.set_split_for_all("train")  # <--- UPDATED: Ensures pseudo-labels are train set
 
     # ---------------------------------------------------------
     # 2. Process YOLO Split (The Real GT Branch)
@@ -73,30 +82,35 @@ def main() -> None:
     proc_split = ParquetProcessor()
     proc_split.load(args.yolo_split)
 
+    # Filter specific datasets
     proc_split.filter_by_dataset(["PAPILA", "GRAPE"], mode="exclude")
 
-    # Lazy Duplication (Saves Memory - copies generated at save time)
+    # Duplicate ONLY the 'train' split
     if args.duplication_factor > 1:
         proc_split.duplicate(factor=args.duplication_factor, splits=["train"])
 
     # ---------------------------------------------------------
-    # 3. Final Merge & Save
+    # 3. Final Merge
     # ---------------------------------------------------------
     logging.info("--- Step 3: Final Merge ---")
 
-    # Merge pseudo-labels (Secondary) into Real GT (Primary)
-    # Real GT takes priority on ID collision.
+    # Merge pseudo-labels INTO the real GT processor.
+    # Real GT (proc_split) takes priority in case of ID collisions.
     proc_split.merge_images(proc_preds.images)
 
-    # Free up prediction memory
+    # Clear prediction memory
     del proc_preds
+    import gc
+    gc.collect()
 
+    # Summarize final state
     proc_split.summarize()
 
-    out_path = args.out_dir / f"final_semi_supervised_dataset{args.conf}.parquet"
+    # Save
+    out_path = args.out_dir / f"semi_supervised_dataset_{args.conf}.parquet"
     proc_split.save(
         out_path,
-        include_mask_bytes=True,
+        include_mask_bytes=True,  # Need masks for training
         include_image_bytes=False
     )
 
