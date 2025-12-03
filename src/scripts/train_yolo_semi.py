@@ -2,30 +2,29 @@
 # File: src/scripts/train_yolo_semi.py
 """
 Simplified Semi-Supervised YOLO Trainer.
+Aligns with experiment.py by using the centralized YOLORunner class.
+
+Workflow:
 1. (Optional) Reads Parquet and Materializes YOLO dataset.
-2. Fine-tunes YOLO model (Multi-GPU ready).
+2. Instantiates YOLORunner (enforcing seeds, configs, and freeze settings).
+3. Fine-tunes YOLO model.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import random
 import shutil
 from pathlib import Path
 from typing import Dict, Optional
 
 import yaml
-from ultralytics import YOLO
 
 from src.imgpipe.image import Image
+from src.model.yolo import YOLORunner, set_global_seed
 from src.utils import ultralytics_device_arg
 
 SEED_DEFAULT = 42
-
-
-def set_global_seed(seed: int) -> None:
-    random.seed(seed)
 
 
 def get_next_run_name(run_root: Path, base: str = "ss") -> str:
@@ -80,6 +79,9 @@ def build_yolo_dataset_from_processed_parquet(
         images: list[Image],
         out_dir: Path,
 ) -> Path:
+    """
+    Materialize dataset assuming `img.split` and `gt_*_box` are already set.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     ensure_dirs(out_dir)
 
@@ -120,69 +122,39 @@ def build_yolo_dataset_from_processed_parquet(
     return data_yaml
 
 
-def run_train(
-        *,
-        data_yaml: Path,
-        runs_root: Path,
-        init_weights: Path,
-        device: str,
-        epochs: int,
-        batch: int,
-        imgsz: int,
-        workers: int,
-        freeze: int = 0,
-) -> Path:
-    runs_root.mkdir(parents=True, exist_ok=True)
-    run_name = get_next_run_name(runs_root, base="ss")
-    run_root = runs_root / run_name
-    run_root.mkdir(parents=True, exist_ok=False)
-
-    print(f"[INFO] Loading weights for fine-tuning: {init_weights}")
-    model = YOLO(str(init_weights))
-
-    print(f"[INFO] Starting training... Output: {run_root}")
-    model.train(
-        data=str(data_yaml),
-        project=str(runs_root),
-        name=run_name,
-        device=device,
-        epochs=epochs,
-        batch=batch,
-        imgsz=imgsz,
-        workers=workers,
-        exist_ok=False,
-        resume=False,
-        freeze=freeze,
-    )
-
-    weights_dir = run_root / "weights"
-    best_pt = weights_dir / "best.pt"
-    return best_pt if best_pt.exists() else weights_dir
-
-
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train YOLO from pre-processed semi-supervised parquet.")
+    p = argparse.ArgumentParser(description="Train YOLO from pre-processed semi-supervised parquet (using YOLORunner).")
+
+    # Dataset / IO
     p.add_argument("--images-parquet", type=Path, required=True, help="Ready-to-go parquet (splits & GT set).")
     p.add_argument("--out-yolo-ds", type=Path, required=True, help="Where to materialize dataset.")
     p.add_argument("--runs-root", type=Path, required=True, help="Where to save training runs.")
-    p.add_argument("--init-weights", type=Path, required=True, help="Pretrained weights to finetune.")
-    p.add_argument("--epochs", type=int, default=50)
+
+    # Training / Model
+    p.add_argument("--init-weights", type=Path, required=True, help="Pretrained weights to fine-tune.")
+    p.add_argument("--cfg", type=Path, default=Path("src/configs/train_custom.yaml"), help="YOLO training config file.")
+    p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--imgsz", type=int, default=640)
     p.add_argument("--device", type=str, default=None, help='Device e.g. "0,1,2,3". Auto-detected if None.')
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=SEED_DEFAULT)
+
+    # Flags
     p.add_argument("--skip-materialization", action="store_true", help="Use existing YOLO dataset if found.")
+
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # Set global seed (also done inside YOLORunner, but good to do early)
     set_global_seed(args.seed)
 
     target_device = args.device if args.device is not None else ultralytics_device_arg()
 
-    # Check if we can skip materialization
+    # 1. Prepare Dataset
     data_yaml = args.out_yolo_ds / "data.yaml"
 
     if args.skip_materialization and data_yaml.exists():
@@ -199,17 +171,46 @@ def main() -> None:
             out_dir=args.out_yolo_ds
         )
 
-    best_weights = run_train(
-        data_yaml=data_yaml,
-        runs_root=args.runs_root,
-        init_weights=args.init_weights,
+    # 2. Determine Run Name
+    # We calculate a unique name here (e.g., 'ss1', 'ss2') to keep runs organized
+    args.runs_root.mkdir(parents=True, exist_ok=True)
+    run_name = get_next_run_name(args.runs_root, base="ss")
+
+    print(f"[INFO] Initializing YOLORunner for run: {run_name}")
+    print(f"[INFO] Fine-tuning from: {args.init_weights}")
+
+    # 3. Instantiate YOLORunner
+    # This class ensures we use the exact same training logic (freeze=5, amp=False, etc.) as experiment.py
+    runner = YOLORunner(
+        data_root=args.out_yolo_ds,  # Required by init but unused when yolo_ds is passed
+        out_dir=args.out_yolo_ds,  # Dataset location
+        run_dir=args.runs_root,  # Base runs folder
+        run_name=run_name,  # Unique run name (ss1, ss2...)
+        cfg=args.cfg,  # Config file (e.g., src/configs/train_custom.yaml)
+        model=str(args.init_weights),  # Weights to load/fine-tune
         device=target_device,
         epochs=args.epochs,
         batch=args.batch,
         imgsz=args.imgsz,
-        workers=args.workers
+        # These are test-time defaults, irrelevant for training but required by __init__
+        conf=0.001,
+        iou=0.7,
+        papila=0.0,
+        seed=args.seed,
+        yolo_ds=args.out_yolo_ds  # Explicitly point to the DS we just prepared
     )
-    print(f"[OK] Training finished. Best weights: {best_weights}")
+
+    # 4. Run Training
+    # YOLORunner.train() handles:
+    # - Creating the run directory
+    # - Calling model.train(..., freeze=5, amp=False, resume=False)
+    best_weights = runner.train()
+
+    print(f"[OK] Training finished.")
+    if best_weights:
+        print(f"[OK] Best weights saved at: {best_weights}")
+    else:
+        print("[WARN] Could not resolve path to best weights.")
 
 
 if __name__ == "__main__":
