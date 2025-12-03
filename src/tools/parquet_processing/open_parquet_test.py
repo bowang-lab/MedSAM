@@ -13,7 +13,7 @@ from src.imgpipe.image import Image
 # =========================
 # Global configuration
 # =========================
-PARQUET_PATH = Path("/Users/carlosperez/PycharmProjects/MedSAM/PREDICT/DEC01_hpc/predictions_dev_fixed2.parquet")
+PARQUET_PATH = Path("/Users/carlosperez/PycharmProjects/MedSAM/OUT/combined.parquet")
 N_PREVIEW = 3
 BATCH_SIZE = 256
 

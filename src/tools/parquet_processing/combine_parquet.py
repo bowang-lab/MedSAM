@@ -166,7 +166,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         args.out,
         drop_none=False,
         include_image_bytes=False,
-        include_mask_bytes=False,
+        include_mask_bytes=True,
         compression=str(args.compression),
         write_batch=int(args.write_batch),
     )

@@ -102,13 +102,13 @@ HPC_ENV = EnvPaths(
     out_dir=HPC_REPO_DIR / "YOLO_DS_P",
     run_dir=HPC_REPO_DIR / "runs",
     cfg=HPC_REPO_DIR / "src/configs/train_custom.yaml",
-    model=HPC_REPO_DIR / "weights/yolo12x.pt",
+    model=Path("/home/cperez67/medsam/runs/run12/Train/Train/weights"),
     device="0",  # default; overridden by --yolo-device from Slurm script
     medsam_ckpt=HPC_REPO_DIR / "weights/medsam_vit_b.pth",
 )
 
 HPC_RUN = RunConfig(
-    epochs=400,
+    epochs=20,
     batch=16,
     workers=6,
     **BASE_YOLO_HP,
