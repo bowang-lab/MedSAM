@@ -30,9 +30,9 @@ mkdir -p "${REPO_DIR}/hpc_logs"
 # 2. Configuration
 ############################
 # Adjust these paths if your filenames differ
-DEV_SPLIT_PARQUET="/home/cperez67/medsam/DS/YOLO_DS/saved_images.parquet"
+DEV_SPLIT_PARQUET="/home/cperez67/medsam/src/image_data/parquet/images_dev_yolo_split.parquet"
 DEV_BASE_PARQUET="/home/cperez67/medsam/src/image_data/parquet/og_images/images_dev.parquet"
-EYEPACS_PARQUET="/home/cperez67/medsam/src/image_data/parquet/og_images/eyepacs_images.parquet"
+EYEPACS_PARQUET="/home/cperez67/medsam/src/image_data/parquet/og_images/images_eyepacs.parquet"
 
 # Output path
 OUTPUT_PARQUET="/home/cperez67/medsam/src/image_data/parquet/og_images/combined_dataset.parquet"
