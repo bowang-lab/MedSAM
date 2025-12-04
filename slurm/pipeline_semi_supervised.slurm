@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=PIPE_SEMI_SUPERVISED
+#SBATCH --job-name=PIPE_SEMI_SUPERVISED_DUP3
 #SBATCH --account=st-ipor-1-gpu
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
