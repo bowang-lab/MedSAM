@@ -32,7 +32,7 @@ mkdir -p "${REPO_DIR}/hpc_logs"
 # 2. Arguments & Defaults
 ############################
 # Default Confidence Threshold (can be overridden via CLI: --conf=0.85)
-CONF_THRESH=0.75
+CONF_THRESH=0.85
 DUP_FACTOR=3
 
 # Parse command line arguments
