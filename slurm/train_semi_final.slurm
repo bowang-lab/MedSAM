@@ -5,9 +5,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --mem=64G
-#SBATCH --time=8:00:00
-#SBATCH --gpus=2
+#SBATCH --mem=100G
+#SBATCH --time=24:00:00
+#SBATCH --gpus=4
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.err
 #SBATCH --mail-user=cperez67@student.ubc.ca
@@ -55,7 +55,7 @@ srun --gpu-bind=closest --cpu-bind=cores -u \
     --runs-root "${RUNS_ROOT}" \
     --init-weights "${INIT_WEIGHTS}" \
     --device "${YOLO_DEVICES}" \
-    --epochs 30 \
+    --epochs 50 \
     --batch 16 \
     --workers 16 \
     --skip-materialization
