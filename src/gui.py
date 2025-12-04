@@ -8,20 +8,13 @@ Features
 - Show counts: total, has predictions, has GT.
 - Dataset + split filtering.
 - Confidence filtering (disc / cup / both).
-- Aggregate metrics on filtered set:
-    * mean Dice (disc/cup)
-    * CDR MAE (from gt_cdr/pred_cdr when present)
-    * RDR MAE (from gt_rdr/pred_rdr when present)
-    * optional "slow" metrics that load masks from disk and compute metrics_summary() MAEs
-- Per-image table with sortable columns + per-image viewer:
-    * fundus image
-    * GT/pred masks (if path-based and accessible)
-    * overlay via Image.visualize
-    * per-image metrics (stored + optional recompute)
+- Aggregate metrics on filtered set.
+- Visual Analysis: Histograms and Confidence vs Performance plots.
+- Per-image table with sortable columns + per-image viewer with overlays.
 
 Run
   pip install streamlit pandas pyarrow pillow matplotlib numpy
-  streamlit run src/tools/guid.py
+  streamlit run src/scripts/parquet_explorer_app.py
 """
 
 from __future__ import annotations
@@ -30,8 +23,9 @@ import math
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -167,7 +161,8 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["has_any_pred"] = out["has_pred"] | out["has_yolo_boxes"]
 
     # numeric normalization
-    for c in ("yolo_disc_conf", "yolo_cup_conf", "mask_dice_disc", "mask_dice_cup", "gt_cdr", "pred_cdr", "gt_rdr", "pred_rdr"):
+    for c in (
+    "yolo_disc_conf", "yolo_cup_conf", "mask_dice_disc", "mask_dice_cup", "gt_cdr", "pred_cdr", "gt_rdr", "pred_rdr"):
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
@@ -304,10 +299,14 @@ def render_image_viewer(rec: Dict[str, Any], *, old_prefix: str, new_prefix: str
 
     # Show stored per-row metrics
     cols = st.columns(4)
-    cols[0].metric("Dice (Disc)", f"{_safe_float(rec.get('mask_dice_disc')):.3f}" if _is_finite(rec.get("mask_dice_disc")) else "NA")
-    cols[1].metric("Dice (Cup)", f"{_safe_float(rec.get('mask_dice_cup')):.3f}" if _is_finite(rec.get("mask_dice_cup")) else "NA")
-    cols[2].metric("YOLO conf (Disc)", f"{_safe_float(rec.get('yolo_disc_conf')):.3f}" if _is_finite(rec.get("yolo_disc_conf")) else "NA")
-    cols[3].metric("YOLO conf (Cup)", f"{_safe_float(rec.get('yolo_cup_conf')):.3f}" if _is_finite(rec.get("yolo_cup_conf")) else "NA")
+    cols[0].metric("Dice (Disc)",
+                   f"{_safe_float(rec.get('mask_dice_disc')):.3f}" if _is_finite(rec.get("mask_dice_disc")) else "NA")
+    cols[1].metric("Dice (Cup)",
+                   f"{_safe_float(rec.get('mask_dice_cup')):.3f}" if _is_finite(rec.get("mask_dice_cup")) else "NA")
+    cols[2].metric("YOLO conf (Disc)",
+                   f"{_safe_float(rec.get('yolo_disc_conf')):.3f}" if _is_finite(rec.get("yolo_disc_conf")) else "NA")
+    cols[3].metric("YOLO conf (Cup)",
+                   f"{_safe_float(rec.get('yolo_cup_conf')):.3f}" if _is_finite(rec.get("yolo_cup_conf")) else "NA")
 
     cols2 = st.columns(4)
     cols2[0].metric("GT CDR", f"{_safe_float(rec.get('gt_cdr')):.3f}" if _is_finite(rec.get("gt_cdr")) else "NA")
@@ -351,7 +350,8 @@ def render_image_viewer(rec: Dict[str, Any], *, old_prefix: str, new_prefix: str
         try:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
                 tmp_png = f.name
-            img_obj.visualize(show=False, save_path=Path(tmp_png), dpi=140, mask_alpha=0.7, show_metrics=True, show_conf=True)
+            img_obj.visualize(show=False, save_path=Path(tmp_png), dpi=140, mask_alpha=0.7, show_metrics=True,
+                              show_conf=True)
             st.image(tmp_png, caption="Overlay", use_container_width=True)
         except Exception as e:
             st.warning(f"Overlay failed: {e!r}")
@@ -378,6 +378,110 @@ def render_image_viewer(rec: Dict[str, Any], *, old_prefix: str, new_prefix: str
             st.json(img_obj.metrics_summary())
         except Exception as e:
             st.error(f"metrics_summary failed: {e!r}")
+
+
+def render_histograms(df: pd.DataFrame) -> None:
+    """
+    Render distribution plots and confidence analysis charts.
+    """
+    st.subheader("Visual Analysis")
+
+    tab1, tab2 = st.tabs(["Distributions (Histograms)", "Confidence vs Performance"])
+
+    # --- TAB 1: Histograms ---
+    with tab1:
+        # Available numeric metrics
+        all_cols = [
+            "mask_dice_disc", "mask_dice_cup",
+            "yolo_disc_conf", "yolo_cup_conf",
+            "cdr_abs_err", "rdr_abs_err",
+            "gt_cdr", "pred_cdr"
+        ]
+        available = [c for c in all_cols if c in df.columns]
+
+        selected_metrics = st.multiselect(
+            "Select metrics",
+            options=available,
+            default=["mask_dice_disc", "mask_dice_cup"] if "mask_dice_disc" in available else available[:2]
+        )
+
+        bins = st.slider("Bins", min_value=5, max_value=100, value=30, key="hist_bins")
+
+        if selected_metrics:
+            # Arrange plots in a grid
+            cols = st.columns(min(len(selected_metrics), 2))
+            for i, metric in enumerate(selected_metrics):
+                with cols[i % 2]:
+                    data = df[metric].dropna()
+                    if len(data) == 0:
+                        st.warning(f"No valid data for {metric}")
+                        continue
+
+                    fig, ax = plt.subplots(figsize=(6, 4))
+                    ax.hist(data, bins=bins, edgecolor="black", alpha=0.7)
+                    ax.set_title(f"{metric} (N={len(data)})")
+                    ax.set_ylabel("Count")
+
+                    # Mean Line
+                    mean_val = data.mean()
+                    ax.axvline(mean_val, color='red', linestyle='--', label=f"Mean: {mean_val:.3f}")
+                    ax.legend()
+
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+    # --- TAB 2: Confidence Analysis ---
+    with tab2:
+        st.write("Analyze how performance metrics change across confidence levels.")
+
+        c1, c2, c3 = st.columns(3)
+        x_metric = c1.selectbox("X Axis (Confidence)", ["yolo_disc_conf", "yolo_cup_conf"], index=0)
+        y_metric = c2.selectbox("Y Axis (Metric)", ["mask_dice_disc", "mask_dice_cup", "cdr_abs_err"], index=0)
+        n_bins = c3.slider("Number of Bins", 5, 50, 10, key="conf_bins")
+
+        if x_metric in df.columns and y_metric in df.columns:
+            df_plot = df[[x_metric, y_metric]].dropna()
+
+            if len(df_plot) > 0:
+                # Bin the data
+                bins_edges = np.linspace(0, 1.0, n_bins + 1)
+                df_plot['bin'] = pd.cut(df_plot[x_metric], bins=bins_edges, include_lowest=True)
+
+                # Calculate stats per bin
+                grouped = df_plot.groupby('bin', observed=False)[y_metric].agg(['mean', 'count']).reset_index()
+
+                # Prepare plotting data
+                x_centers = (bins_edges[:-1] + bins_edges[1:]) / 2
+                counts = grouped['count'].fillna(0).values
+                means = grouped['mean'].fillna(0).values  # Fill NaN means with 0 for plotting
+
+                # Create Dual-Axis Plot
+                fig, ax1 = plt.subplots(figsize=(8, 5))
+
+                # Bar plot for Counts (Left Axis)
+                ax1.bar(x_centers, counts, width=1.0 / n_bins * 0.8, alpha=0.4, color='gray', label='Count')
+                ax1.set_xlabel(f"{x_metric} (Bins)")
+                ax1.set_ylabel("Sample Count", color='gray')
+                ax1.tick_params(axis='y', labelcolor='gray')
+                ax1.set_xlim(0, 1.0)
+
+                # Line plot for Metric Mean (Right Axis)
+                ax2 = ax1.twinx()
+                ax2.plot(x_centers, means, color='blue', marker='o', linewidth=2, label=f"Avg {y_metric}")
+                ax2.set_ylabel(f"Average {y_metric}", color='blue')
+                ax2.tick_params(axis='y', labelcolor='blue')
+
+                # Legend and Layout
+                lines1, labels1 = ax1.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+
+                st.pyplot(fig)
+                plt.close(fig)
+            else:
+                st.warning("No overlapping valid data for these metrics.")
+        else:
+            st.info("Selected metrics not available in this parquet.")
 
 
 # -------------------------
@@ -464,6 +568,9 @@ c4.metric("With ground truth", f"{int(df_f['has_gt'].sum()):,}" if "has_gt" in d
 st.subheader("Aggregate metrics (filtered)")
 agg = compute_fast_aggregates(df_f)
 st.write({k: v for k, v in agg.items()})
+
+# Render the new histograms section
+render_histograms(df_f)
 
 if enable_slow:
     with st.spinner("Computing slow metrics (loading masks)..."):
