@@ -14,7 +14,7 @@
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/src/scripts/predict_summarize.py" />
-    <option name="PARAMETERS" value="--images-parquet $PROJECT_DIR$/DS/GRAPE_PAPILA/saved_images.parquet --yolo-weights $PROJECT_DIR$/work_dir/YOLO/ss_epoch12_conf85.pt --medsam-checkpoint $PROJECT_DIR$/work_dir/MedSAM/medsam_updatedV2.pth --splits test --device mps --out-dir $PROJECT_DIR$/PREDICT/YOLO_PSEUDO85_epoch12_ON_EXTERNAL_medsamv2 --mask-store parquet --sam-no-amp --resume --force-recompute" />
+    <option name="PARAMETERS" value="--images-parquet $PROJECT_DIR$/DS/GRAPE_PAPILA/saved_images.parquet --yolo-weights $PROJECT_DIR$/work_dir/YOLO/ss_dup3_epoch21.pt --medsam-checkpoint $PROJECT_DIR$/work_dir/MedSAM/medsam_updatedV2.pth --splits test --device mps --out-dir $PROJECT_DIR$/PREDICT/YOLO_PSEUDO_85_dup3_epoch21_EXTERNAL_medsamv2 --mask-store parquet --sam-no-amp --resume --force-recompute" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="false" />
     <option name="MODULE_MODE" value="false" />

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# src/scripts/parquet_explorer_app.py
+# src/scripts/gui.py
 """
 Parquet Explorer GUI (Streamlit)
 
@@ -14,7 +14,7 @@ Features
 
 Run
   pip install streamlit pandas pyarrow pillow matplotlib numpy
-  streamlit run src/scripts/parquet_explorer_app.py
+  streamlit run src/gui.py
 """
 
 from __future__ import annotations
@@ -283,21 +283,13 @@ def render_image_viewer(rec: Dict[str, Any], *, old_prefix: str, new_prefix: str
         }
     )
 
-    # Build Image object (for advanced viewing / overlay)
     img_obj: Optional[Image] = None
     try:
         img_obj = Image.from_dict(rec)
     except Exception as e:
         st.error(f"Failed to construct Image.from_dict for this row: {e!r}")
 
-    # Show fundus image if accessible
-    img_path = rec.get("image_path")
-    if img_path and Path(str(img_path)).exists():
-        st.image(str(img_path), caption=f"Fundus: {Path(str(img_path)).name}", use_container_width=True)
-    else:
-        st.info("Fundus image_path not found on disk (path mapping may be required).")
-
-    # Show stored per-row metrics
+    # Metric Columns
     cols = st.columns(4)
     cols[0].metric("Dice (Disc)",
                    f"{_safe_float(rec.get('mask_dice_disc')):.3f}" if _is_finite(rec.get("mask_dice_disc")) else "NA")
@@ -308,51 +300,35 @@ def render_image_viewer(rec: Dict[str, Any], *, old_prefix: str, new_prefix: str
     cols[3].metric("YOLO conf (Cup)",
                    f"{_safe_float(rec.get('yolo_cup_conf')):.3f}" if _is_finite(rec.get("yolo_cup_conf")) else "NA")
 
-    cols2 = st.columns(4)
-    cols2[0].metric("GT CDR", f"{_safe_float(rec.get('gt_cdr')):.3f}" if _is_finite(rec.get("gt_cdr")) else "NA")
-    cols2[1].metric("Pred CDR", f"{_safe_float(rec.get('pred_cdr')):.3f}" if _is_finite(rec.get("pred_cdr")) else "NA")
-    cols2[2].metric("GT RDR", f"{_safe_float(rec.get('gt_rdr')):.3f}" if _is_finite(rec.get("gt_rdr")) else "NA")
-    cols2[3].metric("Pred RDR", f"{_safe_float(rec.get('pred_rdr')):.3f}" if _is_finite(rec.get("pred_rdr")) else "NA")
-
-    # Masks + overlay
     if img_obj is None:
         return
 
-    show_masks = st.checkbox("Show GT/pred masks (loads mask files from disk)", value=False)
-    show_overlay = st.checkbox("Show overlay (Image.visualize)", value=True)
+    # --- Visualization Controls ---
+    st.markdown("### Visualization Settings")
+    c_ctrl1, c_ctrl2, c_ctrl3 = st.columns(3)
+    show_overlay = c_ctrl1.checkbox("Show Overlay", value=True)
+    show_boxes = c_ctrl2.checkbox("Show Boxes", value=True)
+    show_orig = c_ctrl3.checkbox("Show Original Image Panel", value=False)
 
-    if show_masks:
-        # Load and display masks if paths exist
-        def _mask_panel(label: str, mref_attr: str):
-            mref = getattr(img_obj, mref_attr, None)
-            if mref is None:
-                st.write(f"{label}: None")
-                return
-            try:
-                arr = img_obj._mask_to_image_size(mref)  # type: ignore[attr-defined]
-            except Exception:
-                arr = None
-            if arr is None:
-                st.write(f"{label}: could not load/align")
-                return
-            st.image((arr.astype(np.uint8) * 255), caption=label, clamp=True, use_container_width=True)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            _mask_panel("GT Disc mask", "gt_disc_mask")
-            _mask_panel("Pred Disc mask", "pred_disc_mask")
-        with c2:
-            _mask_panel("GT Cup mask", "gt_cup_mask")
-            _mask_panel("Pred Cup mask", "pred_cup_mask")
-
+    # --- Render Overlay ---
     if show_overlay:
         tmp_png = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
                 tmp_png = f.name
-            img_obj.visualize(show=False, save_path=Path(tmp_png), dpi=140, mask_alpha=0.7, show_metrics=True,
-                              show_conf=True)
-            st.image(tmp_png, caption="Overlay", use_container_width=True)
+
+            # Pass new toggles to visualize
+            img_obj.visualize(
+                show=False,
+                save_path=Path(tmp_png),
+                dpi=150,
+                mask_alpha=0.6,
+                show_metrics=False,
+                show_conf=False,
+                show_boxes=show_boxes,  # <--- Linked to checkbox
+                show_original_image=show_orig  # <--- Linked to checkbox
+            )
+            st.image(tmp_png, caption="Visualization", use_container_width=True)
         except Exception as e:
             st.warning(f"Overlay failed: {e!r}")
         finally:
@@ -365,20 +341,6 @@ def render_image_viewer(rec: Dict[str, Any], *, old_prefix: str, new_prefix: str
                     Path(tmp_png).unlink(missing_ok=True)
                 except Exception:
                     pass
-
-    if st.button("Recompute Dice for this image (loads mask files)"):
-        try:
-            img_obj.update_mask_dice(fallback_to_boxes=True)
-            st.write({"mask_dice_disc": img_obj.mask_dice_disc, "mask_dice_cup": img_obj.mask_dice_cup})
-        except Exception as e:
-            st.error(f"Failed to recompute dice: {e!r}")
-
-    if st.button("Compute metrics_summary() for this image (slow; loads masks)"):
-        try:
-            st.json(img_obj.metrics_summary())
-        except Exception as e:
-            st.error(f"metrics_summary failed: {e!r}")
-
 
 def render_histograms(df: pd.DataFrame) -> None:
     """

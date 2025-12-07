@@ -55,7 +55,7 @@ srun --gpu-bind=closest --cpu-bind=cores -u \
     --runs-root "${RUNS_ROOT}" \
     --init-weights "${INIT_WEIGHTS}" \
     --device "${YOLO_DEVICES}" \
-    --epochs 50 \
+    --epochs 400 \
     --batch 16 \
     --workers 16 \
     --skip-materialization

@@ -567,18 +567,18 @@ class Image:
             out["pred"].update(pr_r)
         return out
 
-    # ----------------- visualization -----------------
-
     def visualize(
-        self,
-        *,
-        show: bool = True,
-        save_path: Optional[Path] = None,
-        dpi: int = 150,
-        figsize: Tuple[int, int] = (14, 6),
-        mask_alpha: float = 0.35,
-        show_metrics: bool = True,
-        show_conf: bool = True,
+            self,
+            *,
+            show: bool = True,
+            save_path: Optional[Path] = None,
+            dpi: int = 150,
+            figsize: Tuple[int, int] = (14, 6),
+            mask_alpha: float = 0.35,
+            show_metrics: bool = True,
+            show_conf: bool = True,
+            show_boxes: bool = True,
+            show_original_image: bool = False
     ) -> None:
         img = self.image
         W, H = img.size
@@ -606,33 +606,42 @@ class Image:
 
         has_gt = (gt_disc_m is not None) or (gt_cup_m is not None)
         has_pred = (
-            (pred_disc_m is not None)
-            or (pred_cup_m is not None)
-            or (self.inter_pred_disc_box is not None)
-            or (self.inter_pred_cup_box is not None)
+                (pred_disc_m is not None)
+                or (pred_cup_m is not None)
+                or (self.inter_pred_disc_box is not None)
+                or (self.inter_pred_cup_box is not None)
         )
 
-        if not has_gt and not has_pred:
-            fig, ax = plt.subplots(1, 1, figsize=(figsize[0] / 2, figsize[1]), dpi=dpi)
-            ax.imshow(img, origin="upper")
-            ax.set_axis_off()
-            if save_path is not None:
-                Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-                fig.savefig(str(save_path), bbox_inches="tight", dpi=dpi)
-            if show:
-                plt.show()
-            else:
-                plt.close(fig)
-            return
-
         panels: List[Tuple[str, Dict[str, Any]]] = []
+
+        # 1. Optional Original Image Panel
+        if show_original_image:
+            panels.append(
+                (
+                    "Original",
+                    {
+                        "disc_m": None, "cup_m": None,
+                        "disc_box": None, "cup_box": None,
+                        "use_pred": False, "is_original": True
+                    }
+                )
+            )
+
+        # 2. Ground Truth Panel
         if has_gt:
             panels.append(
                 (
                     "Ground Truth",
-                    {"disc_m": gt_disc_m, "cup_m": gt_cup_m, "disc_box": None, "cup_box": None, "use_pred": False},
+                    {
+                        "disc_m": gt_disc_m, "cup_m": gt_cup_m,
+                        "disc_box": self.gt_disc_box,
+                        "cup_box": self.gt_cup_box,
+                        "use_pred": False, "is_original": False
+                    },
                 )
             )
+
+        # 3. Predictions Panel
         if has_pred:
             panels.append(
                 (
@@ -642,18 +651,29 @@ class Image:
                         "cup_m": pred_cup_m,
                         "disc_box": self.inter_pred_disc_box,
                         "cup_box": self.inter_pred_cup_box,
-                        "use_pred": True,
+                        "use_pred": True, "is_original": False
                     },
                 )
             )
 
+        if not panels:
+            panels.append(("Image",
+                           {"disc_m": None, "cup_m": None, "disc_box": None, "cup_box": None, "use_pred": False,
+                            "is_original": True}))
+
         ncols = len(panels)
+        panel_width = figsize[0] / 2
+        plot_width = panel_width * ncols
+        plot_height = figsize[1]
+
+        # UPDATE: gridspec_kw used to reduce whitespace (wspace=0.02)
         fig, axes = plt.subplots(
             nrows=1,
             ncols=ncols,
-            figsize=figsize if ncols == 2 else (figsize[0] / 2, figsize[1]),
+            figsize=(plot_width, plot_height),
             dpi=dpi,
             squeeze=False,
+            gridspec_kw={"wspace": 0.02, "hspace": 0}
         )
 
         fig.suptitle(f"{self.dataset} / {self.patient_id} — {self.image_path.name}", fontsize=12)
@@ -671,13 +691,17 @@ class Image:
             ax.set_axis_off()
             ax.set_title(title, fontsize=11)
 
+            if dct.get("is_original"):
+                continue
+
             if dct["disc_m"] is not None:
                 _draw_mask(ax, dct["disc_m"], disc_color_mask, mask_alpha)
             if dct["cup_m"] is not None:
                 _draw_mask(ax, dct["cup_m"], cup_color_mask, mask_alpha)
 
-            _draw_nbox(ax, dct["disc_box"], disc_color_box, ls="-", lw=2.0)
-            _draw_nbox(ax, dct["cup_box"], cup_color_box, ls="--", lw=2.0)
+            if show_boxes:
+                _draw_nbox(ax, dct["disc_box"], disc_color_box, ls="-", lw=2.0)
+                _draw_nbox(ax, dct["cup_box"], cup_color_box, ls="--", lw=2.0)
 
             if show_metrics or show_conf:
                 use_pred = bool(dct["use_pred"])
@@ -685,69 +709,49 @@ class Image:
 
                 if show_metrics:
                     cdr_v = self.cdr(use_pred=use_pred, axis="vertical")
-                    cdr_h = self.cdr(use_pred=use_pred, axis="horizontal")
                     rims = self.rim_metrics(use_pred=use_pred)
 
                     if use_pred:
                         if self.mask_dice_disc is not None:
-                            lines.append(f"Dice (Disc): {self.mask_dice_disc:.3f}")
+                            lines.append(f"Dice(D): {self.mask_dice_disc:.2f}")
                         if self.mask_dice_cup is not None:
-                            lines.append(f"Dice (Cup):  {self.mask_dice_cup:.3f}")
+                            lines.append(f"Dice(C): {self.mask_dice_cup:.2f}")
 
                     if cdr_v is not None:
-                        lines.append(f"CDR (V): {cdr_v:.3f}")
-                    if cdr_h is not None:
-                        lines.append(f"CDR (H): {cdr_h:.3f}")
+                        lines.append(f"CDR(V): {cdr_v:.2f}")
                     if rims is not None:
                         if np.isfinite(rims.get("rim_over_disc", np.nan)):
-                            lines.append(f"R/D: {rims['rim_over_disc']:.3f}")
-                        if np.isfinite(rims.get("I_over_S", np.nan)):
-                            lines.append(f"I/S: {rims['I_over_S']:.3f}")
-                        ion = rims.get("I_over_N")
-                        iot = rims.get("I_over_T")
-                        if ion is not None and np.isfinite(ion):
-                            lines.append(f"I/N: {ion:.3f}")
-                        if iot is not None and np.isfinite(iot):
-                            lines.append(f"I/T: {iot:.3f}")
+                            lines.append(f"R/D: {rims['rim_over_disc']:.2f}")
 
                 if show_conf and dct["use_pred"]:
-                    if lines:
-                        lines.append("")
+                    if lines: lines.append("")
                     if self.yolo_disc_conf is not None:
-                        lines.append(f"YOLO conf (Disc): {self.yolo_disc_conf:.3f}")
+                        lines.append(f"Conf(D): {self.yolo_disc_conf:.2f}")
                     if self.yolo_cup_conf is not None:
-                        lines.append(f"YOLO conf (Cup):  {self.yolo_cup_conf:.3f}")
-                    if self.sam_disc_conf is not None:
-                        lines.append(f"MedSAM conf (Disc): {self.sam_disc_conf:.3f}")
-                    if self.sam_cup_conf is not None:
-                        lines.append(f"MedSAM conf (Cup):  {self.sam_cup_conf:.3f}")
+                        lines.append(f"Conf(C): {self.yolo_cup_conf:.2f}")
 
                 if lines:
                     ax.text(
-                        0.02,
-                        0.02,
-                        "\n".join(lines),
-                        transform=ax.transAxes,
-                        fontsize=9,
-                        va="top",
-                        ha="left",
+                        0.02, 0.02, "\n".join(lines),
+                        transform=ax.transAxes, fontsize=9, va="top", ha="left",
                         color="white",
                         bbox=dict(facecolor="black", alpha=0.35, boxstyle="round,pad=0.3", edgecolor="none"),
                     )
 
             handles: List[Any] = []
-            if (dct["disc_m"] is not None) or (dct["disc_box"] is not None):
+            if (dct["disc_m"] is not None) or (dct["disc_box"] is not None and show_boxes):
                 handles.append(plt.Line2D([0], [0], color=disc_color_box, lw=2, linestyle="-", label="Disc"))
-            if (dct["cup_m"] is not None) or (dct["cup_box"] is not None):
+            if (dct["cup_m"] is not None) or (dct["cup_box"] is not None and show_boxes):
                 handles.append(plt.Line2D([0], [0], color=cup_color_box, lw=2, linestyle="--", label="Cup"))
             if handles:
-                ax.legend(handles=handles, loc="lower right", fontsize=9, frameon=True)
+                ax.legend(handles=handles, loc="lower right", fontsize=8, frameon=True)
 
-        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        # Tighter layout logic
+        fig.subplots_adjust(left=0.01, right=0.99, top=0.92, bottom=0.01, wspace=0.02)
 
         if save_path is not None:
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(str(save_path), bbox_inches="tight", dpi=dpi)
+            fig.savefig(str(save_path), bbox_inches="tight", dpi=dpi, pad_inches=0.05)
 
         if show:
             plt.show()
