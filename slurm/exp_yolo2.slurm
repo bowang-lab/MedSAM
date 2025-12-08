@@ -63,7 +63,7 @@ ARGS=(
 
   # Model Config
   --yolo-device "${YOLO_DEVICES}"
-  --epochs 400
+  --epochs 800
   --batch 16                    # Batch size per GPU (effective batch = 16 * 4 = 64)
   --imgsz 640
 
