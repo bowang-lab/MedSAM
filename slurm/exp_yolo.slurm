@@ -48,7 +48,7 @@ echo "YOLO_DEVICES=${YOLO_DEVICES}"
 ############################
 ARGS=(
   --papila 0
-  --yolo-out-dir "/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS"
+  --yolo-out-dir "/scratch/st-ipor-1/cperez/MedSAM/DS/Stage_Two_YOLO_DS"
   --yolo-device "${YOLO_DEVICES}"
   --create-ds
 )
