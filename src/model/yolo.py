@@ -83,12 +83,12 @@ def scan_filter(data_root: Path, out_dir: Path, papila: float):
     image_factory.filter_empty_masks()
     print(image_factory.summary())
 
-    if papila == 1:
-        image_factory.filter_datasets(include=["PAPILA", "GRAPE"])
-    elif papila == 0:
-        image_factory.filter_datasets(exclude=["PAPILA", "GRAPE"])
-    else:
-        excluded_papila = image_factory.retain_percentage_in_dataset("PAPILA", papila)
+    # if papila == 1:
+    #     image_factory.filter_datasets(include=["PAPILA", "GRAPE"])
+    # elif papila == 0:
+    #     image_factory.filter_datasets(exclude=["PAPILA", "GRAPE"])
+    # else:
+    #     excluded_papila = image_factory.retain_percentage_in_dataset("PAPILA", papila)
 
     images = image_factory.make_images()
     out_dir.mkdir(parents=True, exist_ok=True)
