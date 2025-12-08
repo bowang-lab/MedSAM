@@ -33,7 +33,7 @@ OUT_YOLO_DS="${REPO_DIR}/DS/YOLO_SEMI_FINAL_CONF85"
 RUNS_ROOT="${REPO_DIR}/runs/semi_supervised_conf85_2"
 
 # --- CORRECT WEIGHTS HERE ---
-INIT_WEIGHTS="/home/cperez67/medsam/runs/run12/Train/Train/weights/best.pt"
+INIT_WEIGHTS="/scratch/st-ipor-1/cperez/MedSAM/runs/semi_supervised_conf85_2/ss3/Train/Train/weights/best.pt"
 
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   YOLO_DEVICES="${CUDA_VISIBLE_DEVICES}"
@@ -55,7 +55,7 @@ srun --gpu-bind=closest --cpu-bind=cores -u \
     --runs-root "${RUNS_ROOT}" \
     --init-weights "${INIT_WEIGHTS}" \
     --device "${YOLO_DEVICES}" \
-    --epochs 400 \
+    --epochs 300 \
     --batch 16 \
     --workers 16 \
     --skip-materialization
