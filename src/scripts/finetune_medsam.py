@@ -26,29 +26,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from tqdm import tqdm
 
 # Project imports
 from src.imgpipe.image_factory import ImageFactory
 from src.imgpipe.image import Image as IMG
 from src.imgpipe.normalized_box import NormalizedBox
-from src.imgpipe.enums import Structure, LabelType  # expects Structure.DISC/CUP, LabelType.GT/PRED
-
-try:
-    from ultralytics import YOLO
-except Exception as _e:
-    YOLO = None
-    _YOLO_ERR = _e
+from src.imgpipe.enums import Structure, LabelType
+import src.training_utils as tu  # Shared training utilities
+from src.model.predictor import YoloPredictor, YoloPredictorConfig, _ultralytics_device_str  # Re-use your predictor
 
 try:
     from segment_anything import sam_model_registry
 except Exception as _e:
     sam_model_registry = None
     _SAM_ERR = _e
-
-try:
-    import yaml  # for YOLO data.yaml
-except Exception:
-    yaml = None
 
 try:
     import cv2
@@ -87,16 +79,10 @@ DEFAULT_PAD_JITTER = 0.30
 DEFAULT_BOX_TR = 0.05
 DEFAULT_BOX_SC = 0.10
 
-_IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-
-PIXEL_MEAN = torch.tensor([123.675, 116.280, 103.530]).view(3, 1, 1)
-PIXEL_STD = torch.tensor([58.395, 57.120, 57.375]).view(3, 1, 1)
-
 
 # =========================================================
 # Small utils
 # =========================================================
-# Import centralized seed function from utils
 from src.utils import set_global_seed
 
 
@@ -106,24 +92,6 @@ def _ensure_sam_available():
             f"segment-anything not available: {_SAM_ERR!r}. "
             "Install: pip install git+https://github.com/facebookresearch/segment-anything.git"
         )
-
-
-def _ensure_yolo_available():
-    if YOLO is None:
-        raise RuntimeError(
-            f"Ultralytics YOLO not available: {_YOLO_ERR!r}. "
-            "Install: pip install ultralytics"
-        )
-
-
-def _to_device(x: Any, device: torch.device) -> Any:
-    if isinstance(x, torch.Tensor):
-        return x.to(device, non_blocking=True)
-    if isinstance(x, (list, tuple)):
-        return type(x)(_to_device(t, device) for t in x)
-    if isinstance(x, dict):
-        return {k: _to_device(v, device) for k, v in x.items()}
-    return x
 
 
 # =========================================================
@@ -187,45 +155,6 @@ class DistributedContext:
 
 
 # =========================================================
-# YOLO split helpers
-# =========================================================
-def _parse_data_yaml(yaml_path: Path) -> Dict[str, str]:
-    if not yaml_path.exists():
-        raise FileNotFoundError(f"data.yaml not found: {yaml_path}")
-    if yaml is not None:
-        obj = yaml.safe_load(yaml_path.read_text())
-        return {k: str(obj.get(k)) for k in ("train", "val", "test") if k in obj}
-    # fallback
-    lines = [ln.strip() for ln in yaml_path.read_text().splitlines()]
-    out: Dict[str, str] = {}
-    for ln in lines:
-        if not ln or ln.startswith("#"):
-            continue
-        if ln.startswith("train:"):
-            out["train"] = ln.split(":", 1)[1].strip()
-        if ln.startswith("val:"):
-            out["val"] = ln.split(":", 1)[1].strip()
-        if ln.startswith("test:"):
-            out["test"] = ln.split(":", 1)[1].strip()
-    return out
-
-
-def _read_list(p: Path) -> List[Path]:
-    return [Path(ln.strip()) for ln in p.read_text().splitlines() if ln.strip()]
-
-
-def _resolve_split_images(yolo_ds: Path, entry: str) -> List[Path]:
-    p = Path(entry)
-    if not p.is_absolute():
-        p = (yolo_ds / p).resolve()
-    if p.suffix.lower() == ".txt":
-        return _read_list(p)
-    if p.is_dir():
-        return sorted([q for q in p.rglob("*") if q.suffix.lower() in _IMG_EXTS])
-    return [p] if p.suffix.lower() in _IMG_EXTS else []
-
-
-# =========================================================
 # Build Image objects and map to splits
 # =========================================================
 def build_image_index(data_root: Path, exclude: Optional[List[str]] = None) -> Dict[str, IMG]:
@@ -243,10 +172,13 @@ def build_image_index(data_root: Path, exclude: Optional[List[str]] = None) -> D
 def images_from_yolo_splits(
     yolo_ds: Path, data_root: Path, exclude: Optional[List[str]] = None
 ) -> Tuple[List[IMG], List[IMG], List[IMG]]:
-    mapping = _parse_data_yaml(yolo_ds / "data.yaml")
-    train_imgs = _resolve_split_images(yolo_ds, mapping["train"])
-    val_imgs = _resolve_split_images(yolo_ds, mapping["val"])
-    test_imgs = _resolve_split_images(yolo_ds, mapping["test"])
+    # Use shared utility for parsing data.yaml
+    mapping = tu.parse_data_yaml(yolo_ds / "data.yaml")
+    
+    # Use shared utility for resolving images
+    train_imgs = tu.resolve_split_images(yolo_ds, mapping["train"])
+    val_imgs = tu.resolve_split_images(yolo_ds, mapping["val"])
+    test_imgs = tu.resolve_split_images(yolo_ds, mapping["test"])
 
     idx = build_image_index(data_root, exclude)
     miss = 0
@@ -273,39 +205,11 @@ def images_from_yolo_splits(
 # =========================================================
 # Detector → normalized boxes with disk cache (Option B core)
 # =========================================================
-class YOLOBoxProvider:
-    """Returns at most one NormalizedBox per class ({disc, cup}) with per-run cache."""
-
-    def __init__(self, weights: Path, device: str = DEFAULT_YOLO_DEVICE,
-                 imgsz: int = DEFAULT_YOLO_IMGSZ, conf: float = DEFAULT_YOLO_CONF,
-                 iou: float = DEFAULT_YOLO_IOU):
-        _ensure_yolo_available()
-        # Important for memory: we will typically run this on "cpu"
-        self.model = YOLO(str(weights))
-        self.cfg = dict(device=device, imgsz=imgsz, conf=conf, iou=iou)
-
-    def predict_one(self, img_path: Path, W: int, H: int) -> Dict[str, Optional[Tuple[float, float, float, float]]]:
-        r = self.model.predict(source=str(img_path), verbose=False, **self.cfg)[0]
-        out: Dict[str, Optional[Tuple[float, float, float, float]]] = {"disc": None, "cup": None}
-        if getattr(r, "boxes", None) is None or len(r.boxes) == 0:
-            return out
-        xyxy = r.boxes.xyxy.cpu().numpy()
-        cls = r.boxes.cls.cpu().numpy().astype(int)
-        for b, c in zip(xyxy, cls):
-            x1, y1, x2, y2 = map(float, b)
-            nb = NormalizedBox.from_xyxy(x1, y1, x2, y2, W, H).as_tuple()
-            if c == 0 and out["disc"] is None:
-                out["disc"] = nb
-            elif c == 1 and out["cup"] is None:
-                out["cup"] = nb
-        return out
-
-
 def attach_detector_boxes_with_cache(
     images: Iterable[IMG],
     cache_path: Optional[Path],
     dist: DistributedContext,
-    provider: Optional[YOLOBoxProvider] = None,
+    provider: Optional[YoloPredictor] = None,
 ) -> None:
     """
     Implements Option B:
@@ -335,14 +239,31 @@ def attach_detector_boxes_with_cache(
                 else:
                     jf = open(os.devnull, "w")
 
+                # Use provider's batch size for chunking (aligns with YOLO internal batching)
+                chunk_size = provider.cfg.batch_size if provider else 32
+                
                 with jf:
-                    for im in images:
-                        rec = {"stem": Path(im.image_path).stem}
-                        preds = provider.predict_one(Path(im.image_path), im.width, im.height)
-                        rec["disc"] = preds["disc"]
-                        rec["cup"] = preds["cup"]
-                        jf.write(json.dumps(rec) + "\n")
-                        mapping[rec["stem"]] = {"disc": rec["disc"], "cup": rec["cup"]}
+                    # Iterate in chunks to maintain progress bar while using batch inference
+                    for i in tqdm(range(0, len(images), chunk_size), desc="Generating Detector Prompts"):
+                        chunk = images[i : i + chunk_size]
+                        paths = [Path(im.image_path) for im in chunk]
+                        
+                        # Use high-performance batch prediction from YoloPredictor
+                        batch_preds = provider.top1_per_class_batch(paths)
+                        
+                        for im, preds in zip(chunk, batch_preds):
+                            rec = {"stem": Path(im.image_path).stem}
+                            
+                            # YoloPredictor returns {0: (box, conf), 1: (box, conf)}
+                            # Convert NormalizedBox back to tuple for JSON storage
+                            disc_res = preds.get(0, (None, None))
+                            cup_res = preds.get(1, (None, None))
+                            
+                            rec["disc"] = disc_res[0].as_tuple() if disc_res[0] else None
+                            rec["cup"] = cup_res[0].as_tuple() if cup_res[0] else None
+                            
+                            jf.write(json.dumps(rec) + "\n")
+                            mapping[rec["stem"]] = {"disc": rec["disc"], "cup": rec["cup"]}
 
         dist.barrier()
         # Non-main ranks load the newly created cache
@@ -364,103 +285,6 @@ def attach_detector_boxes_with_cache(
 
 
 # =========================================================
-# Geometry / preprocessing
-# =========================================================
-class LetterboxToSquare:
-    def __init__(self, size: int = 1024):
-        self.size = size
-
-    def _compute_pad(self, w: int, h: int) -> Tuple[float, int, int, int, int]:
-        scale = min(self.size / h, self.size / w)
-        new_w = int(round(w * scale))
-        new_h = int(round(h * scale))
-        pad_w = self.size - new_w
-        pad_h = self.size - new_h
-        pad_left = pad_w // 2
-        pad_top = pad_h // 2
-        return scale, new_w, new_h, pad_left, pad_top
-
-    def __call__(
-        self, img: PILImage.Image, mask: PILImage.Image, box_xyxy: np.ndarray
-    ) -> Tuple[PILImage.Image, PILImage.Image, np.ndarray]:
-        w, h = img.size
-        scale, new_w, new_h, pad_left, pad_top = self._compute_pad(w, h)
-        img_r = img.resize((new_w, new_h), PILImage.BILINEAR)
-        mask_r = mask.resize((new_w, new_h), PILImage.NEAREST)
-        new_img = PILImage.new("RGB", (self.size, self.size))
-        new_mask = PILImage.new("L", (self.size, self.size))
-        new_img.paste(img_r, (pad_left, pad_top))
-        new_mask.paste(mask_r, (pad_left, pad_top))
-        x0, y0, x1, y1 = box_xyxy
-        x0 = x0 * scale + pad_left
-        y0 = y0 * scale + pad_top
-        x1 = x1 * scale + pad_left
-        y1 = y1 * scale + pad_top
-        box_t = np.array([x0, y0, x1, y1], dtype=np.float32)
-        return new_img, new_mask, box_t
-
-
-def mask_to_tight_box(mask_np: np.ndarray) -> Optional[np.ndarray]:
-    ys, xs = np.nonzero(mask_np)
-    if ys.size == 0 or xs.size == 0:
-        return None
-    x0, x1 = xs.min(), xs.max()
-    y0, y1 = ys.min(), ys.max()
-    return np.array([x0, y0, x1, y1], dtype=np.float32)
-
-
-def pad_box(box: np.ndarray, pad_frac: float, img_w: int, img_h: int) -> np.ndarray:
-    x0, y0, x1, y1 = box
-    w = x1 - x0 + 1
-    h = y1 - y0 + 1
-    px = w * pad_frac
-    py = h * pad_frac
-    xx0 = max(0.0, x0 - px)
-    yy0 = max(0.0, y0 - py)
-    xx1 = min(float(img_w - 1), x1 + px)
-    yy1 = min(float(img_h - 1), y1 + py)
-    return np.array([xx0, yy0, xx1, yy1], dtype=np.float32)
-
-
-def jitter_box_xyxy(box: np.ndarray, img_w: int, img_h: int, tr: float = 0.05, sc: float = 0.10) -> np.ndarray:
-    x0, y0, x1, y1 = box
-    w = max(1.0, x1 - x0)
-    h = max(1.0, y1 - y0)
-    cx = (x0 + x1) / 2
-    cy = (y0 + y1) / 2
-    dx = (2 * random.random() - 1) * tr * w
-    dy = (2 * random.random() - 1) * tr * h
-    s = 1.0 + (2 * random.random() - 1) * sc
-    nw = max(1.0, w * s)
-    nh = max(1.0, h * s)
-    cx += dx
-    cy += dy
-    nx0 = max(0.0, cx - nw / 2)
-    ny0 = max(0.0, cy - nh / 2)
-    nx1 = min(float(img_w - 1), cx + nw / 2)
-    ny1 = min(float(img_h - 1), cy + nh / 2)
-    return np.array([nx0, ny0, nx1, ny1], dtype=np.float32)
-
-
-def preprocess_for_sam(img_pil: PILImage.Image) -> torch.Tensor:
-    x = torch.from_numpy(np.array(img_pil)).permute(2, 0, 1).float()  # RGB 0..255
-    return (x - PIXEL_MEAN) / PIXEL_STD
-
-
-def nbox_to_xyxy(nbox: NormalizedBox, W: int, H: int) -> np.ndarray:
-    x1, y1, x2, y2 = nbox.to_pixel_xyxy(W, H)
-    return np.array([x1, y1, x2, y2], dtype=np.float32)
-
-
-def color_jitter_safe(img: PILImage.Image, brightness: float = 0.10, contrast: float = 0.10) -> PILImage.Image:
-    if brightness > 0:
-        img = ImageEnhance.Brightness(img).enhance(1.0 + random.uniform(-brightness, brightness))
-    if contrast > 0:
-        img = ImageEnhance.Contrast(img).enhance(1.0 + random.uniform(-contrast, contrast))
-    return img
-
-
-# =========================================================
 # Polar transform helpers (FunduSAM-style disc-centered)
 # =========================================================
 def cartesian_to_polar(
@@ -474,15 +298,6 @@ def cartesian_to_polar(
     Convert Cartesian image (H,W or H,W,C) to polar coordinates.
     
     FunduSAM-style: Center on optic disc for better OD/OC alignment.
-    
-    Args:
-        img: Input image (H,W) or (H,W,C)
-        out_h, out_w: Output polar dimensions
-        center: (cx, cy) center point. If None, uses image center.
-        radius: Max radius for transform. If None, computed from image/center.
-    
-    Returns:
-        Polar-transformed image of shape (out_h, out_w) or (out_h, out_w, C)
     """
     _ensure_cv2_available()
     h, w = img.shape[:2]
@@ -491,12 +306,9 @@ def cartesian_to_polar(
         center = (w / 2.0, h / 2.0)
     
     if radius is None:
-        # Compute radius to cover the entire image from the center
         cx, cy = center
-        # Max distance from center to any corner
         corners = [(0, 0), (w, 0), (0, h), (w, h)]
         radius = max(np.sqrt((cx - x)**2 + (cy - y)**2) for x, y in corners)
-        # Clamp to reasonable bounds
         radius = min(radius, max(w, h))
     
     flags = cv2.WARP_POLAR_LINEAR
@@ -515,15 +327,6 @@ def polar_to_cartesian(
 ) -> np.ndarray:
     """
     Invert polar image back to Cartesian coordinates.
-    
-    Args:
-        img_polar: Polar image
-        out_h, out_w: Output Cartesian dimensions
-        center: Must match the center used in cartesian_to_polar
-        radius: Must match the radius used in cartesian_to_polar
-    
-    Returns:
-        Cartesian image of shape (out_h, out_w) or (out_h, out_w, C)
     """
     _ensure_cv2_available()
     
@@ -550,135 +353,28 @@ def compute_disc_center_and_radius(
 ) -> Tuple[Tuple[float, float], float]:
     """
     Compute polar transform center and radius from disc bounding box.
-    
-    FunduSAM centers the polar transform on the optic disc for better
-    alignment of circular OD/OC structures.
-    
-    Args:
-        disc_box_xyxy: [x1, y1, x2, y2] disc bounding box
-        img_w, img_h: Image dimensions
-        radius_padding: Multiplier for radius (1.5 = 50% padding around disc)
-    
-    Returns:
-        (center, radius) for polar transform
     """
     x1, y1, x2, y2 = disc_box_xyxy
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
     
-    # Radius based on disc size with padding
+    # Disc dimensions
     disc_w = x2 - x1
     disc_h = y2 - y1
-    base_radius = max(disc_w, disc_h) / 2.0 * radius_padding
     
-    # Ensure radius covers enough of the image but not beyond
-    # Also ensure we capture the entire disc region
-    max_possible = min(
-        cx, cy, img_w - cx, img_h - cy  # Distance to edges
-    )
-    radius = min(base_radius, max_possible * 0.95)
-    radius = max(radius, max(disc_w, disc_h) / 2.0 * 1.2)  # At least cover disc
+    # Minimum radius: must cover the entire disc region
+    min_radius = max(disc_w, disc_h) / 2.0 * 1.2
+    
+    # Maximum possible radius: distance to nearest image edge (with safety margin)
+    max_possible = min(cx, cy, img_w - cx, img_h - cy) * 0.95
+    
+    # Desired radius: based on disc size with padding
+    desired_radius = max(disc_w, disc_h) / 2.0 * radius_padding
+    
+    # Clamp desired radius between minimum and maximum
+    radius = max(min_radius, min(desired_radius, max_possible))
     
     return (cx, cy), radius
-
-
-# =========================================================
-# Original single-structure dataset types (kept for reference)
-# =========================================================
-@dataclass(frozen=True)
-class SegItem:
-    image: IMG
-    structure: str  # "disc" | "cup"
-
-
-def make_items(images: List[IMG], require_gt: bool = True) -> List[SegItem]:
-    out: List[SegItem] = []
-    for im in images:
-        im.ensure_boxes_from_masks()
-        if not require_gt:
-            out.extend([SegItem(im, "disc"), SegItem(im, "cup")])
-            continue
-        if im.gt_disc_mask is not None and getattr(im.gt_disc_mask, "path", None):
-            out.append(SegItem(im, "disc"))
-        if im.gt_cup_mask is not None and getattr(im.gt_cup_mask, "path", None):
-            out.append(SegItem(im, "cup"))
-    return out
-
-
-class MedSAMDataset(Dataset):
-    """
-    Original single-structure dataset (disc OR cup).
-    Not used in Fundu pipeline, kept for reference.
-    """
-
-    def __init__(
-        self,
-        items: List[SegItem],
-        img_size: int = DEFAULT_IMGSZ,
-        train: bool = True,
-        use_det_prob: float = DEFAULT_USE_DET_PROB,
-        pad_jitter: float = DEFAULT_PAD_JITTER,
-        box_tr: float = DEFAULT_BOX_TR,
-        box_sc: float = DEFAULT_BOX_SC,
-        prompt_mode: str = "mix",  # "mix" (train only), "gt", "det"
-    ):
-        self.items = items
-        self.img_size = img_size
-        self.train = train
-        self.use_det_prob = float(np.clip(use_det_prob, 0.0, 1.0))
-        self.pad_jitter = pad_jitter
-        self.box_tr = box_tr
-        self.box_sc = box_sc
-        self.prompt_mode = prompt_mode
-        self.letterbox = LetterboxToSquare(img_size)
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-    def _choose_nbox(self, im: IMG, struct: str) -> Optional[NormalizedBox]:
-        gt = im.gt_disc_box if struct == "disc" else im.gt_cup_box
-        det = im.inter_pred_disc_box if struct == "disc" else im.inter_pred_cup_box
-        if self.train and self.prompt_mode == "mix":
-            return det if (random.random() < self.use_det_prob and det is not None) else gt
-        if self.prompt_mode == "det":
-            return det if det is not None else gt
-        return gt
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        item = self.items[idx]
-        im: IMG = item.image
-        struct = item.structure
-
-        img = PILImage.open(im.image_path).convert("RGB")
-        mref = im.gt_disc_mask if struct == "disc" else im.gt_cup_mask
-        if mref is None or getattr(mref, "path", None) is None:
-            raise RuntimeError(f"Missing GT mask for {struct}: {im.image_path}")
-        m = PILImage.open(mref.path).convert("L")
-
-        if self.train:
-            img = color_jitter_safe(img, brightness=0.10, contrast=0.10)
-
-        base_nbox = self._choose_nbox(im, struct)
-        if base_nbox is None:
-            tb = mask_to_tight_box(np.array(m, dtype=np.uint8))
-            box_xyxy = tb if tb is not None else np.array(
-                [0, 0, img.size[0] - 1, img.size[1] - 1],
-                dtype=np.float32,
-            )
-        else:
-            box_xyxy = nbox_to_xyxy(base_nbox, im.width, im.height)
-
-        pad_frac = (random.uniform(0.0, self.pad_jitter) if self.train else 0.0)
-        box_p = pad_box(box_xyxy, pad_frac, im.width, im.height)
-        if self.train and (self.box_tr > 0.0 or self.box_sc > 0.0):
-            box_p = jitter_box_xyxy(box_p, im.width, im.height, tr=self.box_tr, sc=self.box_sc)
-
-        img_r, mask_r, box_t = self.letterbox(img, m, box_p)
-        x = preprocess_for_sam(img_r)
-        y = torch.from_numpy((np.array(mask_r, dtype=np.uint8) > 0).astype(np.float32)).unsqueeze(0)
-        b = torch.from_numpy(box_t.astype(np.float32))
-        meta = {"image_path": str(im.image_path), "structure": struct, "stem": Path(im.image_path).stem}
-        return {"image": x, "mask": y, "box": b, "meta": meta}
 
 
 # =========================================================
@@ -700,12 +396,36 @@ def make_joint_images(images: List[IMG]) -> List[IMG]:
     return out
 
 
+def create_fundu_dataset(
+    images: List[IMG],
+    img_size: int,
+    train: bool,
+    prompt_mode: str,
+    polar_radius_padding: float,
+    use_det_prob: float = 0.0,
+    pad_jitter: float = 0.0,
+    box_tr: float = 0.0,
+    box_sc: float = 0.0,
+) -> FunduSAMDataset:
+    """
+    Helper function to create FunduSAMDataset with common parameters.
+    """
+    return FunduSAMDataset(
+        images=images,
+        img_size=img_size,
+        train=train,
+        use_det_prob=use_det_prob,
+        pad_jitter=pad_jitter,
+        box_tr=box_tr,
+        box_sc=box_sc,
+        prompt_mode=prompt_mode,
+        polar_radius_padding=polar_radius_padding,
+    )
+
+
 def fundu_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Custom collate function that handles metadata with non-tensor types.
-    
-    Stacks tensors normally, but collects metadata (dicts with strings/tuples)
-    into lists for easy iteration during testing.
     """
     result: Dict[str, Any] = {}
     
@@ -732,18 +452,6 @@ def fundu_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 class FunduSAMDataset(Dataset):
     """
     FunduSAM-style joint OD/OC dataset in polar space:
-    
-    Key features (matching FunduSAM paper):
-    - Uses YOLO-predicted disc boxes (PRED) mixed with GT boxes
-    - **Disc-centered polar transform**: Centers polar coordinates on optic disc
-      center from YOLO detection or GT box for better OD/OC alignment
-    - Letterbox full fundus to (img_size, img_size)
-    - Convert image + masks from Cartesian → polar (disc-centered)
-    
-    Returns:
-        image: (3, H, W) normalized SAM-style, in polar coords
-        mask:  (2, H, W) binary [disc, cup], in polar coords
-        meta:  includes polar_center and polar_radius for inverse transform
     """
 
     def __init__(
@@ -768,7 +476,7 @@ class FunduSAMDataset(Dataset):
         self.box_sc = box_sc
         self.prompt_mode = prompt_mode
         self.polar_radius_padding = polar_radius_padding
-        self.letterbox = LetterboxToSquare(img_size)
+        self.letterbox = tu.LetterboxToSquare(img_size)
 
     def __len__(self) -> int:
         return len(self.images)
@@ -787,6 +495,9 @@ class FunduSAMDataset(Dataset):
         im: IMG = self.images[idx]
         im.ensure_boxes_from_masks()
 
+        # Load images from disk (PIL handles file I/O efficiently)
+        # Note: For very small datasets (<1000 images), consider pre-loading into memory
+        # For larger datasets, DataLoader workers already parallelize I/O efficiently
         img = PILImage.open(im.image_path).convert("RGB")
         mref_disc = im.gt_disc_mask
         mref_cup = im.gt_cup_mask
@@ -799,41 +510,36 @@ class FunduSAMDataset(Dataset):
         m_cup = PILImage.open(mref_cup.path).convert("L")
 
         if self.train:
-            img = color_jitter_safe(img, brightness=0.10, contrast=0.10)
+            img = tu.color_jitter_safe(img, brightness=0.10, contrast=0.10)
 
         # Get disc box for polar centering (prefer detection, fallback to GT/mask)
         base_nbox = self._choose_disc_box(im)
         if base_nbox is None:
             # Fallback to tight disc box from mask
-            tb = mask_to_tight_box(np.array(m_disc, dtype=np.uint8))
+            tb = tu.mask_to_tight_box(np.array(m_disc, dtype=np.uint8))
             box_xyxy = tb if tb is not None else np.array(
                 [0, 0, img.size[0] - 1, img.size[1] - 1],
                 dtype=np.float32,
             )
         else:
-            box_xyxy = nbox_to_xyxy(base_nbox, im.width, im.height)
-
-        # Store original disc box for polar centering before any jitter
-        disc_box_orig = box_xyxy.copy()
+            box_xyxy = tu.nbox_to_xyxy(base_nbox, im.width, im.height)
 
         # Apply padding/jitter to box (for letterbox cropping context)
         pad_frac = (random.uniform(0.0, self.pad_jitter) if self.train else 0.0)
-        box_p = pad_box(box_xyxy, pad_frac, im.width, im.height)
+        box_p = tu.pad_box(box_xyxy, pad_frac, im.width, im.height)
         if self.train and (self.box_tr > 0.0 or self.box_sc > 0.0):
-            box_p = jitter_box_xyxy(box_p, im.width, im.height, tr=self.box_tr, sc=self.box_sc)
+            box_p = tu.jitter_box_xyxy(box_p, im.width, im.height, tr=self.box_tr, sc=self.box_sc)
 
         # Letterbox full fundus + masks to square
         img_cart, disc_cart, box_t = self.letterbox(img, m_disc, box_p)
         _, cup_cart, _ = self.letterbox(img, m_cup, box_p)
 
         # Compute disc center in letterboxed coordinates for polar transform
-        # The box_t is the transformed box after letterboxing
-        # Use the center of the transformed disc box
         polar_center, polar_radius = compute_disc_center_and_radius(
             box_t,
             self.img_size,
             self.img_size,
-            radius_padding=self.polar_radius_padding,
+            self.polar_radius_padding,
         )
 
         # Cartesian → polar (disc-centered) for image and masks
@@ -855,7 +561,7 @@ class FunduSAMDataset(Dataset):
         )
 
         img_pol_pil = PILImage.fromarray(img_pol)
-        x = preprocess_for_sam(img_pol_pil)
+        x = tu.preprocess_for_sam(img_pol_pil)
 
         disc_bin = (disc_pol > 0).astype(np.float32)
         cup_bin = (cup_pol > 0).astype(np.float32)
@@ -875,39 +581,10 @@ class FunduSAMDataset(Dataset):
 # =========================================================
 # Loss & metrics
 # =========================================================
-class BCEDice(nn.Module):
-    """
-    Original single-class BCE+Dice loss (kept for reference).
-    """
-
-    def __init__(self, bce_weight: float = 0.5):
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
-        self.bce_weight = bce_weight
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        bce = self.bce(logits, target)
-        prob = torch.sigmoid(logits)
-        num = 2 * (prob * target).sum(dim=(2, 3)) + 1e-6
-        den = (prob.pow(2) + target.pow(2)).sum(dim=(2, 3)) + 1e-6
-        dice = 1.0 - (num / den)
-        return self.bce_weight * bce + (1.0 - self.bce_weight) * dice.mean()
-
-
-def dice_coef_prob(prob: torch.Tensor, target: torch.Tensor, thresh: float = 0.5) -> float:
-    pred = (prob >= thresh).float()
-    inter = (pred * target).sum().item()
-    den = pred.sum().item() + target.sum().item()
-    return (2.0 * inter) / den if den > 0 else 1.0
-
-
 class FunduJointLoss(nn.Module):
     """
     FunduSAM-style joint loss:
     L = w1 * (BCE_disc + Dice_disc) + w2 * (BCE_cup + Dice_cup) + w3 * L_contain
-    where:
-      - BCE + Dice for both disc and cup (standard segmentation combo)
-      - L_contain penalizes cup pixels outside the disc (structural constraint)
     """
 
     def __init__(
@@ -928,18 +605,12 @@ class FunduJointLoss(nn.Module):
 
     def _dice_loss(self, prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Compute Dice loss for a single class."""
-        # prob: (B, H, W) already sigmoid-ed
-        # target: (B, H, W)
         num = 2.0 * (prob * target).sum(dim=(1, 2)) + self.smooth
         den = prob.sum(dim=(1, 2)) + target.sum(dim=(1, 2)) + self.smooth
         dice = num / den
         return 1.0 - dice.mean()
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        logits: (B, 2, H, W)
-        target: (B, 2, H, W)
-        """
         log_disc = logits[:, 0]
         log_cup = logits[:, 1]
         gt_disc = target[:, 0]
@@ -1114,11 +785,6 @@ class FunduSAMFinetuner(nn.Module):
     - CBAM (Channel + Spatial attention) applied to encoder features
     - Custom segmentation head for 2-channel OD/OC mask in polar space
     - No prompt encoder / mask decoder usage (direct segmentation)
-    
-    Architecture differences from original SAM:
-    - Adapters inserted after attention AND FFN in every block
-    - CBAM enhances encoder output features
-    - Direct segmentation head replaces prompt-based decoding
     """
 
     def __init__(
@@ -1310,13 +976,20 @@ class Trainer:
         # Detector cache: rank-0 builds on CPU; all ranks load/attach
         provider = None
         if self.dist.is_main:
-            # Use CPU for YOLO to avoid stealing GPU memory from MedSAM
-            provider = YOLOBoxProvider(
-                cfg.yolo_weights,
-                device="cpu",
-                imgsz=cfg.yolo_imgsz,
-                conf=cfg.yolo_conf,
-                iou=cfg.yolo_iou,
+            # Use YoloPredictor directly from src.model.predictor
+            # This allows efficient batched inference on GPU
+            # Convert device to proper format for Ultralytics
+            yolo_device_str = _ultralytics_device_str(str(self.device))
+            yolo_batch_size = 32  # Good default batch size for inference
+            provider = YoloPredictor(
+                YoloPredictorConfig(
+                    weights=cfg.yolo_weights,
+                    device=yolo_device_str,
+                    imgsz=cfg.yolo_imgsz,
+                    conf=cfg.yolo_conf,
+                    iou=cfg.yolo_iou,
+                    batch_size=yolo_batch_size
+                )
             )
 
         det_cache_path = cfg.det_cache if cfg.det_cache else (self.run_path / "detector_cache.jsonl")
@@ -1338,36 +1011,28 @@ class Trainer:
         joint_test = make_joint_images(test_imgs)
 
         # Datasets/Loaders (FunduSAM-style polar with disc-centered transform)
-        self.ds_train = FunduSAMDataset(
-            joint_train,
+        self.ds_train = create_fundu_dataset(
+            images=joint_train,
             img_size=cfg.imgsz,
             train=True,
+            prompt_mode="mix",  # GT/DET mix during training
+            polar_radius_padding=cfg.polar_radius_padding,
             use_det_prob=cfg.use_det_prob,
             pad_jitter=cfg.pad_jitter,
             box_tr=cfg.box_jitter_tr,
             box_sc=cfg.box_jitter_sc,
-            prompt_mode="mix",  # GT/DET mix during training
-            polar_radius_padding=cfg.polar_radius_padding,
         )
-        self.ds_val = FunduSAMDataset(
-            joint_val,
+        self.ds_val = create_fundu_dataset(
+            images=joint_val,
             img_size=cfg.imgsz,
             train=False,
-            use_det_prob=0.0,
-            pad_jitter=0.0,
-            box_tr=0.0,
-            box_sc=0.0,
             prompt_mode="gt",
             polar_radius_padding=cfg.polar_radius_padding,
         )
-        self.ds_test = FunduSAMDataset(
-            joint_test,
+        self.ds_test = create_fundu_dataset(
+            images=joint_test,
             img_size=cfg.imgsz,
             train=False,
-            use_det_prob=0.0,
-            pad_jitter=0.0,
-            box_tr=0.0,
-            box_sc=0.0,
             prompt_mode=("det" if cfg.test_prompt == "det" else "gt"),
             polar_radius_padding=cfg.polar_radius_padding,
         )
@@ -1503,9 +1168,16 @@ class Trainer:
         use_cuda = self.device.type == "cuda"
         amp_enabled = self.cfg.amp and use_cuda
 
-        for step, batch in enumerate(dl):
+        # CHANGE: Wrap with tqdm progress bar on main process
+        iterator = dl
+        if self.dist.is_main:
+            desc = f"Epoch {self._epoch} {'Train' if train else 'Val'}"
+            iterator = tqdm(dl, desc=desc, leave=False)
+
+        for step, batch in enumerate(iterator):
             batch = {k: v for k, v in batch.items() if k != "meta"}
-            batch = _to_device(batch, self.device)
+            # Use to_device from shared utils
+            batch = tu.to_device(batch, self.device)
 
             if use_cuda:
                 autocast_ctx = torch.cuda.amp.autocast(enabled=amp_enabled)
@@ -1530,13 +1202,18 @@ class Trainer:
                         else:
                             opt.step()
                         opt.zero_grad(set_to_none=True)
+            
+            # CHANGE: Update progress bar postfix
+            if self.dist.is_main and train:
+                 iterator.set_postfix(loss=float(loss.detach()))
 
             with torch.no_grad():
                 prob = torch.sigmoid(logits)
                 for i in range(prob.shape[0]):
                     # average disc+cup dice in polar domain vs polar GT
-                    d_disc = dice_coef_prob(prob[i, 0:1], batch["mask"][i, 0:1])
-                    d_cup = dice_coef_prob(prob[i, 1:2], batch["mask"][i, 1:2])
+                    # Use dice_coef_prob from shared utils
+                    d_disc = tu.dice_coef_prob(prob[i, 0:1], batch["mask"][i, 0:1])
+                    d_cup = tu.dice_coef_prob(prob[i, 1:2], batch["mask"][i, 1:2])
                     total_dice += 0.5 * (d_disc + d_cup)
                     n += 1
                 total_loss += float(loss.detach()) * batch["mask"].shape[0]
@@ -1612,7 +1289,8 @@ class Trainer:
             for batch in self.dl_test:
                 metas = batch["meta"]  # Dict of lists from custom collate
                 batch_tensors = {k: v for k, v in batch.items() if k != "meta"}
-                batch_tensors = _to_device(batch_tensors, self.device)
+                # Use to_device from shared utils
+                batch_tensors = tu.to_device(batch_tensors, self.device)
                 logits, _ = self._unwrap()(batch_tensors)  # (B,2,H,W) in polar
                 prob = torch.sigmoid(logits)
 
@@ -1626,8 +1304,8 @@ class Trainer:
                     polar_radius = metas["polar_radius"][i]
 
                     # Dice in polar domain
-                    d_disc = dice_coef_prob(prob[i, 0:1], batch_tensors["mask"][i, 0:1])
-                    d_cup = dice_coef_prob(prob[i, 1:2], batch_tensors["mask"][i, 1:2])
+                    d_disc = tu.dice_coef_prob(prob[i, 0:1], batch_tensors["mask"][i, 0:1])
+                    d_cup = tu.dice_coef_prob(prob[i, 1:2], batch_tensors["mask"][i, 1:2])
 
                     # Threshold in polar
                     disc_pol = (prob[i, 0].cpu().numpy() >= 0.5).astype(np.uint8) * 255
