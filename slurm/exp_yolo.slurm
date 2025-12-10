@@ -225,7 +225,6 @@ ARG_8=(
     "--yolo-device" "${YOLO_DEVICES}"
     "--grad-checkpointing"
     "--eval-every" "5"
-    "--compile-model"
 )
 
 ###############################################################################
