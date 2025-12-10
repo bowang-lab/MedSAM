@@ -64,18 +64,8 @@ DEFAULT_MEDSAM_CKPT = "/Users/carlosperez/PycharmProjects/MedSAM/work_dir/MedSAM
 # Small helpers
 # =============================
 
-def set_global_seed(seed: int = 42) -> None:
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    try:
-        import torch
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # type: ignore[attr-defined]
-        torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
-        torch.backends.cudnn.benchmark = False     # type: ignore[attr-defined]
-    except Exception:
-        pass
+# Import centralized seed function from utils
+from src.utils import set_global_seed
 
 def _pad_xyxy(
     xyxy: Tuple[int, int, int, int], pad_frac: float, W: int, H: int

@@ -1,0 +1,29 @@
+# Mode 8: MedSAM Finetuning Only
+# Finetune MedSAM using existing YOLO weights and dataset
+
+paths:
+  yolo_weights: "/scratch/st-ipor-1/cperez/MedSAM/runs/run13/Train/Train/weights/best.pt"
+  yolo_ds: "/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS"
+  medsam_ckpt: "/scratch/st-ipor-1/cperez/MedSAM/weights/medsam_vit_b.pth"
+  out_dir: "/scratch/st-ipor-1/cperez/MedSAM/runs/Fundu"
+
+actions:
+  - --finetune-medsam
+  - --test-yolo
+
+training:
+  epochs: 100
+  batch: 8
+  imgsz: 1024
+  workers: 16
+
+args:
+  - --yolo-weights
+  - --yolo-ds
+  - --medsam-ckpt
+  - --yolo-device
+  - --epochs
+  - --batch
+  - --imgsz
+  - --workers
+

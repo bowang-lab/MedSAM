@@ -33,6 +33,14 @@ from src.imgpipe.image import Image as IMG
 from src.imgpipe.normalized_box import NormalizedBox
 from src.imgpipe.enums import Structure, LabelType  # expects Structure.DISC/CUP, LabelType.GT/PRED
 
+# NOTE: Common training utilities are now centralized in src/training_utils.py
+# Future refactoring should migrate local duplicates to use:
+#   from src.training_utils import (
+#       parse_data_yaml, LetterboxToSquare, pad_box, jitter_box_xyxy,
+#       mask_to_tight_box, preprocess_for_sam, color_jitter_safe,
+#       BCEDiceLoss, dice_coef_prob, to_device
+#   )
+
 # Detector
 try:
     from ultralytics import YOLO
@@ -73,24 +81,9 @@ SEED = 42
 # =========================
 # Utilities
 # =========================
-def set_global_seed(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    try:
-        import torch
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # type: ignore[attr-defined]
-        torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
-        torch.backends.cudnn.benchmark = False     # type: ignore[attr-defined]
-    except Exception:
-        pass
+# Import centralized seed function from utils
+from src.utils import set_global_seed
 
-def _ensure_sam_available():
-    if sam_model_registry is None:
-        raise RuntimeError(
-            f"segment-anything not available. Import error: {_SAM_IMPORT_ERR!r}\n"
-            "Install: pip install git+https://github.com/facebookresearch/segment-anything.git"
-        )
 
 def _ensure_yolo_available():
     if YOLO is None:
@@ -481,7 +474,6 @@ def dice_coef_prob(prob: torch.Tensor, target: torch.Tensor, thresh: float = 0.5
 class MedSAMFinetuner(nn.Module):
     def __init__(self, sam_type: str, checkpoint: Path, freeze_encoders: bool = True):
         super().__init__()
-        _ensure_sam_available()
         if not Path(checkpoint).exists():
             raise FileNotFoundError(f"MedSAM checkpoint not found: {checkpoint}")
         self.sam = sam_model_registry[sam_type](checkpoint=str(checkpoint))

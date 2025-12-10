@@ -1,0 +1,40 @@
+# Mode 7: Semi-Supervised + Predictions Pipeline
+# Finetune YOLO -> Test -> Run predictions
+
+paths:
+  processed_dir_template: "{REPO_DIR}/src/image_data/parquet/processed_semi_supervised_dup{DUP_FACTOR}"
+  images_parquet_template: "{PROCESSED_DIR}/final_semi_supervised_dataset_{CONF_PCT}.parquet"
+  init_weights: "/home/cperez67/medsam/runs/run12/Train/Train/weights/best.pt"
+  out_dir_template: "{REPO_DIR}/DS/YOLO_SEMI_CONF{CONF_PCT}_dup{DUP_FACTOR}"
+  runs_root_template: "{REPO_DIR}/runs/finetune/semi_conf{CONF_PCT}_dup{DUP_FACTOR}"
+
+actions:
+  - --finetune-yolo
+  - --test-yolo
+  - --predict
+
+training:
+  epochs: 30
+  batch: 16
+  imgsz: 640
+  workers: 16
+
+prediction:
+  splits: "test"
+  batch_size: 128
+  sam_amp: true
+
+args:
+  - --images-parquet
+  - --init-weights
+  - --yolo-out-dir
+  - --finetune-runs-root
+  - --yolo-device
+  - --epochs
+  - --batch
+  - --imgsz
+  - --workers
+  - --predict-splits
+  - --predict-batch-size
+  - --predict-sam-amp
+

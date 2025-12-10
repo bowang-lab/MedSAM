@@ -54,17 +54,8 @@ SPACE = {
 # =========================
 # Reproducibility
 # =========================
-def set_global_seed(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    try:
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # type: ignore[attr-defined]
-        torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
-        torch.backends.cudnn.benchmark = False     # type: ignore[attr-defined]
-    except Exception:
-        # In case some backends/devices are not available.
-        pass
+# Import centralized seed function from utils
+from src.utils import set_global_seed
 
 
 # =========================
@@ -787,3 +778,209 @@ class YOLORunner:
         print(f"[OK] Saved combined summary to: {agg_json}")
 
         return combined
+
+
+# =========================
+# YOLO Finetuning from Parquet
+# =========================
+
+import shutil
+from src.imgpipe.image import Image
+from src.utils import ultralytics_device_arg
+
+
+def get_next_run_name(run_root: Path, base: str = "ss") -> str:
+    """Generate unique run name like ss1, ss2, etc."""
+    i = 1
+    while (run_root / f"{base}{i}").exists():
+        i += 1
+    return f"{base}{i}"
+
+
+def ensure_yolo_dirs(ds_root: Path) -> None:
+    """Create YOLO dataset directory structure."""
+    for sub in (
+        "images/train", "images/val", "images/test",
+        "labels/train", "labels/val", "labels/test",
+    ):
+        (ds_root / sub).mkdir(parents=True, exist_ok=True)
+
+
+def write_yolo_data_yaml(ds_root: Path) -> Path:
+    """Write YOLO data.yaml config file."""
+    data = {
+        "path": str(ds_root),
+        "train": "images/train",
+        "val": "images/val",
+        "test": "images/test",
+        "names": {0: "disc", 1: "cup"},
+    }
+    p = ds_root / "data.yaml"
+    p.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return p
+
+
+def fmt_yolo_line(cls_id: int, xc: float, yc: float, w: float, h: float) -> str:
+    """Format a YOLO label line with clamped values."""
+    xc = float(min(1.0, max(0.0, xc)))
+    yc = float(min(1.0, max(0.0, yc)))
+    w = float(min(1.0, max(0.0, w)))
+    h = float(min(1.0, max(0.0, h)))
+    return f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}"
+
+
+def materialize_image_file(img: Image, dst_img_path: Path) -> None:
+    """Copy or extract image file to destination."""
+    dst_img_path.parent.mkdir(parents=True, exist_ok=True)
+    ref = img.image_ref
+    if ref is not None and getattr(ref, "packed", None) is not None:
+        dst_img_path.write_bytes(ref.packed)
+        return
+    src = Path(img.image_path)
+    if not src.exists():
+        return
+    shutil.copy2(src, dst_img_path)
+
+
+def build_yolo_dataset_from_processed_parquet(
+    images: list[Image],
+    out_dir: Path,
+) -> Path:
+    """
+    Materialize YOLO dataset from processed images.
+    Assumes img.split and gt_*_box are already set.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ensure_yolo_dirs(out_dir)
+
+    counts = {"train": 0, "val": 0, "test": 0}
+
+    print(f"[INFO] Materializing {len(images)} images to {out_dir}...")
+
+    for img in images:
+        split = img.split
+        if split not in counts:
+            continue
+
+        ext = (img.image_path.suffix or "").lower()
+        if not ext:
+            ext = getattr(img.image_ref, "ext", None) or ".png"
+        if not ext.startswith("."):
+            ext = "." + ext
+
+        dst_img = out_dir / "images" / split / f"{img.uid}{ext}"
+        dst_lbl = out_dir / "labels" / split / f"{img.uid}.txt"
+
+        materialize_image_file(img, dst_img)
+
+        lines = []
+        if img.gt_disc_box:
+            xc, yc, w, h = img.gt_disc_box.as_tuple()
+            lines.append(fmt_yolo_line(0, xc, yc, w, h))
+        if img.gt_cup_box:
+            xc, yc, w, h = img.gt_cup_box.as_tuple()
+            lines.append(fmt_yolo_line(1, xc, yc, w, h))
+
+        if lines:
+            dst_lbl.write_text("\n".join(lines), encoding="utf-8")
+            counts[split] += 1
+
+    data_yaml = write_yolo_data_yaml(out_dir)
+    print(f"[INFO] Materialization complete. Counts: {json.dumps(counts)}")
+    return data_yaml
+
+
+def finetune_yolo_from_parquet(
+    images_parquet: Path,
+    out_yolo_ds: Path,
+    runs_root: Path,
+    init_weights: Path,
+    cfg: Path,
+    device: str,
+    epochs: int,
+    batch: int,
+    imgsz: int,
+    workers: int = 8,
+    seed: int = 42,
+    skip_materialization: bool = False,
+    run_name_base: str = "ss",
+) -> Optional[Path]:
+    """
+    Finetune YOLO from a pre-processed parquet file.
+    
+    This function handles the full workflow:
+    1. Load images from parquet
+    2. Materialize YOLO dataset structure
+    3. Initialize YOLORunner and train
+    
+    Args:
+        images_parquet: Path to parquet with splits and GT boxes set
+        out_yolo_ds: Where to materialize the YOLO dataset
+        runs_root: Where to save training runs
+        init_weights: Pretrained weights to finetune from
+        cfg: YOLO training config file
+        device: Device string (e.g., "0,1,2,3")
+        epochs: Number of training epochs
+        batch: Batch size
+        imgsz: Image size
+        workers: Number of data workers
+        seed: Random seed
+        skip_materialization: If True, use existing dataset if found
+        run_name_base: Base name for run directories (e.g., "ss" -> ss1, ss2, ...)
+        
+    Returns:
+        Path to best weights, or None if training failed
+    """
+    set_global_seed(seed)
+    
+    target_device = device if device else ultralytics_device_arg()
+    
+    # 1. Prepare Dataset
+    data_yaml = out_yolo_ds / "data.yaml"
+    
+    if skip_materialization and data_yaml.exists():
+        print(f"[INFO] Skipping materialization. Using existing dataset: {data_yaml}")
+    else:
+        if skip_materialization:
+            print(f"[WARN] --skip-materialization set but {data_yaml} not found. Proceeding with creation.")
+        
+        print(f"[INFO] Loading Parquet: {images_parquet}")
+        images = Image.load_parquet(images_parquet)
+        
+        build_yolo_dataset_from_processed_parquet(images, out_dir=out_yolo_ds)
+    
+    # 2. Determine Run Name
+    runs_root.mkdir(parents=True, exist_ok=True)
+    run_name = get_next_run_name(runs_root, base=run_name_base)
+    
+    print(f"[INFO] Initializing YOLORunner for run: {run_name}")
+    print(f"[INFO] Fine-tuning from: {init_weights}")
+    
+    # 3. Instantiate YOLORunner
+    runner = YOLORunner(
+        data_root=out_yolo_ds,  # Required by init but unused when yolo_ds is passed
+        out_dir=out_yolo_ds,
+        run_dir=runs_root,
+        run_name=run_name,
+        cfg=cfg,
+        model=str(init_weights),
+        device=target_device,
+        epochs=epochs,
+        batch=batch,
+        imgsz=imgsz,
+        conf=0.001,  # Test-time defaults
+        iou=0.7,
+        seed=seed,
+        yolo_ds=out_yolo_ds,
+    )
+    
+    # 4. Run Training
+    best_weights = runner.train()
+    
+    print(f"[OK] Finetuning finished.")
+    if best_weights:
+        print(f"[OK] Best weights saved at: {best_weights}")
+    else:
+        print("[WARN] Could not resolve path to best weights.")
+    
+    return best_weights

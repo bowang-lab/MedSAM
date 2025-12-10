@@ -1,7 +1,8 @@
-# src/device.py
+# src/utils.py
 from __future__ import annotations
 
 import os
+import random
 import uuid
 import shutil
 from pathlib import Path
@@ -12,6 +13,25 @@ import numpy as np
 import torch
 import yaml
 from skimage import io as skio  # for PNG mask writing
+
+
+# ======================================================================
+# Reproducibility
+# ======================================================================
+
+def set_global_seed(seed: int = 42) -> None:
+    """
+    Set global seeds for reproducibility across random, numpy, and torch.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
 
 
 
@@ -409,3 +429,147 @@ def xc_yc_wh_to_xyxy(xc: float, yc: float, w: float, h: float) -> Tuple[float, f
     x2 = xc + w / 2.0
     y2 = yc + h / 2.0
     return x1, y1, x2, y2
+
+
+# ======================================================================
+# Statistical helpers
+# ======================================================================
+
+def is_finite(x: Any) -> bool:
+    """Check if value is finite (not None, NaN, or Inf)."""
+    try:
+        return (x is not None) and bool(np.isfinite(float(x)))
+    except Exception:
+        return False
+
+
+def mean_std(xs: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    """Compute mean and sample standard deviation from a list of values."""
+    if not xs:
+        return None, None
+    arr = np.asarray(xs, dtype=float)
+    mean = float(np.mean(arr))
+    std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+    return mean, std
+
+
+# ======================================================================
+# Distributed / Multi-GPU helpers
+# ======================================================================
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class DistInfo:
+    """Distributed training information."""
+    rank: int
+    world_size: int
+    local_rank: int
+
+
+def get_dist_info() -> DistInfo:
+    """
+    Get distributed training info from environment variables.
+    
+    Supports:
+    - PyTorch distributed (RANK, WORLD_SIZE, LOCAL_RANK)
+    - SLURM (SLURM_PROCID, SLURM_NTASKS, SLURM_LOCALID)
+    - Falls back to single-process defaults
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        return DistInfo(
+            rank=int(os.environ["RANK"]),
+            world_size=int(os.environ["WORLD_SIZE"]),
+            local_rank=int(os.environ.get("LOCAL_RANK", "0"))
+        )
+    if "SLURM_PROCID" in os.environ:
+        return DistInfo(
+            rank=int(os.environ["SLURM_PROCID"]),
+            world_size=int(os.environ["SLURM_NTASKS"]),
+            local_rank=int(os.environ.get("SLURM_LOCALID", "0"))
+        )
+    return DistInfo(rank=0, world_size=1, local_rank=0)
+
+
+def maybe_init_torch_distributed(dist: DistInfo) -> bool:
+    """
+    Initialize PyTorch distributed process group if applicable.
+    
+    Returns True if distributed is initialized (or was already initialized).
+    """
+    if dist.world_size <= 1 or not torch.distributed.is_available():
+        return False
+    if torch.distributed.is_initialized():
+        return True
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    try:
+        torch.distributed.init_process_group(
+            backend=backend, init_method="env://", rank=dist.rank, world_size=dist.world_size
+        )
+        return True
+    except Exception:
+        return False
+
+
+def barrier_if_possible() -> None:
+    """Execute a distributed barrier if torch.distributed is initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            torch.distributed.barrier()
+        except Exception:
+            pass
+
+
+def device_for_rank(base_device: str, local_rank: int) -> str:
+    """
+    Get the appropriate device string for a given rank.
+    
+    Handles CUDA_VISIBLE_DEVICES remapping.
+    """
+    d = (base_device or "").strip().lower()
+    if not d.startswith("cuda"):
+        return base_device
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if cvd:
+        if "," not in cvd:
+            return "cuda:0"
+    if d == "cuda":
+        return f"cuda:{local_rank}"
+    return base_device
+
+
+def pin_torch_cuda_device(device: str) -> None:
+    """Pin the current process to a specific CUDA device."""
+    if not torch.cuda.is_available():
+        return
+    d = (device or "").strip().lower()
+    if not d.startswith("cuda"):
+        return
+    idx = 0
+    if ":" in d:
+        try:
+            idx = int(d.split(":")[1])
+        except Exception:
+            idx = 0
+    if idx < torch.cuda.device_count():
+        torch.cuda.set_device(idx)
+
+
+def ultralytics_device_for_current_process(base_device: str) -> str:
+    """Get the Ultralytics-compatible device string for current process."""
+    d = (base_device or "").strip().lower()
+    if d.startswith("cuda") and torch.cuda.is_available():
+        return str(torch.cuda.current_device())
+    return base_device
+
+
+def iter_sharded(items: Iterable[Any], *, rank: int, world_size: int) -> Iterable[Any]:
+    """
+    Iterate over items sharded across multiple workers.
+    
+    Each worker only yields items where (index % world_size) == rank.
+    """
+    for i, item in enumerate(items):
+        if (i % world_size) == rank:
+            yield item

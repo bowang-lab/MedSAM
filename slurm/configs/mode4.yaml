@@ -1,0 +1,32 @@
+# Mode 4: Semi-Supervised Finetuning + MedSAM Pipeline
+# Full pipeline: Finetune YOLO -> Test YOLO -> Finetune MedSAM
+
+paths:
+  processed_dir_template: "{REPO_DIR}/src/image_data/parquet/processed_semi_supervised_dup{DUP_FACTOR}"
+  images_parquet_template: "{PROCESSED_DIR}/final_semi_supervised_dataset_{CONF_PCT}.parquet"
+  init_weights: "/home/cperez67/medsam/runs/run12/Train/Train/weights/best.pt"
+  out_dir_template: "{REPO_DIR}/DS/YOLO_SEMI_CONF{CONF_PCT}_dup{DUP_FACTOR}"
+  runs_root_template: "{REPO_DIR}/runs/finetune/semi_conf{CONF_PCT}_dup{DUP_FACTOR}"
+
+actions:
+  - --finetune-yolo
+  - --test-yolo
+  - --finetune-medsam
+
+training:
+  epochs: 30
+  batch: 16
+  imgsz: 640
+  workers: 16
+
+args:
+  - --images-parquet
+  - --init-weights
+  - --yolo-out-dir
+  - --finetune-runs-root
+  - --yolo-device
+  - --epochs
+  - --batch
+  - --imgsz
+  - --workers
+

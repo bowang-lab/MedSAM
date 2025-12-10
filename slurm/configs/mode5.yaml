@@ -1,0 +1,29 @@
+# Mode 5: Predictions Only (Standalone)
+# Run YOLO+MedSAM predictions on a dataset
+
+paths:
+  yolo_weights: "/scratch/st-ipor-1/cperez/MedSAM/runs/run13/Train/Train/weights/best.pt"
+  medsam_ckpt: "/scratch/st-ipor-1/cperez/MedSAM/weights/medsam_vit_b.pth"
+  predict_parquet: "/scratch/st-ipor-1/cperez/MedSAM/src/image_data/images_dev.parquet"
+  out_dir: "/scratch/st-ipor-1/cperez/MedSAM/PREDICT/experiment_predictions"
+
+actions:
+  - --predict
+
+prediction:
+  splits: "test"
+  batch_size: 128
+  sam_amp: true
+  resume: true
+
+args:
+  - --predict-parquet
+  - --yolo-weights
+  - --medsam-ckpt
+  - --predict-out-dir
+  - --yolo-device
+  - --predict-splits
+  - --predict-batch-size
+  - --predict-sam-amp
+  - --predict-resume
+

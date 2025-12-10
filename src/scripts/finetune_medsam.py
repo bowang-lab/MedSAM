@@ -33,7 +33,6 @@ from src.imgpipe.image import Image as IMG
 from src.imgpipe.normalized_box import NormalizedBox
 from src.imgpipe.enums import Structure, LabelType  # expects Structure.DISC/CUP, LabelType.GT/PRED
 
-# Optional dependencies
 try:
     from ultralytics import YOLO
 except Exception as _e:
@@ -97,13 +96,8 @@ PIXEL_STD = torch.tensor([58.395, 57.120, 57.375]).view(3, 1, 1)
 # =========================================================
 # Small utils
 # =========================================================
-def set_global_seed(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # no-op on CPU/MPS
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+# Import centralized seed function from utils
+from src.utils import set_global_seed
 
 
 def _ensure_sam_available():
@@ -467,18 +461,44 @@ def color_jitter_safe(img: PILImage.Image, brightness: float = 0.10, contrast: f
 
 
 # =========================================================
-# Polar transform helpers
+# Polar transform helpers (FunduSAM-style disc-centered)
 # =========================================================
-def cartesian_to_polar(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+def cartesian_to_polar(
+    img: np.ndarray,
+    out_h: int,
+    out_w: int,
+    center: Optional[Tuple[float, float]] = None,
+    radius: Optional[float] = None,
+) -> np.ndarray:
     """
     Convert Cartesian image (H,W or H,W,C) to polar coordinates.
-    Output is (out_h, out_w, C) or (out_h, out_w).
-    Center = image center, radius = min(H,W)/2.
+    
+    FunduSAM-style: Center on optic disc for better OD/OC alignment.
+    
+    Args:
+        img: Input image (H,W) or (H,W,C)
+        out_h, out_w: Output polar dimensions
+        center: (cx, cy) center point. If None, uses image center.
+        radius: Max radius for transform. If None, computed from image/center.
+    
+    Returns:
+        Polar-transformed image of shape (out_h, out_w) or (out_h, out_w, C)
     """
     _ensure_cv2_available()
     h, w = img.shape[:2]
-    center = (w / 2.0, h / 2.0)
-    radius = min(h, w) / 2.0
+    
+    if center is None:
+        center = (w / 2.0, h / 2.0)
+    
+    if radius is None:
+        # Compute radius to cover the entire image from the center
+        cx, cy = center
+        # Max distance from center to any corner
+        corners = [(0, 0), (w, 0), (0, h), (w, h)]
+        radius = max(np.sqrt((cx - x)**2 + (cy - y)**2) for x, y in corners)
+        # Clamp to reasonable bounds
+        radius = min(radius, max(w, h))
+    
     flags = cv2.WARP_POLAR_LINEAR
     polar = cv2.warpPolar(img, (out_w, out_h), center, radius, flags)
     # Rotate so angle axis becomes x-axis consistently
@@ -486,18 +506,80 @@ def cartesian_to_polar(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     return polar
 
 
-def polar_to_cartesian(img_polar: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+def polar_to_cartesian(
+    img_polar: np.ndarray,
+    out_h: int,
+    out_w: int,
+    center: Optional[Tuple[float, float]] = None,
+    radius: Optional[float] = None,
+) -> np.ndarray:
     """
-    Invert polar image back to Cartesian coordinates of size (out_h, out_w).
-    Assumes same center/radius convention as cartesian_to_polar with H=W=out_h=out_w.
+    Invert polar image back to Cartesian coordinates.
+    
+    Args:
+        img_polar: Polar image
+        out_h, out_w: Output Cartesian dimensions
+        center: Must match the center used in cartesian_to_polar
+        radius: Must match the radius used in cartesian_to_polar
+    
+    Returns:
+        Cartesian image of shape (out_h, out_w) or (out_h, out_w, C)
     """
     _ensure_cv2_available()
-    center = (out_w / 2.0, out_h / 2.0)
-    radius = min(out_h, out_w) / 2.0
+    
+    if center is None:
+        center = (out_w / 2.0, out_h / 2.0)
+    
+    if radius is None:
+        cx, cy = center
+        corners = [(0, 0), (out_w, 0), (0, out_h), (out_w, out_h)]
+        radius = max(np.sqrt((cx - x)**2 + (cy - y)**2) for x, y in corners)
+        radius = min(radius, max(out_w, out_h))
+    
     p = cv2.rotate(img_polar, cv2.ROTATE_90_COUNTERCLOCKWISE)
     flags = cv2.WARP_POLAR_LINEAR + cv2.WARP_INVERSE_MAP
     cart = cv2.warpPolar(p, (out_w, out_h), center, radius, flags)
     return cart
+
+
+def compute_disc_center_and_radius(
+    disc_box_xyxy: np.ndarray,
+    img_w: int,
+    img_h: int,
+    radius_padding: float = 1.5,
+) -> Tuple[Tuple[float, float], float]:
+    """
+    Compute polar transform center and radius from disc bounding box.
+    
+    FunduSAM centers the polar transform on the optic disc for better
+    alignment of circular OD/OC structures.
+    
+    Args:
+        disc_box_xyxy: [x1, y1, x2, y2] disc bounding box
+        img_w, img_h: Image dimensions
+        radius_padding: Multiplier for radius (1.5 = 50% padding around disc)
+    
+    Returns:
+        (center, radius) for polar transform
+    """
+    x1, y1, x2, y2 = disc_box_xyxy
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    
+    # Radius based on disc size with padding
+    disc_w = x2 - x1
+    disc_h = y2 - y1
+    base_radius = max(disc_w, disc_h) / 2.0 * radius_padding
+    
+    # Ensure radius covers enough of the image but not beyond
+    # Also ensure we capture the entire disc region
+    max_possible = min(
+        cx, cy, img_w - cx, img_h - cy  # Distance to edges
+    )
+    radius = min(base_radius, max_possible * 0.95)
+    radius = max(radius, max(disc_w, disc_h) / 2.0 * 1.2)  # At least cover disc
+    
+    return (cx, cy), radius
 
 
 # =========================================================
@@ -618,16 +700,50 @@ def make_joint_images(images: List[IMG]) -> List[IMG]:
     return out
 
 
+def fundu_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Custom collate function that handles metadata with non-tensor types.
+    
+    Stacks tensors normally, but collects metadata (dicts with strings/tuples)
+    into lists for easy iteration during testing.
+    """
+    result: Dict[str, Any] = {}
+    
+    # Identify keys from first sample
+    keys = batch[0].keys()
+    
+    for key in keys:
+        values = [sample[key] for sample in batch]
+        
+        if key == "meta":
+            # Metadata: collect as dict of lists
+            meta_keys = values[0].keys()
+            result[key] = {mk: [v[mk] for v in values] for mk in meta_keys}
+        elif isinstance(values[0], torch.Tensor):
+            # Stack tensors
+            result[key] = torch.stack(values, dim=0)
+        else:
+            # Other types: just collect as list
+            result[key] = values
+    
+    return result
+
+
 class FunduSAMDataset(Dataset):
     """
-    Joint OD/OC dataset in polar space with Option B prompts:
-    - Uses YOLO-predicted disc boxes (PRED) mixed with GT boxes,
-      controlled by use_det_prob and prompt_mode.
+    FunduSAM-style joint OD/OC dataset in polar space:
+    
+    Key features (matching FunduSAM paper):
+    - Uses YOLO-predicted disc boxes (PRED) mixed with GT boxes
+    - **Disc-centered polar transform**: Centers polar coordinates on optic disc
+      center from YOLO detection or GT box for better OD/OC alignment
     - Letterbox full fundus to (img_size, img_size)
-    - Convert image + masks from Cartesian → polar
-    - Returns:
+    - Convert image + masks from Cartesian → polar (disc-centered)
+    
+    Returns:
         image: (3, H, W) normalized SAM-style, in polar coords
         mask:  (2, H, W) binary [disc, cup], in polar coords
+        meta:  includes polar_center and polar_radius for inverse transform
     """
 
     def __init__(
@@ -640,6 +756,7 @@ class FunduSAMDataset(Dataset):
         box_tr: float = DEFAULT_BOX_TR,
         box_sc: float = DEFAULT_BOX_SC,
         prompt_mode: str = "mix",  # "mix" (train only), "gt", "det"
+        polar_radius_padding: float = 1.5,  # Padding around disc for polar radius
     ):
         _ensure_cv2_available()
         self.images = images
@@ -650,12 +767,14 @@ class FunduSAMDataset(Dataset):
         self.box_tr = box_tr
         self.box_sc = box_sc
         self.prompt_mode = prompt_mode
+        self.polar_radius_padding = polar_radius_padding
         self.letterbox = LetterboxToSquare(img_size)
 
     def __len__(self) -> int:
         return len(self.images)
 
     def _choose_disc_box(self, im: IMG) -> Optional[NormalizedBox]:
+        """Choose disc box: YOLO detection or GT based on mode."""
         gt = im.gt_disc_box
         det = im.inter_pred_disc_box
         if self.train and self.prompt_mode == "mix":
@@ -682,9 +801,10 @@ class FunduSAMDataset(Dataset):
         if self.train:
             img = color_jitter_safe(img, brightness=0.10, contrast=0.10)
 
+        # Get disc box for polar centering (prefer detection, fallback to GT/mask)
         base_nbox = self._choose_disc_box(im)
         if base_nbox is None:
-            # fallback to tight disc box
+            # Fallback to tight disc box from mask
             tb = mask_to_tight_box(np.array(m_disc, dtype=np.uint8))
             box_xyxy = tb if tb is not None else np.array(
                 [0, 0, img.size[0] - 1, img.size[1] - 1],
@@ -693,6 +813,10 @@ class FunduSAMDataset(Dataset):
         else:
             box_xyxy = nbox_to_xyxy(base_nbox, im.width, im.height)
 
+        # Store original disc box for polar centering before any jitter
+        disc_box_orig = box_xyxy.copy()
+
+        # Apply padding/jitter to box (for letterbox cropping context)
         pad_frac = (random.uniform(0.0, self.pad_jitter) if self.train else 0.0)
         box_p = pad_box(box_xyxy, pad_frac, im.width, im.height)
         if self.train and (self.box_tr > 0.0 or self.box_sc > 0.0):
@@ -702,14 +826,33 @@ class FunduSAMDataset(Dataset):
         img_cart, disc_cart, box_t = self.letterbox(img, m_disc, box_p)
         _, cup_cart, _ = self.letterbox(img, m_cup, box_p)
 
-        # Cartesian → polar for image and masks
+        # Compute disc center in letterboxed coordinates for polar transform
+        # The box_t is the transformed box after letterboxing
+        # Use the center of the transformed disc box
+        polar_center, polar_radius = compute_disc_center_and_radius(
+            box_t,
+            self.img_size,
+            self.img_size,
+            radius_padding=self.polar_radius_padding,
+        )
+
+        # Cartesian → polar (disc-centered) for image and masks
         img_np = np.array(img_cart)
         disc_np = np.array(disc_cart, dtype=np.uint8)
         cup_np = np.array(cup_cart, dtype=np.uint8)
 
-        img_pol = cartesian_to_polar(img_np, out_h=self.img_size, out_w=self.img_size)
-        disc_pol = cartesian_to_polar(disc_np, out_h=self.img_size, out_w=self.img_size)
-        cup_pol = cartesian_to_polar(cup_np, out_h=self.img_size, out_w=self.img_size)
+        img_pol = cartesian_to_polar(
+            img_np, out_h=self.img_size, out_w=self.img_size,
+            center=polar_center, radius=polar_radius
+        )
+        disc_pol = cartesian_to_polar(
+            disc_np, out_h=self.img_size, out_w=self.img_size,
+            center=polar_center, radius=polar_radius
+        )
+        cup_pol = cartesian_to_polar(
+            cup_np, out_h=self.img_size, out_w=self.img_size,
+            center=polar_center, radius=polar_radius
+        )
 
         img_pol_pil = PILImage.fromarray(img_pol)
         x = preprocess_for_sam(img_pol_pil)
@@ -719,7 +862,13 @@ class FunduSAMDataset(Dataset):
         y = torch.from_numpy(np.stack([disc_bin, cup_bin], axis=0))  # (2,H,W)
 
         b = torch.from_numpy(box_t.astype(np.float32))
-        meta = {"image_path": str(im.image_path), "stem": Path(im.image_path).stem}
+        meta = {
+            "image_path": str(im.image_path),
+            "stem": Path(im.image_path).stem,
+            # Store polar params for inverse transform during inference
+            "polar_center": polar_center,
+            "polar_radius": polar_radius,
+        }
         return {"image": x, "mask": y, "box": b, "meta": meta}
 
 
@@ -754,19 +903,37 @@ def dice_coef_prob(prob: torch.Tensor, target: torch.Tensor, thresh: float = 0.5
 
 class FunduJointLoss(nn.Module):
     """
-    Fundu-style joint loss:
-    L = w1 * L_disc + w2 * L_cup + w3 * L_contain
+    FunduSAM-style joint loss:
+    L = w1 * (BCE_disc + Dice_disc) + w2 * (BCE_cup + Dice_cup) + w3 * L_contain
     where:
-      - L_disc, L_cup are BCE losses for disc and cup
-      - L_contain penalizes cup pixels outside the disc
+      - BCE + Dice for both disc and cup (standard segmentation combo)
+      - L_contain penalizes cup pixels outside the disc (structural constraint)
     """
 
-    def __init__(self, w_disc: float = 1.0, w_cup: float = 1.0, w_contain: float = 1.0):
+    def __init__(
+        self,
+        w_disc: float = 1.0,
+        w_cup: float = 2.0,  # Cup is typically smaller, weight higher
+        w_contain: float = 1.0,
+        bce_weight: float = 0.5,  # Balance BCE vs Dice
+        smooth: float = 1e-6,
+    ):
         super().__init__()
-        self.ce = nn.BCEWithLogitsLoss()
+        self.bce = nn.BCEWithLogitsLoss()
         self.w_disc = w_disc
         self.w_cup = w_cup
         self.w_contain = w_contain
+        self.bce_weight = bce_weight
+        self.smooth = smooth
+
+    def _dice_loss(self, prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute Dice loss for a single class."""
+        # prob: (B, H, W) already sigmoid-ed
+        # target: (B, H, W)
+        num = 2.0 * (prob * target).sum(dim=(1, 2)) + self.smooth
+        den = prob.sum(dim=(1, 2)) + target.sum(dim=(1, 2)) + self.smooth
+        dice = num / den
+        return 1.0 - dice.mean()
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -778,12 +945,21 @@ class FunduJointLoss(nn.Module):
         gt_disc = target[:, 0]
         gt_cup = target[:, 1]
 
-        L_disc = self.ce(log_disc, gt_disc)
-        L_cup = self.ce(log_cup, gt_cup)
+        # BCE losses
+        bce_disc = self.bce(log_disc, gt_disc)
+        bce_cup = self.bce(log_cup, gt_cup)
 
+        # Dice losses (need probabilities)
         prob_disc = torch.sigmoid(log_disc)
         prob_cup = torch.sigmoid(log_cup)
-        # cup outside disc
+        dice_disc = self._dice_loss(prob_disc, gt_disc)
+        dice_cup = self._dice_loss(prob_cup, gt_cup)
+
+        # Combined BCE + Dice per structure
+        L_disc = self.bce_weight * bce_disc + (1.0 - self.bce_weight) * dice_disc
+        L_cup = self.bce_weight * bce_cup + (1.0 - self.bce_weight) * dice_cup
+
+        # Containment: penalize cup pixels outside disc
         L_contain = torch.mean(prob_cup * (1.0 - prob_disc))
 
         return self.w_disc * L_disc + self.w_cup * L_cup + self.w_contain * L_contain
@@ -826,25 +1002,34 @@ class FunduBlock(nn.Module):
 
 
 class ChannelAttention(nn.Module):
+    """
+    Channel attention module from CBAM.
+    Uses both avg-pool and max-pool followed by shared MLP.
+    """
     def __init__(self, channels: int, ratio: int = 16):
         super().__init__()
+        reduced = max(channels // ratio, 8)  # Ensure minimum dimension
         self.mlp = nn.Sequential(
-            nn.Linear(channels, channels // ratio, bias=False),
+            nn.Linear(channels, reduced, bias=False),
             nn.ReLU(inplace=True),
-            nn.Linear(channels // ratio, channels, bias=False),
+            nn.Linear(reduced, channels, bias=False),
         )
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B,C,H,W)
-        avg = torch.mean(x, dim=(2, 3), keepdim=False)
-        max_ = torch.amax(x, dim=(2, 3), keepdim=False)
-        attn = self.mlp(avg) + self.mlp(max_)
-        attn = self.sigmoid(attn).unsqueeze(-1).unsqueeze(-1)
+        avg = torch.mean(x, dim=(2, 3), keepdim=False)  # (B,C)
+        max_ = torch.amax(x, dim=(2, 3), keepdim=False)  # (B,C)
+        attn = self.mlp(avg) + self.mlp(max_)  # shared MLP
+        attn = self.sigmoid(attn).unsqueeze(-1).unsqueeze(-1)  # (B,C,1,1)
         return x * attn
 
 
 class SpatialAttention(nn.Module):
+    """
+    Spatial attention module from CBAM.
+    Uses channel-wise avg and max pooling followed by conv.
+    """
     def __init__(self, kernel_size: int = 7):
         super().__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
@@ -852,11 +1037,28 @@ class SpatialAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B,C,H,W)
-        avg = torch.mean(x, dim=1, keepdim=True)
-        max_, _ = torch.max(x, dim=1, keepdim=True)
-        attn = torch.cat([avg, max_], dim=1)
-        attn = self.sigmoid(self.conv(attn))
+        avg = torch.mean(x, dim=1, keepdim=True)  # (B,1,H,W)
+        max_, _ = torch.max(x, dim=1, keepdim=True)  # (B,1,H,W)
+        attn = torch.cat([avg, max_], dim=1)  # (B,2,H,W)
+        attn = self.sigmoid(self.conv(attn))  # (B,1,H,W)
         return x * attn
+
+
+class CBAM(nn.Module):
+    """
+    Convolutional Block Attention Module (CBAM).
+    Applies channel attention followed by spatial attention.
+    This is the proper FunduSAM-style CBAM applied to encoder features.
+    """
+    def __init__(self, channels: int, ratio: int = 16, kernel_size: int = 7):
+        super().__init__()
+        self.channel_attn = ChannelAttention(channels, ratio)
+        self.spatial_attn = SpatialAttention(kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.channel_attn(x)
+        x = self.spatial_attn(x)
+        return x
 
 
 class ConvBlock(nn.Module):
@@ -905,12 +1107,18 @@ class FunduSegHead(nn.Module):
 
 class FunduSAMFinetuner(nn.Module):
     """
-    Fundu-style model:
-    - SAM image encoder with adapters in the last few blocks (lighter)
-    - Spatial CBAM on input image
-    - Channel CBAM on encoder feature map
-    - Segmentation head -> 2-channel OD/OC mask in polar space
-    - No prompt encoder / mask decoder usage
+    FunduSAM-style model (matching the paper):
+    
+    Key components:
+    - SAM image encoder with adapters in ALL transformer blocks (PEFT)
+    - CBAM (Channel + Spatial attention) applied to encoder features
+    - Custom segmentation head for 2-channel OD/OC mask in polar space
+    - No prompt encoder / mask decoder usage (direct segmentation)
+    
+    Architecture differences from original SAM:
+    - Adapters inserted after attention AND FFN in every block
+    - CBAM enhances encoder output features
+    - Direct segmentation head replaces prompt-based decoding
     """
 
     def __init__(
@@ -918,10 +1126,13 @@ class FunduSAMFinetuner(nn.Module):
         sam_type: str,
         checkpoint: Path,
         freeze_encoders: bool = True,
-        adapter_bottleneck: int = 32,
+        adapter_bottleneck: int = 64,  # Increased from 32 for better capacity
         num_classes: int = 2,
-        last_n_adapted: int = 4,
+        adapt_all_blocks: bool = True,  # FunduSAM uses adapters in ALL blocks
+        last_n_adapted: int = 12,  # Fallback if not adapting all (vit_b has 12 blocks)
         seg_width: int = 128,
+        cbam_ratio: int = 16,
+        cbam_kernel_size: int = 7,
     ):
         super().__init__()
         _ensure_sam_available()
@@ -958,48 +1169,49 @@ class FunduSAMFinetuner(nn.Module):
         else:
             raise RuntimeError("Unexpected SAM image encoder structure: no blocks found.")
 
-        # Wrap only the last few blocks with adapters (memory-friendly)
+        # FunduSAM: Wrap ALL blocks with adapters (PEFT across entire encoder)
         n_blocks = len(enc.blocks)
         wrapped_blocks = []
         for i, b in enumerate(enc.blocks):
-            if i >= n_blocks - max(1, last_n_adapted):
+            if adapt_all_blocks or i >= n_blocks - max(1, last_n_adapted):
                 wrapped_blocks.append(FunduBlock(b, dim=dim, bottleneck=adapter_bottleneck))
             else:
                 wrapped_blocks.append(b)
         enc.blocks = nn.ModuleList(wrapped_blocks)
         self.image_encoder = enc
 
-        # CBAM
+        # FunduSAM: CBAM applied to encoder output features (not input!)
         out_chans = getattr(enc, "out_chans", 256)
-        self.spatial_attn = SpatialAttention()
-        self.channel_attn = ChannelAttention(out_chans)
+        self.cbam = CBAM(out_chans, ratio=cbam_ratio, kernel_size=cbam_kernel_size)
 
-        # Segmentation head (still low-res)
+        # Segmentation head (outputs at low-res, upsampled in forward)
         self.seg_head = FunduSegHead(in_ch=out_chans, num_classes=num_classes, width=seg_width)
 
-        # Freeze encoder weights if requested, but keep adapters & seg_head trainable
+        # Freeze encoder weights if requested, but keep adapters, CBAM & seg_head trainable
         if freeze_encoders:
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
+            # Unfreeze adapter parameters
             for blk in self.image_encoder.blocks:
                 if isinstance(blk, FunduBlock):
                     for m in [blk.adapter_after_attn, blk.adapter_after_ffn]:
                         for p in m.parameters():
                             p.requires_grad = True
 
+        # CBAM and seg_head are always trainable
+        for p in self.cbam.parameters():
+            p.requires_grad = True
         for p in self.seg_head.parameters():
             p.requires_grad = True
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = batch["image"]  # (B,3,H,W) in polar coords
-        # Spatial attention at input
-        x = self.spatial_attn(x)
 
-        # Image encoder
+        # Image encoder (with adapters in all blocks)
         feat = self.image_encoder(x)  # (B,C,h,w)
 
-        # Channel attention on features
-        feat = self.channel_attn(feat)
+        # FunduSAM: CBAM on encoder features (Channel + Spatial attention)
+        feat = self.cbam(feat)
 
         # Segmentation head (still low-res)
         logits_low = self.seg_head(feat)  # (B,2,h,w)
@@ -1065,6 +1277,9 @@ class TrainConfig:
     pad_jitter: float = DEFAULT_PAD_JITTER
     box_jitter_tr: float = DEFAULT_BOX_TR
     box_jitter_sc: float = DEFAULT_BOX_SC
+    
+    # Polar transform (FunduSAM-style disc-centered)
+    polar_radius_padding: float = 1.5  # Padding around disc for polar radius
 
     # Modes
     do_train: bool = True
@@ -1122,7 +1337,7 @@ class Trainer:
         joint_val = make_joint_images(val_imgs)
         joint_test = make_joint_images(test_imgs)
 
-        # Datasets/Loaders (polar, Option B mixing on train)
+        # Datasets/Loaders (FunduSAM-style polar with disc-centered transform)
         self.ds_train = FunduSAMDataset(
             joint_train,
             img_size=cfg.imgsz,
@@ -1131,7 +1346,8 @@ class Trainer:
             pad_jitter=cfg.pad_jitter,
             box_tr=cfg.box_jitter_tr,
             box_sc=cfg.box_jitter_sc,
-            prompt_mode="mix",  # GT/DET mix
+            prompt_mode="mix",  # GT/DET mix during training
+            polar_radius_padding=cfg.polar_radius_padding,
         )
         self.ds_val = FunduSAMDataset(
             joint_val,
@@ -1142,6 +1358,7 @@ class Trainer:
             box_tr=0.0,
             box_sc=0.0,
             prompt_mode="gt",
+            polar_radius_padding=cfg.polar_radius_padding,
         )
         self.ds_test = FunduSAMDataset(
             joint_test,
@@ -1152,6 +1369,7 @@ class Trainer:
             box_tr=0.0,
             box_sc=0.0,
             prompt_mode=("det" if cfg.test_prompt == "det" else "gt"),
+            polar_radius_padding=cfg.polar_radius_padding,
         )
 
         # Samplers
@@ -1176,7 +1394,7 @@ class Trainer:
             else None
         )
 
-        # Loaders
+        # Loaders (use custom collate for metadata handling)
         self.dl_train = DataLoader(
             self.ds_train,
             batch_size=cfg.batch,
@@ -1185,6 +1403,7 @@ class Trainer:
             pin_memory=True,
             drop_last=False,
             sampler=self.sampler_train,
+            collate_fn=fundu_collate_fn,
         )
         self.dl_val = DataLoader(
             self.ds_val,
@@ -1193,6 +1412,7 @@ class Trainer:
             num_workers=cfg.workers,
             pin_memory=True,
             sampler=self.sampler_val,
+            collate_fn=fundu_collate_fn,
         )
         # Test loader is rank-0 only (simplifies writing artifacts)
         self.dl_test = DataLoader(
@@ -1201,6 +1421,7 @@ class Trainer:
             shuffle=False,
             num_workers=cfg.workers,
             pin_memory=True,
+            collate_fn=fundu_collate_fn,
         )
 
         # Model
@@ -1389,26 +1610,38 @@ class Trainer:
         summary = {"disc_sum": 0.0, "cup_sum": 0.0, "disc_n": 0, "cup_n": 0}
         with jl_path.open("w") as jf, torch.no_grad():
             for batch in self.dl_test:
-                metas = batch["meta"]
-                batch = {k: v for k, v in batch.items() if k != "meta"}
-                batch = _to_device(batch, self.device)
-                logits, _ = self._unwrap()(batch)  # (B,2,H,W) in polar
+                metas = batch["meta"]  # Dict of lists from custom collate
+                batch_tensors = {k: v for k, v in batch.items() if k != "meta"}
+                batch_tensors = _to_device(batch_tensors, self.device)
+                logits, _ = self._unwrap()(batch_tensors)  # (B,2,H,W) in polar
                 prob = torch.sigmoid(logits)
 
                 for i in range(prob.shape[0]):
-                    stem = metas[i]["stem"]
+                    # Access metadata from dict-of-lists format
+                    stem = metas["stem"][i]
+                    image_path = metas["image_path"][i]
+                    
+                    # Get polar transform params for inverse (disc-centered)
+                    polar_center = metas["polar_center"][i]
+                    polar_radius = metas["polar_radius"][i]
 
                     # Dice in polar domain
-                    d_disc = dice_coef_prob(prob[i, 0:1], batch["mask"][i, 0:1])
-                    d_cup = dice_coef_prob(prob[i, 1:2], batch["mask"][i, 1:2])
+                    d_disc = dice_coef_prob(prob[i, 0:1], batch_tensors["mask"][i, 0:1])
+                    d_cup = dice_coef_prob(prob[i, 1:2], batch_tensors["mask"][i, 1:2])
 
                     # Threshold in polar
                     disc_pol = (prob[i, 0].cpu().numpy() >= 0.5).astype(np.uint8) * 255
                     cup_pol = (prob[i, 1].cpu().numpy() >= 0.5).astype(np.uint8) * 255
 
-                    # Convert back to Cartesian (letterboxed 1024×1024)
-                    disc_cart = polar_to_cartesian(disc_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz)
-                    cup_cart = polar_to_cartesian(cup_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz)
+                    # Convert back to Cartesian using disc-centered params
+                    disc_cart = polar_to_cartesian(
+                        disc_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz,
+                        center=polar_center, radius=polar_radius
+                    )
+                    cup_cart = polar_to_cartesian(
+                        cup_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz,
+                        center=polar_center, radius=polar_radius
+                    )
 
                     disc_cart = disc_cart.astype(np.uint8)
                     cup_cart = cup_cart.astype(np.uint8)
@@ -1419,11 +1652,13 @@ class Trainer:
                     PILImage.fromarray(cup_cart).save(str(save_cup))
 
                     rec = {
-                        "image": metas[i]["image_path"],
+                        "image": image_path,
                         "stem": stem,
                         "dice_disc": float(d_disc),
                         "dice_cup": float(d_cup),
                         "prompt": self.cfg.test_prompt,
+                        "polar_center": list(polar_center) if isinstance(polar_center, tuple) else polar_center,
+                        "polar_radius": float(polar_radius),
                         "mask_disc_path": str(save_disc),
                         "mask_cup_path": str(save_cup),
                     }
@@ -1600,6 +1835,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_BOX_SC,
         help=f"Box scale jitter (default: {DEFAULT_BOX_SC})",
     )
+    p.add_argument(
+        "--polar-radius-padding",
+        type=float,
+        default=1.5,
+        help="Padding multiplier for polar transform radius around disc (default: 1.5)",
+    )
 
     # Modes
     p.add_argument("--train", action="store_true")
@@ -1645,6 +1886,7 @@ def main():
         pad_jitter=args.pad_jitter,
         box_jitter_tr=args.box_jitter_tr,
         box_jitter_sc=args.box_jitter_sc,
+        polar_radius_padding=args.polar_radius_padding,
         do_train=args.train,
         do_test=args.test,
         test_prompt=args.test_prompt,

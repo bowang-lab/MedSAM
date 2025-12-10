@@ -1,0 +1,23 @@
+# Mode 6: Training + Predictions Pipeline
+# Train YOLO -> Test -> Run predictions on test set
+
+paths:
+  out_dir: "/scratch/st-ipor-1/cperez/MedSAM/DS/Stage_Two_YOLO_DS"
+
+actions:
+  - --train-yolo
+  - --test-yolo
+  - --predict
+
+prediction:
+  splits: "test"
+  batch_size: 128
+  sam_amp: true
+
+args:
+  - --yolo-out-dir
+  - --yolo-device
+  - --predict-splits
+  - --predict-batch-size
+  - --predict-sam-amp
+

@@ -1,0 +1,25 @@
+# Mode 2: Parquet Splits (Reproducible)
+# Training from parquet splits
+
+paths:
+  splits_parquet: "/home/cperez67/medsam/src/image_data/parquet/combined.parquet"
+  out_dir: "/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS_CONF_0.85_FROM_PARQUET"
+
+actions:
+  - --create-ds
+  - --train-yolo
+  - --test-yolo
+
+training:
+  epochs: 800
+  batch: 16
+  imgsz: 640
+
+args:
+  - --splits-parquet
+  - --yolo-out-dir
+  - --splits-batch-size
+  - --yolo-device
+  - --epochs
+  - --batch
+

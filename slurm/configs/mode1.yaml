@@ -1,0 +1,14 @@
+# Mode 1: Standard / Stage Two (Raw Folders)
+# Train YOLO from scratch on raw dataset folders
+
+paths:
+  out_dir: "/scratch/st-ipor-1/cperez/MedSAM/DS/Stage_Two_YOLO_DS"
+
+actions:
+  - --train-yolo
+  - --test-yolo
+
+args:
+  - --yolo-out-dir
+  - --yolo-device
+

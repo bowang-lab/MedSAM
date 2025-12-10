@@ -1,0 +1,32 @@
+# Mode 3: Semi-Supervised YOLO Finetuning
+# Finetunes YOLO from pretrained weights using processed parquet
+
+paths:
+  # These use template variables: {REPO_DIR}, {CONF_PCT}, {DUP_FACTOR}
+  processed_dir_template: "{REPO_DIR}/src/image_data/parquet/processed_semi_supervised_dup{DUP_FACTOR}"
+  images_parquet_template: "{PROCESSED_DIR}/final_semi_supervised_dataset_{CONF_PCT}.parquet"
+  init_weights: "/home/cperez67/medsam/runs/run12/Train/Train/weights/best.pt"
+  out_dir_template: "{REPO_DIR}/DS/YOLO_SEMI_CONF{CONF_PCT}_dup{DUP_FACTOR}"
+  runs_root_template: "{REPO_DIR}/runs/finetune/semi_conf{CONF_PCT}_dup{DUP_FACTOR}"
+
+actions:
+  - --finetune-yolo
+  - --test-yolo
+
+training:
+  epochs: 30  # Can be overridden via --epochs CLI arg
+  batch: 16
+  imgsz: 640
+  workers: 16
+
+args:
+  - --images-parquet
+  - --init-weights
+  - --yolo-out-dir
+  - --finetune-runs-root
+  - --yolo-device
+  - --epochs
+  - --batch
+  - --imgsz
+  - --workers
+

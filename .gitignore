@@ -13,6 +13,11 @@ data/
 work_dir/
 runs/
 results/
+DS/
+PREDICT/
+OUT/
+test/
+image_data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

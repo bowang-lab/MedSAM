@@ -47,9 +47,14 @@ from  src.imgpipe.enums import LabelType, Structure
 
 # ----------------------- Small Utilities ----------------------- #
 
+# Import centralized directory utilities from utils
+from src.utils import ensure_dir
+
+
 def _ensure_dir(p: Optional[Path]) -> None:
+    """Wrapper for compatibility - use ensure_dir from utils."""
     if p is not None:
-        p.parent.mkdir(parents=True, exist_ok=True)
+        ensure_dir(p.parent)
 
 
 def _isfinite(x: Optional[float]) -> bool:

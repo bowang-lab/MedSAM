@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
 # File: src/scripts/predict_summarize.py
+"""
+YOLO+MedSAM Prediction Pipeline with Multi-GPU Support.
+
+This module provides both a CLI interface and a programmatic API for running
+predictions using YOLO detection + MedSAM segmentation.
+
+API Usage:
+    from src.scripts.predict_summarize import PredictConfig, run_predictions
+    
+    config = PredictConfig(
+        images_parquet=Path("images.parquet"),
+        yolo_weights=Path("best.pt"),
+        medsam_checkpoint=Path("medsam_vit_b.pth"),
+        out_dir=Path("predictions/"),
+        device="cuda",
+    )
+    summary = run_predictions(config)
+
+CLI Usage:
+    python -m src.scripts.predict_summarize \\
+        --images-parquet images.parquet \\
+        --yolo-weights best.pt \\
+        --medsam-checkpoint medsam_vit_b.pth \\
+        --out-dir predictions/
+"""
 
 from __future__ import annotations
 
@@ -8,7 +33,7 @@ import csv
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -21,12 +46,114 @@ from tqdm import tqdm
 from src.imgpipe.image import Image
 from src.model.predictor import (
     Predictor,
-    PredictorConfig,
+    PredictorConfig as _PredictorConfig,
     YoloPredictorConfig,
     MedSamPredictorConfig,
 )
 
+# Import centralized utilities
+from src.utils import (
+    ensure_dir as _util_ensure_dir,
+    is_finite as _is_finite,
+    mean_std as _mean_std,
+    list_files_with_ext,
+    DistInfo,
+    get_dist_info as _get_dist_info,
+    maybe_init_torch_distributed as _maybe_init_torch_distributed,
+    barrier_if_possible as _barrier_if_possible,
+    device_for_rank as _device_for_rank,
+    pin_torch_cuda_device as _pin_torch_cuda_device,
+    ultralytics_device_for_current_process as _ultralytics_device_str_for_current_process,
+    iter_sharded as _iter_sharded_items,
+)
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+# =========================
+# Configuration Dataclass
+# =========================
+
+@dataclass
+class PredictConfig:
+    """
+    Configuration for running YOLO+MedSAM predictions.
+    
+    Required fields:
+        out_dir: Output directory for predictions
+        yolo_weights: Path to YOLO weights file
+        medsam_checkpoint: Path to MedSAM checkpoint
+        
+    Input source (one required):
+        images_parquet: Path to parquet file with images
+        images_dir: Path to directory with images
+    """
+    # Output
+    out_dir: Path
+    
+    # Model weights (required)
+    yolo_weights: Path
+    medsam_checkpoint: Path
+    
+    # Input source (one required)
+    images_parquet: Optional[Path] = None
+    images_dir: Optional[Path] = None
+    image_pattern: str = "*"
+    inference_dataset: str = "inference"
+    inference_split: Optional[str] = None
+    
+    # Device / Hardware
+    device: str = "cuda"
+    
+    # YOLO settings
+    conf: float = 0.001
+    iou: float = 0.70
+    imgsz: int = 640
+    yolo_batch: Optional[int] = None
+    
+    # MedSAM settings
+    sam_amp: bool = True
+    sam_resize_backend: str = "cv2"
+    box_pad_frac: float = 0.05
+    
+    # Output options
+    save_overlays: bool = False
+    mask_store: str = "parquet"  # "png", "parquet", "both", "none"
+    image_store: str = "none"  # "parquet", "none"
+    
+    # Filtering
+    splits: Optional[str] = None  # comma-separated
+    datasets: Optional[str] = None  # comma-separated
+    
+    # Batch / Performance
+    parquet_read_batch: int = 1024
+    predict_batch_size: int = 128
+    
+    # Resume / Recompute
+    resume: bool = False
+    force_recompute: bool = False
+    
+    # Output naming
+    final_parquet_name: str = "predictions.parquet"
+    final_parquet_compression: str = "zstd"
+    final_parquet_batch: int = 2048
+    summary_csv: Optional[Path] = None
+    
+    def __post_init__(self):
+        """Validate configuration."""
+        if not self.images_parquet and not self.images_dir:
+            raise ValueError("Either images_parquet or images_dir must be provided")
+        # Convert to Path if needed
+        if isinstance(self.out_dir, str):
+            self.out_dir = Path(self.out_dir)
+        if isinstance(self.yolo_weights, str):
+            self.yolo_weights = Path(self.yolo_weights)
+        if isinstance(self.medsam_checkpoint, str):
+            self.medsam_checkpoint = Path(self.medsam_checkpoint)
+        if self.images_parquet and isinstance(self.images_parquet, str):
+            self.images_parquet = Path(self.images_parquet)
+        if self.images_dir and isinstance(self.images_dir, str):
+            self.images_dir = Path(self.images_dir)
 
 
 # =========================
@@ -34,24 +161,9 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # =========================
 
 def _ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
+    """Wrapper that returns the path for chaining."""
+    _util_ensure_dir(p)
     return p
-
-
-def _is_finite(x: Any) -> bool:
-    try:
-        return (x is not None) and bool(np.isfinite(float(x)))
-    except Exception:
-        return False
-
-
-def _mean_std(xs: List[float]) -> Tuple[Optional[float], Optional[float]]:
-    if not xs:
-        return None, None
-    arr = np.asarray(xs, dtype=float)
-    mean = float(np.mean(arr))
-    std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
-    return mean, std
 
 
 def _relative_subdir(image_path: Path, images_root: Optional[Path]) -> Path:
@@ -170,8 +282,13 @@ def _save_pred_masks_for_image(
 
 
 def _gather_image_files(images_dir: Path, pattern: str) -> List[Path]:
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-    return sorted(p for p in images_dir.rglob(pattern) if p.suffix.lower() in exts)
+    """Gather image files from directory. Uses centralized list_files_with_ext."""
+    # Filter by pattern if not "*"
+    all_images = list_files_with_ext(images_dir, recursive=True)
+    if pattern == "*":
+        return all_images
+    import fnmatch
+    return sorted(p for p in all_images if fnmatch.fnmatch(p.name, pattern))
 
 
 def _make_images_from_dir(
@@ -263,88 +380,9 @@ def append_summary_row_to_csv(csv_path: Path, pred_ref: Path, summary: Dict[str,
 # =========================
 # Distributed / Multi-GPU helpers
 # =========================
-
-@dataclass(frozen=True)
-class DistInfo:
-    rank: int
-    world_size: int
-    local_rank: int
-
-
-def _get_dist_info() -> DistInfo:
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        return DistInfo(
-            rank=int(os.environ["RANK"]),
-            world_size=int(os.environ["WORLD_SIZE"]),
-            local_rank=int(os.environ.get("LOCAL_RANK", "0"))
-        )
-    if "SLURM_PROCID" in os.environ:
-        return DistInfo(
-            rank=int(os.environ["SLURM_PROCID"]),
-            world_size=int(os.environ["SLURM_NTASKS"]),
-            local_rank=int(os.environ.get("SLURM_LOCALID", "0"))
-        )
-    return DistInfo(rank=0, world_size=1, local_rank=0)
-
-
-def _maybe_init_torch_distributed(dist: DistInfo) -> bool:
-    if dist.world_size <= 1 or not torch.distributed.is_available():
-        return False
-    if torch.distributed.is_initialized():
-        return True
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    try:
-        torch.distributed.init_process_group(
-            backend=backend, init_method="env://", rank=dist.rank, world_size=dist.world_size
-        )
-        return True
-    except Exception:
-        return False
-
-
-def _barrier_if_possible() -> None:
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        try:
-            torch.distributed.barrier()
-        except Exception:
-            pass
-
-
-def _device_for_rank(base_device: str, local_rank: int) -> str:
-    d = (base_device or "").strip().lower()
-    if not d.startswith("cuda"):
-        return base_device
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if cvd:
-        if "," not in cvd:
-            return "cuda:0"
-    if d == "cuda":
-        return f"cuda:{local_rank}"
-    return base_device
-
-
-def _pin_torch_cuda_device(device: str) -> None:
-    if not torch.cuda.is_available():
-        return
-    d = (device or "").strip().lower()
-    if not d.startswith("cuda"):
-        return
-    idx = 0
-    if ":" in d:
-        try:
-            idx = int(d.split(":")[1])
-        except Exception:
-            idx = 0
-    if idx < torch.cuda.device_count():
-        torch.cuda.set_device(idx)
-
-
-def _ultralytics_device_str_for_current_process(base_device: str) -> str:
-    d = (base_device or "").strip().lower()
-    if d.startswith("cuda") and torch.cuda.is_available():
-        return str(torch.cuda.current_device())
-    return base_device
-
+# NOTE: Core distributed helpers (DistInfo, get_dist_info, maybe_init_torch_distributed,
+#       barrier_if_possible, device_for_rank, pin_torch_cuda_device, 
+#       ultralytics_device_for_current_process) are now imported from src.utils
 
 def _dataset_dir(out_dir: Path) -> Path:
     return out_dir / "predictions.dataset"
@@ -394,9 +432,8 @@ def _existing_part_count(rank_dir: Path) -> int:
 
 
 def _iter_sharded_images(it: Iterable[Image], *, rank: int, world_size: int) -> Iterable[Image]:
-    for i, img in enumerate(it):
-        if (i % world_size) == rank:
-            yield img
+    """Wrapper around iter_sharded for Image objects."""
+    return _iter_sharded_items(it, rank=rank, world_size=world_size)
 
 
 # =========================
@@ -532,83 +569,28 @@ def summarize_predictions_dataset(
 
 
 # =========================
-# CLI
+# Core Prediction API
 # =========================
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Run YOLO+MedSAM predictions (resumable + multi-GPU) and summarize results.")
-
-    p.add_argument("--images-parquet", type=Path, default=None)
-    p.add_argument("--images-dir", type=Path, default=None)
-    p.add_argument("--image-pattern", type=str, default="*")
-    p.add_argument("--inference-dataset", type=str, default="inference")
-    p.add_argument("--inference-split", type=str, default=None)
-
-    p.add_argument("--yolo-weights", type=Path, default=None)
-    p.add_argument("--medsam-checkpoint", type=Path, default=None)
-
-    p.add_argument("--device", type=str, default="cuda", help="cuda | cuda:<id> | cpu | mps")
-
-    p.add_argument("--conf", type=float, default=0.001)
-    p.add_argument("--iou", type=float, default=0.70)
-    p.add_argument("--imgsz", type=int, default=640)
-
-    p.add_argument("--save-overlays", action="store_true")
-    p.add_argument("--no-save-masks", action="store_true")
-    p.add_argument("--box-pad-frac", type=float, default=0.05)
-
-    p.add_argument("--sam-amp", action="store_true", help="Enable CUDA AMP for MedSAM (if supported by predictor).")
-    p.add_argument("--sam-no-amp", action="store_true", help="Disable CUDA AMP for MedSAM (if supported by predictor).")
-    p.add_argument("--sam-resize-backend", type=str, default="cv2", choices=("cv2", "pil"))
-
-    p.add_argument("--out-dir", type=Path, required=True)
-    p.add_argument("--summary-csv", type=Path, default=None)
-
-    p.add_argument("--splits", type=str, default=None)
-    p.add_argument("--datasets", type=str, default=None)
-
-    p.add_argument("--parquet-read-batch", type=int, default=1024)
-    p.add_argument("--predict-batch-size", type=int, default=128)
-
-    p.add_argument("--yolo-batch", type=int, default=None, help="Ultralytics YOLO batch size for inference.")
-
-    p.add_argument("--resume", action="store_true")
-    p.add_argument("--force-recompute", action="store_true")
-
-    p.add_argument(
-        "--mask-store",
-        type=str,
-        choices=("png", "parquet", "both", "none"),
-        default="parquet",
-        help="Where to store predicted masks. 'parquet' stores packed masks in output parquet; "
-             "'png' writes oc_mask/od_mask PNGs; 'both' does both; 'none' stores neither.",
-    )
-
-    p.add_argument(
-        "--image-store",
-        type=str,
-        choices=("parquet", "none"),
-        default="none",
-        help="Whether to embed raw image bytes in the output parquets (large!).",
-    )
-
-    p.add_argument("--final-parquet-name", type=str, default="predictions.parquet")
-    p.add_argument("--final-parquet-compression", type=str, default="zstd")
-    p.add_argument("--final-parquet-batch", type=int, default=2048)
-
-    return p.parse_args(argv)
-
-
-# =========================
-# Main
-# =========================
-
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def run_predictions(config: PredictConfig) -> Optional[Dict[str, Any]]:
+    """
+    Run YOLO+MedSAM predictions using the provided configuration.
+    
+    This is the main programmatic API for running predictions. It handles:
+    - Multi-GPU distribution (via environment variables)
+    - Resumable processing
+    - Output to parquet and/or PNG masks
+    - Summary generation
+    
+    Args:
+        config: PredictConfig instance with all settings
+        
+    Returns:
+        Summary dictionary on rank 0, None on other ranks
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    args = parse_args(argv)
-
-    out_dir: Path = _ensure_dir(args.out_dir)
+    
+    out_dir: Path = _ensure_dir(config.out_dir)
     dist = _get_dist_info()
 
     # Best-effort distributed init so we can barrier for final concatenation.
@@ -616,21 +598,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     # Filters
     split_set: Optional[Set[str]] = None
-    if args.splits:
-        split_set = {s.strip() for s in args.splits.split(",") if s.strip()}
+    if config.splits:
+        split_set = {s.strip() for s in config.splits.split(",") if s.strip()}
 
     dataset_set: Optional[Set[str]] = None
-    if args.datasets:
-        dataset_set = {d.strip() for d in args.datasets.split(",") if d.strip()}
+    if config.datasets:
+        dataset_set = {d.strip() for d in config.datasets.split(",") if d.strip()}
 
     # Outputs
     dataset_dir = _dataset_dir(out_dir)
     rank_dir = _rank_dataset_dir(dataset_dir, dist.rank)
 
-    save_png_masks = (args.mask_store in ("png", "both")) and (not args.no_save_masks)
-    save_parquet_masks = (args.mask_store in ("parquet", "both"))
-    save_overlays = bool(args.save_overlays)
-    save_parquet_images = (args.image_store == "parquet")
+    save_png_masks = config.mask_store in ("png", "both")
+    save_parquet_masks = config.mask_store in ("parquet", "both")
+    save_overlays = config.save_overlays
+    save_parquet_images = config.image_store == "parquet"
 
     oc_mask_root = (out_dir / "oc_mask" / f"gpu={dist.rank:03d}") if save_png_masks else None
     od_mask_root = (out_dir / "od_mask" / f"gpu={dist.rank:03d}") if save_png_masks else None
@@ -644,34 +626,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     # Resume bookkeeping
     done: Set[str] = set()
-    if args.force_recompute:
+    if config.force_recompute:
         logging.info("force-recompute enabled: ignoring any resume state.")
-    elif args.resume:
+    elif config.resume:
         done = _load_done_set(progress_file)
         logging.info("resume enabled (rank=%d): loaded %d done items", dist.rank, len(done))
 
-    # Input source iterator
-    if not (args.images_parquet or args.images_dir):
-        raise ValueError("You must pass --images-parquet or --images-dir to run predictions.")
-    if args.yolo_weights is None or args.medsam_checkpoint is None:
-        raise ValueError("--yolo-weights and --medsam-checkpoint are required.")
-
     def input_image_iter() -> Iterable[Image]:
-        if args.images_parquet is not None:
-            logging.info("Reading images from Parquet: %s", args.images_parquet)
-            # Use Image class to stream efficiently
-            for img in Image.iter_parquet(args.images_parquet, batch_size=args.parquet_read_batch):
+        if config.images_parquet is not None:
+            logging.info("Reading images from Parquet: %s", config.images_parquet)
+            for img in Image.iter_parquet(config.images_parquet, batch_size=config.parquet_read_batch):
                 if dataset_set and getattr(img, "dataset", None) not in dataset_set: continue
                 if split_set and getattr(img, "split", None) not in split_set: continue
                 yield img
         else:
-            assert args.images_dir is not None
-            logging.info("Creating images from directory: %s", args.images_dir)
+            assert config.images_dir is not None
+            logging.info("Creating images from directory: %s", config.images_dir)
             images = _make_images_from_dir(
-                images_dir=args.images_dir,
-                pattern=args.image_pattern,
-                dataset=args.inference_dataset,
-                split=args.inference_split,
+                images_dir=config.images_dir,
+                pattern=config.image_pattern,
+                dataset=config.inference_dataset,
+                split=config.inference_split,
             )
             for im in images:
                 if dataset_set and getattr(im, "dataset", None) not in dataset_set: continue
@@ -679,16 +654,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 yield im
 
     # Device for this rank
-    device = _device_for_rank(args.device, dist.local_rank)
+    device = _device_for_rank(config.device, dist.local_rank)
     _pin_torch_cuda_device(device)
     yolo_device = _ultralytics_device_str_for_current_process(device)
 
     # Predictor Setup
     yolo_kwargs: Dict[str, Any] = dict(
-        weights=args.yolo_weights, device=yolo_device, imgsz=args.imgsz, conf=args.conf, iou=args.iou,
+        weights=config.yolo_weights, device=yolo_device, imgsz=config.imgsz, 
+        conf=config.conf, iou=config.iou,
     )
-    if args.yolo_batch is not None:
-        yolo_kwargs["batch_size"] = int(args.yolo_batch)
+    if config.yolo_batch is not None:
+        yolo_kwargs["batch_size"] = int(config.yolo_batch)
 
     try:
         yolo_cfg = YoloPredictorConfig(**yolo_kwargs)
@@ -696,14 +672,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         yolo_kwargs.pop("batch_size", None)
         yolo_cfg = YoloPredictorConfig(**yolo_kwargs)
 
-    use_amp = True
-    if args.sam_no_amp:
-        use_amp = False
-    elif args.sam_amp:
-        use_amp = True
-
-    sam_kwargs: Dict[str, Any] = {"checkpoint": args.medsam_checkpoint, "device": device, "use_amp": use_amp,
-                                  "resize_backend": args.sam_resize_backend}
+    sam_kwargs: Dict[str, Any] = {
+        "checkpoint": config.medsam_checkpoint, 
+        "device": device, 
+        "use_amp": config.sam_amp,
+        "resize_backend": config.sam_resize_backend
+    }
     try:
         sam_cfg = MedSamPredictorConfig(**sam_kwargs)
     except TypeError:
@@ -711,10 +685,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         sam_kwargs.pop("resize_backend", None)
         sam_cfg = MedSamPredictorConfig(**sam_kwargs)
 
-    pred_cfg = PredictorConfig(box_pad_frac=args.box_pad_frac)
+    pred_cfg = _PredictorConfig(box_pad_frac=config.box_pad_frac)
     predictor = Predictor(yolo_cfg, sam_cfg, pred_cfg)
 
-    images_root = args.images_dir.resolve() if args.images_dir else None
+    images_root = config.images_dir.resolve() if config.images_dir else None
     part_idx = _existing_part_count(rank_dir)
 
     def process_batch(batch: List[Image]) -> None:
@@ -731,8 +705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 try:
                     preds.extend(predictor.predict([img]))
                 except Exception:
-                    # Skip bad images, mark done to avoid retry loops
-                    if args.resume:
+                    if config.resume:
                         ip = str(img.image_path)
                         done.add(ip)
                         _append_done(progress_file, image_path=ip, uid=img.uid)
@@ -781,7 +754,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         part_idx += 1
 
-        if args.resume and not args.force_recompute:
+        if config.resume and not config.force_recompute:
             for ip, uid in batch_done_records:
                 done.add(ip)
                 _append_done(progress_file, image_path=ip, uid=uid)
@@ -790,16 +763,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     batch: List[Image] = []
     n_seen = 0
 
-    # Iterate specifically over sharded subset for this rank
     sharded_iter = _iter_sharded_images(input_image_iter(), rank=dist.rank, world_size=dist.world_size)
 
     for img in tqdm(sharded_iter, desc=f"Predict (rank={dist.rank})", unit="img"):
         n_seen += 1
-        if not args.force_recompute and args.resume and str(img.image_path) in done:
+        if not config.force_recompute and config.resume and str(img.image_path) in done:
             continue
 
         batch.append(img)
-        if len(batch) >= args.predict_batch_size:
+        if len(batch) >= config.predict_batch_size:
             process_batch(batch)
             batch = []
 
@@ -810,31 +782,169 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     _barrier_if_possible()
 
     # Rank 0: Summarize and Concatenate
+    summary = None
     if dist.rank == 0:
         logging.info("Summarizing predictions from dataset %s", dataset_dir)
         summary = summarize_predictions_dataset(
-            dataset_dir, splits=split_set, datasets=dataset_set, batch_size=args.parquet_read_batch
+            dataset_dir, splits=split_set, datasets=dataset_set, batch_size=config.parquet_read_batch
         )
 
         with open(out_dir / "summary.json", "w") as f:
             json.dump(summary, f, indent=2)
 
-        if args.summary_csv:
-            append_summary_row_to_csv(args.summary_csv, dataset_dir, summary)
+        if config.summary_csv:
+            append_summary_row_to_csv(config.summary_csv, dataset_dir, summary)
 
-        final_path = out_dir / args.final_parquet_name
+        final_path = out_dir / config.final_parquet_name
         logging.info("Concatenating into single file: %s", final_path)
 
-        # Use Image class to stream from dataset directory and write to single file
         Image.save_parquet(
             Image.iter_parquet(dataset_dir),
             path=final_path,
             include_image_bytes=save_parquet_images,
             include_mask_bytes=save_parquet_masks,
-            compression=args.final_parquet_compression,
-            write_batch=args.final_parquet_batch
+            compression=config.final_parquet_compression,
+            write_batch=config.final_parquet_batch
         )
         logging.info("Done.")
+    
+    return summary
+
+
+# =========================
+# CLI
+# =========================
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Run YOLO+MedSAM predictions (resumable + multi-GPU) and summarize results.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run predictions from parquet
+  python -m src.scripts.predict_summarize \\
+      --images-parquet images.parquet \\
+      --yolo-weights best.pt \\
+      --medsam-checkpoint medsam_vit_b.pth \\
+      --out-dir predictions/
+
+  # Run predictions from directory
+  python -m src.scripts.predict_summarize \\
+      --images-dir /path/to/images \\
+      --yolo-weights best.pt \\
+      --medsam-checkpoint medsam_vit_b.pth \\
+      --out-dir predictions/
+        """,
+    )
+
+    p.add_argument("--images-parquet", type=Path, default=None)
+    p.add_argument("--images-dir", type=Path, default=None)
+    p.add_argument("--image-pattern", type=str, default="*")
+    p.add_argument("--inference-dataset", type=str, default="inference")
+    p.add_argument("--inference-split", type=str, default=None)
+
+    p.add_argument("--yolo-weights", type=Path, required=True)
+    p.add_argument("--medsam-checkpoint", type=Path, required=True)
+
+    p.add_argument("--device", type=str, default="cuda", help="cuda | cuda:<id> | cpu | mps")
+
+    p.add_argument("--conf", type=float, default=0.001)
+    p.add_argument("--iou", type=float, default=0.70)
+    p.add_argument("--imgsz", type=int, default=640)
+
+    p.add_argument("--save-overlays", action="store_true")
+    p.add_argument("--box-pad-frac", type=float, default=0.05)
+
+    p.add_argument("--sam-amp", action="store_true", help="Enable CUDA AMP for MedSAM.")
+    p.add_argument("--sam-no-amp", action="store_true", help="Disable CUDA AMP for MedSAM.")
+    p.add_argument("--sam-resize-backend", type=str, default="cv2", choices=("cv2", "pil"))
+
+    p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--summary-csv", type=Path, default=None)
+
+    p.add_argument("--splits", type=str, default=None)
+    p.add_argument("--datasets", type=str, default=None)
+
+    p.add_argument("--parquet-read-batch", type=int, default=1024)
+    p.add_argument("--predict-batch-size", type=int, default=128)
+
+    p.add_argument("--yolo-batch", type=int, default=None, help="Ultralytics YOLO batch size for inference.")
+
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--force-recompute", action="store_true")
+
+    p.add_argument(
+        "--mask-store",
+        type=str,
+        choices=("png", "parquet", "both", "none"),
+        default="parquet",
+        help="Where to store predicted masks.",
+    )
+
+    p.add_argument(
+        "--image-store",
+        type=str,
+        choices=("parquet", "none"),
+        default="none",
+        help="Whether to embed raw image bytes in the output parquets.",
+    )
+
+    p.add_argument("--final-parquet-name", type=str, default="predictions.parquet")
+    p.add_argument("--final-parquet-compression", type=str, default="zstd")
+    p.add_argument("--final-parquet-batch", type=int, default=2048)
+
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    """CLI entry point."""
+    args = parse_args(argv)
+    
+    # Validate input source
+    if not args.images_parquet and not args.images_dir:
+        raise ValueError("You must pass --images-parquet or --images-dir to run predictions.")
+    
+    # Determine AMP setting
+    sam_amp = True  # default
+    if args.sam_no_amp:
+        sam_amp = False
+    elif args.sam_amp:
+        sam_amp = True
+    
+    # Build config from CLI args
+    config = PredictConfig(
+        out_dir=args.out_dir,
+        yolo_weights=args.yolo_weights,
+        medsam_checkpoint=args.medsam_checkpoint,
+        images_parquet=args.images_parquet,
+        images_dir=args.images_dir,
+        image_pattern=args.image_pattern,
+        inference_dataset=args.inference_dataset,
+        inference_split=args.inference_split,
+        device=args.device,
+        conf=args.conf,
+        iou=args.iou,
+        imgsz=args.imgsz,
+        yolo_batch=args.yolo_batch,
+        sam_amp=sam_amp,
+        sam_resize_backend=args.sam_resize_backend,
+        box_pad_frac=args.box_pad_frac,
+        save_overlays=args.save_overlays,
+        mask_store=args.mask_store,
+        image_store=args.image_store,
+        splits=args.splits,
+        datasets=args.datasets,
+        parquet_read_batch=args.parquet_read_batch,
+        predict_batch_size=args.predict_batch_size,
+        resume=args.resume,
+        force_recompute=args.force_recompute,
+        final_parquet_name=args.final_parquet_name,
+        final_parquet_compression=args.final_parquet_compression,
+        final_parquet_batch=args.final_parquet_batch,
+        summary_csv=args.summary_csv,
+    )
+    
+    run_predictions(config)
 
 
 if __name__ == "__main__":
