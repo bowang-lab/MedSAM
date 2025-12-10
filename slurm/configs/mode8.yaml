@@ -2,7 +2,7 @@
 # Finetune MedSAM using existing YOLO weights and dataset
 
 paths:
-  yolo_weights: "/scratch/st-ipor-1/cperez/MedSAM/runs/run13/Train/Train/weights/best.pt"
+  yolo_weights: "/scratch/st-ipor-1/cperez/MedSAM/runs/YOLO_DEV_RUN/Train/Train/weights/best.pt"
   yolo_ds: "/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS"
   medsam_ckpt: "/scratch/st-ipor-1/cperez/MedSAM/weights/medsam_vit_b.pth"
   out_dir: "/scratch/st-ipor-1/cperez/MedSAM/runs/Fundu"
