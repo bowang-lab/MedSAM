@@ -219,10 +219,13 @@ ARG_8=(
     "--medsam-ckpt" "/scratch/st-ipor-1/cperez/MedSAM/weights/medsam_vit_b.pth"
     "--yolo-out-dir" "/scratch/st-ipor-1/cperez/MedSAM/runs/Fundu"
     "--epochs" "100"
-    "--batch" "8"
+    "--batch" "4"
     "--imgsz" "1024"
     "--workers" "16"
     "--yolo-device" "${YOLO_DEVICES}"
+    "--grad-checkpointing"
+    "--eval-every" "5"
+    "--compile-model"
 )
 
 ###############################################################################
