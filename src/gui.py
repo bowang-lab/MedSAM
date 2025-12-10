@@ -21,9 +21,8 @@ from __future__ import annotations
 
 import math
 import tempfile
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np

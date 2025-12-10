@@ -74,10 +74,16 @@ def infer_data_yaml_path(out_dir: Path) -> Path:
     return out_dir / "data.yaml"
 
 
-def scan_filter(data_root: Path, out_dir: Path):
+def scan_filter(data_root: Path, out_dir: Path, exclude_datasets: Optional[List[str]] = None):
     print("[INFO] Scanning datasets…")
     image_factory = ImageFactory(root=data_root, auto_scan=True)
+
     image_factory.filter_empty_masks()
+
+    if exclude_datasets:
+        print(f"[INFO] Excluding datasets matching: {exclude_datasets}")
+        image_factory.filter_datasets(exclude=exclude_datasets)
+
 
     images = image_factory.make_images()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -497,6 +503,7 @@ class YOLORunner:
         iou: float,
         yolo_ds: Optional[Path] = None,
         run_name: Optional[str] = None,
+        exclude_datasets: Optional[List[str]] = None,
         resume: bool = False,
         seed: int = 42,
         single_top_per_class: bool = False,
@@ -515,6 +522,7 @@ class YOLORunner:
         self.imgsz = imgsz
         self.conf = float(conf)
         self.iou = float(iou)
+        self.exclude_datasets = exclude_datasets
         self.yolo_ds = yolo_ds
         self.run_name = run_name or "run"
         self.resume = resume
@@ -597,6 +605,7 @@ class YOLORunner:
         images = scan_filter(
             self.data_root,
             self.out_dir,
+            exclude_datasets=self.exclude_datasets,
         )
         self._data_yaml = create_yolo_ds(
             images,

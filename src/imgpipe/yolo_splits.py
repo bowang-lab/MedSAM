@@ -296,26 +296,35 @@ def create_yolo_dataset(
 
 
 def create_yolo_dataset_from_parquet(
-    in_parquet: Path,
-    *,
-    out_dir: Path,
-    batch_size: int = 2048,
-    use_gt: bool = True,
-    save_images_parquet: bool = True,
+        in_parquet: Path,
+        *,
+        out_dir: Path,
+        batch_size: int = 2048,
+        use_gt: bool = True,
+        save_images_parquet: bool = True,
+        exclude_datasets: Optional[List[str]] = None,  # <--- NEW ARG
 ) -> YoloSplit:
     """
-    Build the same YOLO directory structure, but using a Parquet file that ALREADY has
-    split assigned per image (img.split in {train,val,test}).
-
-    Reads streaming via Image.iter_parquet to support nested columns and large files.
+    Build the same YOLO directory structure, but using a Parquet file.
+    Supports excluding datasets by substring match (case-insensitive).
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     _ensure_dirs(out_dir)
 
-    # Stream in -> bucket by split (needs lists to write split_meta + optional saved_images.parquet)
+    # Stream in -> bucket by split
     imgs: List[Image] = []
+
+    # Pre-compute lower-case exclusions for speed
+    excludes_lower = [e.lower() for e in exclude_datasets] if exclude_datasets else []
+
     for im in Image.iter_parquet(in_parquet, batch_size=int(batch_size)):
+        # NEW: Check exclusion
+        if excludes_lower:
+            ds_name = (im.dataset or "").lower()
+            if any(ex in ds_name for ex in excludes_lower):
+                continue
+
         imgs.append(im)
 
     split = _split_from_existing(imgs)
