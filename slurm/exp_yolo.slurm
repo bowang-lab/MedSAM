@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=YOLO_TRAIN_multi_GPU
+#SBATCH --job-name=Experiment
 #SBATCH --account=st-ipor-1-gpu
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
@@ -8,15 +8,15 @@
 #SBATCH --mem=160G
 #SBATCH --time=72:00:00
 #SBATCH --gpus=4
-#SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.out
-#SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%A.err
+#SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.out
+#SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.err
 #SBATCH --mail-user=cperez67@student.ubc.ca
 #SBATCH --mail-type=FAIL,END
 
 set -euo pipefail
 
 ############################
-# Repo / env
+# 1. Environment Setup
 ############################
 REPO_DIR="/scratch/st-ipor-1/cperez/MedSAM"
 export REPO_DIR
@@ -29,31 +29,94 @@ cd "${REPO_DIR}"
 mkdir -p "${REPO_DIR}/hpc_logs"
 
 ############################
-# FIX: define YOLO_DEVICES safely (do NOT rely on it being pre-set)
+# 2. Device Configuration
 ############################
-# Preferred source is CUDA_VISIBLE_DEVICES, which Slurm typically sets per job/step.
-# Ultralytics accepts comma-separated GPU indices, e.g. "0,1,2,3".
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   YOLO_DEVICES="${CUDA_VISIBLE_DEVICES}"
 else
-  # If Slurm didn't set it for some reason, fall back to "0,1,2,3" for 4 GPUs.
-  # (Not a resource change; this just prevents -u from crashing.)
+  # Fallback logic
   YOLO_DEVICES="0,1,2,3"
 fi
-export YOLO_DEVICES
 echo "YOLO_DEVICES=${YOLO_DEVICES}"
 
 ############################
-# Experiment args
+# 3. Argument Selection Logic
 ############################
-ARGS=(
-  --papila 0
-  --yolo-out-dir "/scratch/st-ipor-1/cperez/MedSAM/DS/Stage_Two_YOLO_DS"
-  --yolo-device "${YOLO_DEVICES}"
-)
+# Get the mode from command line arg 1, default to "1" if not provided
+MODE="${1:-1}"
+
+echo "========================================"
+echo "RUNNING IN MODE: ${MODE}"
+echo "========================================"
+
+case $MODE in
+
+  # ----------------------------------------------------------------
+  # CONFIG 1: Standard / Stage Two (Raw Folders)
+  # ----------------------------------------------------------------
+  1)
+    OUT_DIR="/scratch/st-ipor-1/cperez/MedSAM/DS/Stage_Two_YOLO_DS"
+
+    ARGS=(
+      --yolo-out-dir "${OUT_DIR}"
+      --yolo-device "${YOLO_DEVICES}"
+      # Add default actions if needed, otherwise experiment_unified defaults apply
+      --train-yolo
+      --test-yolo
+    )
+    ;;
+
+  # ----------------------------------------------------------------
+  # CONFIG 2: Parquet Splits (Reproducible)
+  # ----------------------------------------------------------------
+  2)
+    SPLITS_PARQUET="/home/cperez67/medsam/src/image_data/parquet/combined.parquet"
+    OUT_DIR="/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS_CONF_0.85_FROM_PARQUET"
+
+    # Sanity check specific to this mode
+    if [[ ! -f "${SPLITS_PARQUET}" ]]; then
+      echo "[ERROR] Splits parquet not found: ${SPLITS_PARQUET}" >&2
+      exit 2
+    fi
+
+    echo "[INFO] Source Parquet: ${SPLITS_PARQUET}"
+
+    ARGS=(
+      # Data Source
+      --splits-parquet "${SPLITS_PARQUET}"
+      --yolo-out-dir "${OUT_DIR}"
+      --splits-batch-size 2048
+      --require-both-gt-boxes       # Filter out rows missing GT boxes
+
+      # Model Config
+      --yolo-device "${YOLO_DEVICES}"
+      --epochs 800
+      --batch 16                    # Batch size per GPU (effective batch = 16 * 4 = 64)
+
+      # Workflow Stages
+      --create-ds
+      --train-yolo
+      --test-yolo
+    )
+    ;;
+
+  # ----------------------------------------------------------------
+  # Fallback
+  # ----------------------------------------------------------------
+  *)
+    echo "Invalid mode selected: $MODE"
+    echo "Usage: sbatch script.slurm [1|2]"
+    exit 1
+    ;;
+esac
 
 ############################
-# Run
+# 4. Execution
 ############################
+echo "[INFO] Output Directory: ${OUT_DIR}"
+echo "[INFO] Launching Experiment..."
+
 srun --gpu-bind=closest --cpu-bind=cores -u \
-  python -m src.experiment "${ARGS[@]}"
+  python -m src.experiment_unified "${ARGS[@]}"
+
+echo "[INFO] Job Finished"

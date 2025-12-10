@@ -74,21 +74,10 @@ def infer_data_yaml_path(out_dir: Path) -> Path:
     return out_dir / "data.yaml"
 
 
-def scan_filter(data_root: Path, out_dir: Path, papila: float):
-    excluded_papila = None
-
+def scan_filter(data_root: Path, out_dir: Path):
     print("[INFO] Scanning datasets…")
     image_factory = ImageFactory(root=data_root, auto_scan=True)
-    print(image_factory.summary())
     image_factory.filter_empty_masks()
-    print(image_factory.summary())
-
-    # if papila == 1:
-    #     image_factory.filter_datasets(include=["PAPILA", "GRAPE"])
-    # elif papila == 0:
-    #     image_factory.filter_datasets(exclude=["PAPILA", "GRAPE"])
-    # else:
-    #     excluded_papila = image_factory.retain_percentage_in_dataset("PAPILA", papila)
 
     images = image_factory.make_images()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -105,7 +94,7 @@ def scan_filter(data_root: Path, out_dir: Path, papila: float):
         except Exception as e:
             print(f"[WARN] Visualization failed: {e!r}")
 
-    return images, excluded_papila
+    return images
 
 
 def create_yolo_ds(
@@ -511,12 +500,10 @@ class YOLORunner:
         resume: bool = False,
         seed: int = 42,
         single_top_per_class: bool = False,
-        papila: float,
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         test_ratio: float = 0.1,
     ) -> None:
-        self.papila = papila
         self.data_root = data_root
         self.out_dir = out_dir
         self.run_dir = run_dir              # base runs directory, e.g. ./runs
@@ -607,10 +594,9 @@ class YOLORunner:
 
         # Build from raw datasets
         print("[INFO] Creating YOLO dataset (no pre-existing yolo_ds provided)…")
-        images, excluded = scan_filter(
+        images = scan_filter(
             self.data_root,
             self.out_dir,
-            papila=self.papila,
         )
         self._data_yaml = create_yolo_ds(
             images,
@@ -619,17 +605,6 @@ class YOLORunner:
             val_ratio=vr,
             test_ratio=ter,
         )
-
-        # Create dataset for excluded PAPILA images (test-only dataset)
-        if excluded:
-            papila_out = Path(str(self.out_dir) + "_papila_excluded")
-            self._data_yaml_excluded = create_yolo_ds(
-                excluded,
-                papila_out,
-                train_ratio=0.0,
-                val_ratio=0.0,
-                test_ratio=1.0,
-            )
 
         self.yolo_ds = self.out_dir  # for later evaluation
         return self._data_yaml
