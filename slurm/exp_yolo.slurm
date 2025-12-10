@@ -69,8 +69,8 @@ shift # Remove mode from args so we can parse overrides
 
 # Defaults for Overrides
 CONF_THRESH="${CONF_THRESH:-0.85}"
-DUP_FACTOR="${DUP_FACTOR:-3}"
-FINETUNE_EPOCHS="${FINETUNE_EPOCHS:-30}"
+DUP_FACTOR="${DUP_FACTOR:-2}"
+FINETUNE_EPOCHS="${FINETUNE_EPOCHS:-50}"
 
 # Parse overrides from remaining arguments
 for arg in "$@"; do
@@ -217,7 +217,7 @@ ARG_8=(
     "--yolo-weights" "/scratch/st-ipor-1/cperez/MedSAM/runs/YOLO_DEV_RUN/Train/Train/weights/best.pt"
     "--yolo-ds" "/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS"
     "--medsam-ckpt" "/scratch/st-ipor-1/cperez/MedSAM/weights/medsam_vit_b.pth"
-    "--out-dir" "/scratch/st-ipor-1/cperez/MedSAM/runs/Fundu"
+    "--yolo-out-dir" "/scratch/st-ipor-1/cperez/MedSAM/runs/Fundu"
     "--epochs" "100"
     "--batch" "8"
     "--imgsz" "1024"
