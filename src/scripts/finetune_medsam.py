@@ -34,7 +34,7 @@ from src.imgpipe.image import Image as IMG
 from src.imgpipe.normalized_box import NormalizedBox
 from src.imgpipe.enums import Structure, LabelType
 import src.training_utils as tu  # Shared training utilities
-from src.model.predictor import YoloPredictor, YoloPredictorConfig, _ultralytics_device_str  # Re-use your predictor
+from src.model.predictor import YoloPredictor, YoloPredictorConfig, _ultralytics_device_str
 
 try:
     from segment_anything import sam_model_registry
@@ -94,6 +94,11 @@ def _ensure_sam_available():
         )
 
 
+def _to_device(x: Any, device: torch.device) -> Any:
+    """Local wrapper calling shared util."""
+    return tu.to_device(x, device)
+
+
 # =========================================================
 # Distributed context
 # =========================================================
@@ -110,7 +115,6 @@ class DistConfig:
         return self.world_size > 1
 
     def device(self) -> torch.device:
-        # Prefer CUDA, then MPS, then CPU
         if torch.cuda.is_available():
             return torch.device(f"cuda:{self.local_rank}" if self.distributed else "cuda:0")
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -159,7 +163,7 @@ class DistributedContext:
 # =========================================================
 def build_image_index(data_root: Path, exclude: Optional[List[str]] = None) -> Dict[str, IMG]:
     fac = ImageFactory(root=data_root, auto_scan=True)
-    fac.filter_empty_masks()  # require GT masks present
+    fac.filter_empty_masks()
     if exclude:
         fac.filter_datasets(exclude=exclude)
     images = fac.make_images()
@@ -172,10 +176,7 @@ def build_image_index(data_root: Path, exclude: Optional[List[str]] = None) -> D
 def images_from_yolo_splits(
     yolo_ds: Path, data_root: Path, exclude: Optional[List[str]] = None
 ) -> Tuple[List[IMG], List[IMG], List[IMG]]:
-    # Use shared utility for parsing data.yaml
     mapping = tu.parse_data_yaml(yolo_ds / "data.yaml")
-    
-    # Use shared utility for resolving images
     train_imgs = tu.resolve_split_images(yolo_ds, mapping["train"])
     val_imgs = tu.resolve_split_images(yolo_ds, mapping["val"])
     test_imgs = tu.resolve_split_images(yolo_ds, mapping["test"])
@@ -211,18 +212,10 @@ def attach_detector_boxes_with_cache(
     dist: DistributedContext,
     provider: Optional[YoloPredictor] = None,
 ) -> None:
-    """
-    Implements Option B:
-      - Rank-0 runs YOLO once and writes a JSONL cache:
-          {"stem":..., "disc": (xc,yc,w,h) or null, "cup": (...)}
-      - All ranks read the same cache and attach NormalizedBox(PRED) to each Image.
-      - During training, datasets can mix GT vs DET boxes on-the-fly.
-    """
     images = list(images)
     mapping: Dict[str, Dict[str, Optional[Tuple[float, float, float, float]]]] = {}
 
     if cache_path and cache_path.exists():
-        # Load existing cache
         for line in cache_path.read_text().splitlines():
             rec = json.loads(line)
             mapping[rec["stem"]] = {"disc": rec.get("disc"), "cup": rec.get("cup")}
@@ -231,7 +224,6 @@ def attach_detector_boxes_with_cache(
             if dist.is_main:
                 print("[INFO] No provider and no cache; skipping detector attachment.")
         else:
-            # Compute on main, write cache
             if dist.is_main:
                 if cache_path:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,40 +231,29 @@ def attach_detector_boxes_with_cache(
                 else:
                     jf = open(os.devnull, "w")
 
-                # Use provider's batch size for chunking (aligns with YOLO internal batching)
                 chunk_size = provider.cfg.batch_size if provider else 32
                 
                 with jf:
-                    # Iterate in chunks to maintain progress bar while using batch inference
                     for i in tqdm(range(0, len(images), chunk_size), desc="Generating Detector Prompts"):
                         chunk = images[i : i + chunk_size]
                         paths = [Path(im.image_path) for im in chunk]
-                        
-                        # Use high-performance batch prediction from YoloPredictor
                         batch_preds = provider.top1_per_class_batch(paths)
                         
                         for im, preds in zip(chunk, batch_preds):
                             rec = {"stem": Path(im.image_path).stem}
-                            
-                            # YoloPredictor returns {0: (box, conf), 1: (box, conf)}
-                            # Convert NormalizedBox back to tuple for JSON storage
                             disc_res = preds.get(0, (None, None))
                             cup_res = preds.get(1, (None, None))
-                            
                             rec["disc"] = disc_res[0].as_tuple() if disc_res[0] else None
                             rec["cup"] = cup_res[0].as_tuple() if cup_res[0] else None
-                            
                             jf.write(json.dumps(rec) + "\n")
                             mapping[rec["stem"]] = {"disc": rec["disc"], "cup": rec["cup"]}
 
         dist.barrier()
-        # Non-main ranks load the newly created cache
         if not mapping and cache_path and cache_path.exists():
             for line in cache_path.read_text().splitlines():
                 rec = json.loads(line)
                 mapping[rec["stem"]] = {"disc": rec.get("disc"), "cup": rec.get("cup")}
 
-    # Attach to Image objects
     for im in images:
         stem = Path(im.image_path).stem
         m = mapping.get(stem)
@@ -288,57 +269,36 @@ def attach_detector_boxes_with_cache(
 # Polar transform helpers (FunduSAM-style disc-centered)
 # =========================================================
 def cartesian_to_polar(
-    img: np.ndarray,
-    out_h: int,
-    out_w: int,
-    center: Optional[Tuple[float, float]] = None,
-    radius: Optional[float] = None,
+    img: np.ndarray, out_h: int, out_w: int,
+    center: Optional[Tuple[float, float]] = None, radius: Optional[float] = None,
 ) -> np.ndarray:
-    """
-    Convert Cartesian image (H,W or H,W,C) to polar coordinates.
-    
-    FunduSAM-style: Center on optic disc for better OD/OC alignment.
-    """
     _ensure_cv2_available()
     h, w = img.shape[:2]
-    
     if center is None:
         center = (w / 2.0, h / 2.0)
-    
     if radius is None:
         cx, cy = center
         corners = [(0, 0), (w, 0), (0, h), (w, h)]
         radius = max(np.sqrt((cx - x)**2 + (cy - y)**2) for x, y in corners)
         radius = min(radius, max(w, h))
-    
     flags = cv2.WARP_POLAR_LINEAR
     polar = cv2.warpPolar(img, (out_w, out_h), center, radius, flags)
-    # Rotate so angle axis becomes x-axis consistently
     polar = cv2.rotate(polar, cv2.ROTATE_90_CLOCKWISE)
     return polar
 
 
 def polar_to_cartesian(
-    img_polar: np.ndarray,
-    out_h: int,
-    out_w: int,
-    center: Optional[Tuple[float, float]] = None,
-    radius: Optional[float] = None,
+    img_polar: np.ndarray, out_h: int, out_w: int,
+    center: Optional[Tuple[float, float]] = None, radius: Optional[float] = None,
 ) -> np.ndarray:
-    """
-    Invert polar image back to Cartesian coordinates.
-    """
     _ensure_cv2_available()
-    
     if center is None:
         center = (out_w / 2.0, out_h / 2.0)
-    
     if radius is None:
         cx, cy = center
         corners = [(0, 0), (out_w, 0), (0, out_h), (out_w, out_h)]
         radius = max(np.sqrt((cx - x)**2 + (cy - y)**2) for x, y in corners)
         radius = min(radius, max(out_w, out_h))
-    
     p = cv2.rotate(img_polar, cv2.ROTATE_90_COUNTERCLOCKWISE)
     flags = cv2.WARP_POLAR_LINEAR + cv2.WARP_INVERSE_MAP
     cart = cv2.warpPolar(p, (out_w, out_h), center, radius, flags)
@@ -346,34 +306,17 @@ def polar_to_cartesian(
 
 
 def compute_disc_center_and_radius(
-    disc_box_xyxy: np.ndarray,
-    img_w: int,
-    img_h: int,
-    radius_padding: float = 1.5,
+    disc_box_xyxy: np.ndarray, img_w: int, img_h: int, radius_padding: float = 1.5,
 ) -> Tuple[Tuple[float, float], float]:
-    """
-    Compute polar transform center and radius from disc bounding box.
-    """
     x1, y1, x2, y2 = disc_box_xyxy
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
-    
-    # Disc dimensions
     disc_w = x2 - x1
     disc_h = y2 - y1
-    
-    # Minimum radius: must cover the entire disc region
     min_radius = max(disc_w, disc_h) / 2.0 * 1.2
-    
-    # Maximum possible radius: distance to nearest image edge (with safety margin)
     max_possible = min(cx, cy, img_w - cx, img_h - cy) * 0.95
-    
-    # Desired radius: based on disc size with padding
     desired_radius = max(disc_w, disc_h) / 2.0 * radius_padding
-    
-    # Clamp desired radius between minimum and maximum
     radius = max(min_radius, min(desired_radius, max_possible))
-    
     return (cx, cy), radius
 
 
@@ -381,9 +324,6 @@ def compute_disc_center_and_radius(
 # Fundu-style joint OD/OC dataset with polar coordinates
 # =========================================================
 def make_joint_images(images: List[IMG]) -> List[IMG]:
-    """
-    Filter images to those that have BOTH disc and cup GT masks.
-    """
     out: List[IMG] = []
     for im in images:
         if (
@@ -397,74 +337,39 @@ def make_joint_images(images: List[IMG]) -> List[IMG]:
 
 
 def create_fundu_dataset(
-    images: List[IMG],
-    img_size: int,
-    train: bool,
-    prompt_mode: str,
-    polar_radius_padding: float,
-    use_det_prob: float = 0.0,
-    pad_jitter: float = 0.0,
-    box_tr: float = 0.0,
-    box_sc: float = 0.0,
+    images: List[IMG], img_size: int, train: bool, prompt_mode: str,
+    polar_radius_padding: float, use_det_prob: float = 0.0,
+    pad_jitter: float = 0.0, box_tr: float = 0.0, box_sc: float = 0.0,
 ) -> FunduSAMDataset:
-    """
-    Helper function to create FunduSAMDataset with common parameters.
-    """
     return FunduSAMDataset(
-        images=images,
-        img_size=img_size,
-        train=train,
-        use_det_prob=use_det_prob,
-        pad_jitter=pad_jitter,
-        box_tr=box_tr,
-        box_sc=box_sc,
-        prompt_mode=prompt_mode,
+        images=images, img_size=img_size, train=train,
+        use_det_prob=use_det_prob, pad_jitter=pad_jitter,
+        box_tr=box_tr, box_sc=box_sc, prompt_mode=prompt_mode,
         polar_radius_padding=polar_radius_padding,
     )
 
 
 def fundu_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Custom collate function that handles metadata with non-tensor types.
-    """
     result: Dict[str, Any] = {}
-    
-    # Identify keys from first sample
     keys = batch[0].keys()
-    
     for key in keys:
         values = [sample[key] for sample in batch]
-        
         if key == "meta":
-            # Metadata: collect as dict of lists
             meta_keys = values[0].keys()
             result[key] = {mk: [v[mk] for v in values] for mk in meta_keys}
         elif isinstance(values[0], torch.Tensor):
-            # Stack tensors
             result[key] = torch.stack(values, dim=0)
         else:
-            # Other types: just collect as list
             result[key] = values
-    
     return result
 
 
 class FunduSAMDataset(Dataset):
-    """
-    FunduSAM-style joint OD/OC dataset in polar space:
-    """
-
     def __init__(
-        self,
-        images: List[IMG],
-        img_size: int = DEFAULT_IMGSZ,
-        train: bool = True,
-        use_det_prob: float = DEFAULT_USE_DET_PROB,
-        pad_jitter: float = DEFAULT_PAD_JITTER,
-        box_tr: float = DEFAULT_BOX_TR,
-        box_sc: float = DEFAULT_BOX_SC,
-        prompt_mode: str = "mix",  # "mix" (train only), "gt", "det"
-        polar_radius_padding: float = 1.5,  # Padding around disc for polar radius
+        self, images: List[IMG], img_size: int = DEFAULT_IMGSZ, train: bool = True,
+        use_det_prob: float = DEFAULT_USE_DET_PROB, pad_jitter: float = DEFAULT_PAD_JITTER,
+        box_tr: float = DEFAULT_BOX_TR, box_sc: float = DEFAULT_BOX_SC,
+        prompt_mode: str = "mix", polar_radius_padding: float = 1.5,
     ):
         _ensure_cv2_available()
         self.images = images
@@ -482,7 +387,6 @@ class FunduSAMDataset(Dataset):
         return len(self.images)
 
     def _choose_disc_box(self, im: IMG) -> Optional[NormalizedBox]:
-        """Choose disc box: YOLO detection or GT based on mode."""
         gt = im.gt_disc_box
         det = im.inter_pred_disc_box
         if self.train and self.prompt_mode == "mix":
@@ -495,9 +399,6 @@ class FunduSAMDataset(Dataset):
         im: IMG = self.images[idx]
         im.ensure_boxes_from_masks()
 
-        # Load images from disk (PIL handles file I/O efficiently)
-        # Note: For very small datasets (<1000 images), consider pre-loading into memory
-        # For larger datasets, DataLoader workers already parallelize I/O efficiently
         img = PILImage.open(im.image_path).convert("RGB")
         mref_disc = im.gt_disc_mask
         mref_cup = im.gt_cup_mask
@@ -512,66 +413,44 @@ class FunduSAMDataset(Dataset):
         if self.train:
             img = tu.color_jitter_safe(img, brightness=0.10, contrast=0.10)
 
-        # Get disc box for polar centering (prefer detection, fallback to GT/mask)
         base_nbox = self._choose_disc_box(im)
         if base_nbox is None:
-            # Fallback to tight disc box from mask
             tb = tu.mask_to_tight_box(np.array(m_disc, dtype=np.uint8))
-            box_xyxy = tb if tb is not None else np.array(
-                [0, 0, img.size[0] - 1, img.size[1] - 1],
-                dtype=np.float32,
-            )
+            box_xyxy = tb if tb is not None else np.array([0, 0, img.size[0] - 1, img.size[1] - 1], dtype=np.float32)
         else:
             box_xyxy = tu.nbox_to_xyxy(base_nbox, im.width, im.height)
 
-        # Apply padding/jitter to box (for letterbox cropping context)
         pad_frac = (random.uniform(0.0, self.pad_jitter) if self.train else 0.0)
         box_p = tu.pad_box(box_xyxy, pad_frac, im.width, im.height)
         if self.train and (self.box_tr > 0.0 or self.box_sc > 0.0):
             box_p = tu.jitter_box_xyxy(box_p, im.width, im.height, tr=self.box_tr, sc=self.box_sc)
 
-        # Letterbox full fundus + masks to square
         img_cart, disc_cart, box_t = self.letterbox(img, m_disc, box_p)
         _, cup_cart, _ = self.letterbox(img, m_cup, box_p)
 
-        # Compute disc center in letterboxed coordinates for polar transform
         polar_center, polar_radius = compute_disc_center_and_radius(
-            box_t,
-            self.img_size,
-            self.img_size,
-            self.polar_radius_padding,
+            box_t, self.img_size, self.img_size, self.polar_radius_padding,
         )
 
-        # Cartesian → polar (disc-centered) for image and masks
         img_np = np.array(img_cart)
         disc_np = np.array(disc_cart, dtype=np.uint8)
         cup_np = np.array(cup_cart, dtype=np.uint8)
 
-        img_pol = cartesian_to_polar(
-            img_np, out_h=self.img_size, out_w=self.img_size,
-            center=polar_center, radius=polar_radius
-        )
-        disc_pol = cartesian_to_polar(
-            disc_np, out_h=self.img_size, out_w=self.img_size,
-            center=polar_center, radius=polar_radius
-        )
-        cup_pol = cartesian_to_polar(
-            cup_np, out_h=self.img_size, out_w=self.img_size,
-            center=polar_center, radius=polar_radius
-        )
+        img_pol = cartesian_to_polar(img_np, out_h=self.img_size, out_w=self.img_size, center=polar_center, radius=polar_radius)
+        disc_pol = cartesian_to_polar(disc_np, out_h=self.img_size, out_w=self.img_size, center=polar_center, radius=polar_radius)
+        cup_pol = cartesian_to_polar(cup_np, out_h=self.img_size, out_w=self.img_size, center=polar_center, radius=polar_radius)
 
         img_pol_pil = PILImage.fromarray(img_pol)
         x = tu.preprocess_for_sam(img_pol_pil)
 
         disc_bin = (disc_pol > 0).astype(np.float32)
         cup_bin = (cup_pol > 0).astype(np.float32)
-        y = torch.from_numpy(np.stack([disc_bin, cup_bin], axis=0))  # (2,H,W)
+        y = torch.from_numpy(np.stack([disc_bin, cup_bin], axis=0))
 
         b = torch.from_numpy(box_t.astype(np.float32))
         meta = {
             "image_path": str(im.image_path),
             "stem": Path(im.image_path).stem,
-            # Store polar params for inverse transform during inference
             "polar_center": polar_center,
             "polar_radius": polar_radius,
         }
@@ -582,19 +461,7 @@ class FunduSAMDataset(Dataset):
 # Loss & metrics
 # =========================================================
 class FunduJointLoss(nn.Module):
-    """
-    FunduSAM-style joint loss:
-    L = w1 * (BCE_disc + Dice_disc) + w2 * (BCE_cup + Dice_cup) + w3 * L_contain
-    """
-
-    def __init__(
-        self,
-        w_disc: float = 1.0,
-        w_cup: float = 2.0,  # Cup is typically smaller, weight higher
-        w_contain: float = 1.0,
-        bce_weight: float = 0.5,  # Balance BCE vs Dice
-        smooth: float = 1e-6,
-    ):
+    def __init__(self, w_disc: float = 1.0, w_cup: float = 2.0, w_contain: float = 1.0, bce_weight: float = 0.5, smooth: float = 1e-6):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss()
         self.w_disc = w_disc
@@ -604,7 +471,6 @@ class FunduJointLoss(nn.Module):
         self.smooth = smooth
 
     def _dice_loss(self, prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute Dice loss for a single class."""
         num = 2.0 * (prob * target).sum(dim=(1, 2)) + self.smooth
         den = prob.sum(dim=(1, 2)) + target.sum(dim=(1, 2)) + self.smooth
         dice = num / den
@@ -616,21 +482,16 @@ class FunduJointLoss(nn.Module):
         gt_disc = target[:, 0]
         gt_cup = target[:, 1]
 
-        # BCE losses
         bce_disc = self.bce(log_disc, gt_disc)
         bce_cup = self.bce(log_cup, gt_cup)
 
-        # Dice losses (need probabilities)
         prob_disc = torch.sigmoid(log_disc)
         prob_cup = torch.sigmoid(log_cup)
         dice_disc = self._dice_loss(prob_disc, gt_disc)
         dice_cup = self._dice_loss(prob_cup, gt_cup)
 
-        # Combined BCE + Dice per structure
         L_disc = self.bce_weight * bce_disc + (1.0 - self.bce_weight) * dice_disc
         L_cup = self.bce_weight * bce_cup + (1.0 - self.bce_weight) * dice_cup
-
-        # Containment: penalize cup pixels outside disc
         L_contain = torch.mean(prob_cup * (1.0 - prob_disc))
 
         return self.w_disc * L_disc + self.w_cup * L_cup + self.w_contain * L_contain
@@ -647,16 +508,10 @@ class Adapter(nn.Module):
         self.up = nn.Linear(bottleneck, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, N, C)
         return x + self.up(self.act(self.down(x)))
 
 
 class FunduBlock(nn.Module):
-    """
-    Wraps a SAM ViT block, inserting adapters after attention and FFN.
-    Assumes the wrapped block has attributes: norm1, attn, norm2, mlp.
-    """
-
     def __init__(self, block: nn.Module, dim: int, bottleneck: int = 32):
         super().__init__()
         self.block = block
@@ -673,13 +528,9 @@ class FunduBlock(nn.Module):
 
 
 class ChannelAttention(nn.Module):
-    """
-    Channel attention module from CBAM.
-    Uses both avg-pool and max-pool followed by shared MLP.
-    """
     def __init__(self, channels: int, ratio: int = 16):
         super().__init__()
-        reduced = max(channels // ratio, 8)  # Ensure minimum dimension
+        reduced = max(channels // ratio, 8)
         self.mlp = nn.Sequential(
             nn.Linear(channels, reduced, bias=False),
             nn.ReLU(inplace=True),
@@ -688,39 +539,28 @@ class ChannelAttention(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,C,H,W)
-        avg = torch.mean(x, dim=(2, 3), keepdim=False)  # (B,C)
-        max_ = torch.amax(x, dim=(2, 3), keepdim=False)  # (B,C)
-        attn = self.mlp(avg) + self.mlp(max_)  # shared MLP
-        attn = self.sigmoid(attn).unsqueeze(-1).unsqueeze(-1)  # (B,C,1,1)
+        avg = torch.mean(x, dim=(2, 3), keepdim=False)
+        max_ = torch.amax(x, dim=(2, 3), keepdim=False)
+        attn = self.mlp(avg) + self.mlp(max_)
+        attn = self.sigmoid(attn).unsqueeze(-1).unsqueeze(-1)
         return x * attn
 
 
 class SpatialAttention(nn.Module):
-    """
-    Spatial attention module from CBAM.
-    Uses channel-wise avg and max pooling followed by conv.
-    """
     def __init__(self, kernel_size: int = 7):
         super().__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,C,H,W)
-        avg = torch.mean(x, dim=1, keepdim=True)  # (B,1,H,W)
-        max_, _ = torch.max(x, dim=1, keepdim=True)  # (B,1,H,W)
-        attn = torch.cat([avg, max_], dim=1)  # (B,2,H,W)
-        attn = self.sigmoid(self.conv(attn))  # (B,1,H,W)
+        avg = torch.mean(x, dim=1, keepdim=True)
+        max_, _ = torch.max(x, dim=1, keepdim=True)
+        attn = torch.cat([avg, max_], dim=1)
+        attn = self.sigmoid(self.conv(attn))
         return x * attn
 
 
 class CBAM(nn.Module):
-    """
-    Convolutional Block Attention Module (CBAM).
-    Applies channel attention followed by spatial attention.
-    This is the proper FunduSAM-style CBAM applied to encoder features.
-    """
     def __init__(self, channels: int, ratio: int = 16, kernel_size: int = 7):
         super().__init__()
         self.channel_attn = ChannelAttention(channels, ratio)
@@ -733,10 +573,6 @@ class CBAM(nn.Module):
 
 
 class ConvBlock(nn.Module):
-    """
-    Simple 2-layer conv block with BN + ReLU.
-    """
-
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.block = nn.Sequential(
@@ -753,12 +589,6 @@ class ConvBlock(nn.Module):
 
 
 class FunduSegHead(nn.Module):
-    """
-    Heavier segmentation head built on top of SAM encoder features:
-    - Several ConvBlocks with residual-style skip
-    - Final 1x1 conv to num_classes
-    """
-
     def __init__(self, in_ch: int, num_classes: int = 2, width: int = 128):
         super().__init__()
         self.proj = nn.Conv2d(in_ch, width, kernel_size=1, bias=False)
@@ -777,28 +607,10 @@ class FunduSegHead(nn.Module):
 
 
 class FunduSAMFinetuner(nn.Module):
-    """
-    FunduSAM-style model (matching the paper):
-    
-    Key components:
-    - SAM image encoder with adapters in ALL transformer blocks (PEFT)
-    - CBAM (Channel + Spatial attention) applied to encoder features
-    - Custom segmentation head for 2-channel OD/OC mask in polar space
-    - No prompt encoder / mask decoder usage (direct segmentation)
-    """
-
     def __init__(
-        self,
-        sam_type: str,
-        checkpoint: Path,
-        freeze_encoders: bool = True,
-        adapter_bottleneck: int = 64,  # Increased from 32 for better capacity
-        num_classes: int = 2,
-        adapt_all_blocks: bool = True,  # FunduSAM uses adapters in ALL blocks
-        last_n_adapted: int = 12,  # Fallback if not adapting all (vit_b has 12 blocks)
-        seg_width: int = 128,
-        cbam_ratio: int = 16,
-        cbam_kernel_size: int = 7,
+        self, sam_type: str, checkpoint: Path, freeze_encoders: bool = True,
+        adapter_bottleneck: int = 64, num_classes: int = 2, adapt_all_blocks: bool = True,
+        last_n_adapted: int = 12, seg_width: int = 128, cbam_ratio: int = 16, cbam_kernel_size: int = 7,
     ):
         super().__init__()
         _ensure_sam_available()
@@ -806,36 +618,23 @@ class FunduSAMFinetuner(nn.Module):
             raise FileNotFoundError(f"MedSAM checkpoint not found: {checkpoint}")
 
         sam = sam_model_registry[sam_type](checkpoint=str(checkpoint))
-
-        # Extract image encoder
         enc = sam.image_encoder
 
-        # --------- Infer token dim for adapters (robustly) ----------
         if hasattr(enc, "blocks") and len(enc.blocks) > 0:
             blk0 = enc.blocks[0]
             mlp = getattr(blk0, "mlp", None)
-            if mlp is None:
-                raise RuntimeError("Unexpected SAM encoder block: missing 'mlp' submodule.")
-
             dim = None
-            # Common cases: fc1 (some ViTs), linear1 (SAM's MLPBlock)
-            if hasattr(mlp, "fc1"):
-                dim = mlp.fc1.in_features
-            elif hasattr(mlp, "linear1"):
-                dim = mlp.linear1.in_features
-            else:
-                # Fallback: first Linear inside the MLP
+            if mlp and hasattr(mlp, "fc1"): dim = mlp.fc1.in_features
+            elif mlp and hasattr(mlp, "linear1"): dim = mlp.linear1.in_features
+            elif mlp:
                 for m in mlp.modules():
                     if isinstance(m, nn.Linear):
                         dim = m.in_features
                         break
-
-            if dim is None:
-                raise RuntimeError("Could not infer token dimension from encoder MLP.")
+            if dim is None: raise RuntimeError("Could not infer token dimension.")
         else:
-            raise RuntimeError("Unexpected SAM image encoder structure: no blocks found.")
+            raise RuntimeError("Unexpected SAM structure.")
 
-        # FunduSAM: Wrap ALL blocks with adapters (PEFT across entire encoder)
         n_blocks = len(enc.blocks)
         wrapped_blocks = []
         for i, b in enumerate(enc.blocks):
@@ -846,54 +645,30 @@ class FunduSAMFinetuner(nn.Module):
         enc.blocks = nn.ModuleList(wrapped_blocks)
         self.image_encoder = enc
 
-        # FunduSAM: CBAM applied to encoder output features (not input!)
         out_chans = getattr(enc, "out_chans", 256)
         self.cbam = CBAM(out_chans, ratio=cbam_ratio, kernel_size=cbam_kernel_size)
-
-        # Segmentation head (outputs at low-res, upsampled in forward)
         self.seg_head = FunduSegHead(in_ch=out_chans, num_classes=num_classes, width=seg_width)
 
-        # Freeze encoder weights if requested, but keep adapters, CBAM & seg_head trainable
         if freeze_encoders:
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
-            # Unfreeze adapter parameters
             for blk in self.image_encoder.blocks:
                 if isinstance(blk, FunduBlock):
                     for m in [blk.adapter_after_attn, blk.adapter_after_ffn]:
-                        for p in m.parameters():
-                            p.requires_grad = True
+                        for p in m.parameters(): p.requires_grad = True
 
-        # CBAM and seg_head are always trainable
-        for p in self.cbam.parameters():
-            p.requires_grad = True
-        for p in self.seg_head.parameters():
-            p.requires_grad = True
+        for p in self.cbam.parameters(): p.requires_grad = True
+        for p in self.seg_head.parameters(): p.requires_grad = True
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        x = batch["image"]  # (B,3,H,W) in polar coords
-
-        # Image encoder (with adapters in all blocks)
-        feat = self.image_encoder(x)  # (B,C,h,w)
-
-        # FunduSAM: CBAM on encoder features (Channel + Spatial attention)
+        x = batch["image"]
+        feat = self.image_encoder(x)
         feat = self.cbam(feat)
-
-        # Segmentation head (still low-res)
-        logits_low = self.seg_head(feat)  # (B,2,h,w)
-
-        # Upsample back to input polar resolution
-        logits = F.interpolate(
-            logits_low,
-            size=(x.shape[2], x.shape[3]),
-            mode="bilinear",
-            align_corners=False,
-        )
-        iou_pred = None  # not used in this setup
-        return logits, iou_pred
+        logits_low = self.seg_head(feat)
+        logits = F.interpolate(logits_low, size=(x.shape[2], x.shape[3]), mode="bilinear", align_corners=False)
+        return logits, None
 
 
-# Backwards alias for any old references
 MedSAMFinetuner = FunduSAMFinetuner
 
 
@@ -902,57 +677,46 @@ MedSAMFinetuner = FunduSAMFinetuner
 # =========================================================
 @dataclass
 class TrainConfig:
-    # Data (no defaults)
     data_root: Path
     yolo_ds: Path
     out_dir: Path
     run_dir: Path
     run_name: str
-    yolo_weights: Path  # non-default field
-
-    # Now fields with defaults (all numeric defaults via constants above)
+    yolo_weights: Path
     exclude_datasets: Optional[List[str]] = None
-
-    # Detector prompts
     yolo_device: str = DEFAULT_YOLO_DEVICE
     yolo_imgsz: int = DEFAULT_YOLO_IMGSZ
     yolo_conf: float = DEFAULT_YOLO_CONF
     yolo_iou: float = DEFAULT_YOLO_IOU
-    det_cache: Optional[Path] = None  # path to JSONL detector cache
-
-    # Model/opt
+    det_cache: Optional[Path] = None
     model: str = DEFAULT_MODEL
     ckpt: Path = Path("")
     unfreeze_encoders: bool = False
-    save_full: bool = False  # kept for CLI compatibility
-
+    save_full: bool = False
     epochs: int = DEFAULT_EPOCHS
     batch: int = DEFAULT_BATCH
     imgsz: int = DEFAULT_IMGSZ
     lr: float = DEFAULT_LR
     wd: float = DEFAULT_WD
     workers: int = DEFAULT_WORKERS
-    amp: bool = True              # enable AMP by default for memory savings
+    amp: bool = True
     grad_acc_steps: int = 1
     bucket_cap_mb: int = 25
     find_unused_parameters: bool = False
     seed: int = SEED
-
-    # Prompt/augmentation (Option B tuning knobs)
     use_det_prob: float = DEFAULT_USE_DET_PROB
     pad_jitter: float = DEFAULT_PAD_JITTER
     box_jitter_tr: float = DEFAULT_BOX_TR
     box_jitter_sc: float = DEFAULT_BOX_SC
-    
-    # Polar transform (FunduSAM-style disc-centered)
-    polar_radius_padding: float = 1.5  # Padding around disc for polar radius
-
-    # Modes
+    polar_radius_padding: float = 1.5
     do_train: bool = True
     do_test: bool = True
-    test_prompt: str = "det"  # "det" or "gt"
+    test_prompt: str = "det"
     test_weights: Optional[Path] = None
     resume: Optional[Path] = None
+    compile_model: bool = False  # New config for torch.compile
+    eval_every: int = 1  # Eval every N epochs
+    grad_checkpointing: bool = False # Gradient checkpointing to save VRAM
 
 
 class Trainer:
@@ -960,7 +724,6 @@ class Trainer:
         self.cfg = cfg
         self.dist = dist
         self.device = dist.cfg.device()
-        # Output dirs
         self.run_path = Path(cfg.run_dir) / cfg.run_name
         self.weights_dir = self.run_path / "weights"
         self.weights_dir.mkdir(parents=True, exist_ok=True)
@@ -968,19 +731,14 @@ class Trainer:
         self.last_path = self.weights_dir / "last.pth"
         Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
 
-        # Build splits from YOLO data.yaml (shared with detection)
         train_imgs, val_imgs, test_imgs = images_from_yolo_splits(
             cfg.yolo_ds, cfg.data_root, exclude=cfg.exclude_datasets
         )
 
-        # Detector cache: rank-0 builds on CPU; all ranks load/attach
         provider = None
         if self.dist.is_main:
-            # Use YoloPredictor directly from src.model.predictor
-            # This allows efficient batched inference on GPU
-            # Convert device to proper format for Ultralytics
             yolo_device_str = _ultralytics_device_str(str(self.device))
-            yolo_batch_size = 32  # Good default batch size for inference
+            # Use a sensible batch size for inference
             provider = YoloPredictor(
                 YoloPredictorConfig(
                     weights=cfg.yolo_weights,
@@ -988,7 +746,7 @@ class Trainer:
                     imgsz=cfg.yolo_imgsz,
                     conf=cfg.yolo_conf,
                     iou=cfg.yolo_iou,
-                    batch_size=yolo_batch_size
+                    batch_size=32
                 )
             )
 
@@ -1000,125 +758,89 @@ class Trainer:
             provider=provider,
         )
 
-        # Free YOLO model and clear any GPU cache
         del provider
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Joint OD/OC image lists (require both disc & cup GT masks)
         joint_train = make_joint_images(train_imgs)
         joint_val = make_joint_images(val_imgs)
         joint_test = make_joint_images(test_imgs)
 
-        # Datasets/Loaders (FunduSAM-style polar with disc-centered transform)
         self.ds_train = create_fundu_dataset(
-            images=joint_train,
-            img_size=cfg.imgsz,
-            train=True,
-            prompt_mode="mix",  # GT/DET mix during training
-            polar_radius_padding=cfg.polar_radius_padding,
-            use_det_prob=cfg.use_det_prob,
-            pad_jitter=cfg.pad_jitter,
-            box_tr=cfg.box_jitter_tr,
-            box_sc=cfg.box_jitter_sc,
+            images=joint_train, img_size=cfg.imgsz, train=True,
+            prompt_mode="mix", polar_radius_padding=cfg.polar_radius_padding,
+            use_det_prob=cfg.use_det_prob, pad_jitter=cfg.pad_jitter,
+            box_tr=cfg.box_jitter_tr, box_sc=cfg.box_jitter_sc,
         )
         self.ds_val = create_fundu_dataset(
-            images=joint_val,
-            img_size=cfg.imgsz,
-            train=False,
-            prompt_mode="gt",
-            polar_radius_padding=cfg.polar_radius_padding,
+            images=joint_val, img_size=cfg.imgsz, train=False,
+            prompt_mode="gt", polar_radius_padding=cfg.polar_radius_padding,
         )
         self.ds_test = create_fundu_dataset(
-            images=joint_test,
-            img_size=cfg.imgsz,
-            train=False,
+            images=joint_test, img_size=cfg.imgsz, train=False,
             prompt_mode=("det" if cfg.test_prompt == "det" else "gt"),
             polar_radius_padding=cfg.polar_radius_padding,
         )
 
-        # Samplers
         self.sampler_train = (
-            DistributedSampler(
-                self.ds_train,
-                num_replicas=dist.cfg.world_size,
-                rank=dist.cfg.rank,
-                shuffle=True,
-            )
-            if dist.cfg.distributed
-            else None
+            DistributedSampler(self.ds_train, num_replicas=dist.cfg.world_size, rank=dist.cfg.rank, shuffle=True)
+            if dist.cfg.distributed else None
         )
         self.sampler_val = (
-            DistributedSampler(
-                self.ds_val,
-                num_replicas=dist.cfg.world_size,
-                rank=dist.cfg.rank,
-                shuffle=False,
-            )
-            if dist.cfg.distributed
-            else None
+            DistributedSampler(self.ds_val, num_replicas=dist.cfg.world_size, rank=dist.cfg.rank, shuffle=False)
+            if dist.cfg.distributed else None
         )
 
-        # Loaders (use custom collate for metadata handling)
+        # Performance Optimization: persistent_workers & prefetch_factor
         self.dl_train = DataLoader(
-            self.ds_train,
-            batch_size=cfg.batch,
-            shuffle=(self.sampler_train is None),
-            num_workers=cfg.workers,
-            pin_memory=True,
-            drop_last=False,
-            sampler=self.sampler_train,
-            collate_fn=fundu_collate_fn,
+            self.ds_train, batch_size=cfg.batch, shuffle=(self.sampler_train is None),
+            num_workers=cfg.workers, pin_memory=True, drop_last=False,
+            sampler=self.sampler_train, collate_fn=fundu_collate_fn,
+            persistent_workers=(cfg.workers > 0), prefetch_factor=(2 if cfg.workers > 0 else None)
         )
         self.dl_val = DataLoader(
-            self.ds_val,
-            batch_size=max(1, cfg.batch // 2),
-            shuffle=False,
-            num_workers=cfg.workers,
-            pin_memory=True,
-            sampler=self.sampler_val,
+            self.ds_val, batch_size=max(1, cfg.batch // 2), shuffle=False,
+            num_workers=cfg.workers, pin_memory=True, sampler=self.sampler_val,
             collate_fn=fundu_collate_fn,
+            persistent_workers=(cfg.workers > 0), prefetch_factor=(2 if cfg.workers > 0 else None)
         )
-        # Test loader is rank-0 only (simplifies writing artifacts)
         self.dl_test = DataLoader(
-            self.ds_test,
-            batch_size=max(1, cfg.batch // 2),
-            shuffle=False,
-            num_workers=cfg.workers,
-            pin_memory=True,
-            collate_fn=fundu_collate_fn,
+            self.ds_test, batch_size=max(1, cfg.batch // 2), shuffle=False,
+            num_workers=cfg.workers, pin_memory=True, collate_fn=fundu_collate_fn,
         )
 
-        # Model
         self.model = FunduSAMFinetuner(
-            sam_type=cfg.model,
-            checkpoint=cfg.ckpt,
-            freeze_encoders=not cfg.unfreeze_encoders,
+            sam_type=cfg.model, checkpoint=cfg.ckpt, freeze_encoders=not cfg.unfreeze_encoders,
         ).to(self.device)
+
+        # Optimization: Gradient Checkpointing (Saves VRAM, allows larger batch size)
+        if cfg.grad_checkpointing:
+            self.model.image_encoder.set_grad_checkpointing(True) # SAM ViT specific method if available, else standard hook needed
+            # Fallback if specific method absent:
+            # self.model.image_encoder = torch.utils.checkpoint.checkpoint_wrapper(self.model.image_encoder) 
+
+        # Optimization: PyTorch 2.0 Compile
+        if cfg.compile_model and hasattr(torch, "compile"):
+            if self.dist.is_main:
+                print("[INFO] Compiling model with torch.compile...")
+            # We compile the heavy encoder
+            self.model.image_encoder = torch.compile(self.model.image_encoder)
 
         if dist.cfg.distributed:
             self.model = nn.parallel.DistributedDataParallel(
-                self.model,
-                device_ids=[dist.cfg.local_rank],
-                output_device=dist.cfg.local_rank,
-                gradient_as_bucket_view=True,
-                find_unused_parameters=cfg.find_unused_parameters,
+                self.model, device_ids=[dist.cfg.local_rank], output_device=dist.cfg.local_rank,
+                gradient_as_bucket_view=True, find_unused_parameters=cfg.find_unused_parameters,
                 bucket_cap_mb=cfg.bucket_cap_mb,
             )
 
-        # Fundu joint loss
         self.criterion = FunduJointLoss(w_disc=1.0, w_cup=2.0, w_contain=1.0)
         self.optimizer = torch.optim.AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=cfg.lr,
-            weight_decay=cfg.wd,
+            [p for p in self.model.parameters() if p.requires_grad], lr=cfg.lr, weight_decay=cfg.wd,
         )
 
-        # AMP scaler: only on CUDA; on MPS/CPU it is disabled
         use_cuda = self.device.type == "cuda"
         self.scaler = torch.cuda.amp.GradScaler(enabled=(self.cfg.amp and use_cuda))
 
-        # Resume
         if cfg.resume and Path(cfg.resume).exists():
             self._load_resume(cfg.resume)
             if self.dist.is_main:
@@ -1127,7 +849,6 @@ class Trainer:
         self.best_val = -1.0
         self.history: Dict[str, List[float]] = {"train_loss": [], "train_dice": [], "val_dice": []}
 
-    # ---------- Checkpoint IO ----------
     def _unwrap(self) -> FunduSAMFinetuner:
         return self.model.module if isinstance(self.model, nn.parallel.DistributedDataParallel) else self.model
 
@@ -1150,14 +871,13 @@ class Trainer:
         else:
             mod.load_state_dict(state, strict=False)
 
-    # ---------- One epoch ----------
     def _run_epoch(self, train: bool) -> Dict[str, float]:
         model = self.model
         crit = self.criterion
         opt = self.optimizer
         dl = self.dl_train if train else self.dl_val
         if self.sampler_train and train:
-            self.sampler_train.set_epoch(self._epoch)  # type: ignore[attr-defined]
+            self.sampler_train.set_epoch(self._epoch)
 
         model.train(mode=train)
         total_loss = 0.0
@@ -1168,7 +888,6 @@ class Trainer:
         use_cuda = self.device.type == "cuda"
         amp_enabled = self.cfg.amp and use_cuda
 
-        # CHANGE: Wrap with tqdm progress bar on main process
         iterator = dl
         if self.dist.is_main:
             desc = f"Epoch {self._epoch} {'Train' if train else 'Val'}"
@@ -1176,7 +895,6 @@ class Trainer:
 
         for step, batch in enumerate(iterator):
             batch = {k: v for k, v in batch.items() if k != "meta"}
-            # Use to_device from shared utils
             batch = tu.to_device(batch, self.device)
 
             if use_cuda:
@@ -1186,7 +904,7 @@ class Trainer:
 
             with torch.set_grad_enabled(train):
                 with autocast_ctx:
-                    logits, _ = model(batch)  # (B,2,H,W) in polar space
+                    logits, _ = model(batch)
                     loss = crit(logits, batch["mask"])
 
                 if train:
@@ -1203,22 +921,18 @@ class Trainer:
                             opt.step()
                         opt.zero_grad(set_to_none=True)
             
-            # CHANGE: Update progress bar postfix
             if self.dist.is_main and train:
                  iterator.set_postfix(loss=float(loss.detach()))
 
             with torch.no_grad():
                 prob = torch.sigmoid(logits)
                 for i in range(prob.shape[0]):
-                    # average disc+cup dice in polar domain vs polar GT
-                    # Use dice_coef_prob from shared utils
                     d_disc = tu.dice_coef_prob(prob[i, 0:1], batch["mask"][i, 0:1])
                     d_cup = tu.dice_coef_prob(prob[i, 1:2], batch["mask"][i, 1:2])
                     total_dice += 0.5 * (d_disc + d_cup)
                     n += 1
                 total_loss += float(loss.detach()) * batch["mask"].shape[0]
 
-        # Reduce across ranks
         loss_tensor = torch.tensor([total_loss, float(n)], device=self.device)
         dice_tensor = torch.tensor([total_dice, float(n)], device=self.device)
         loss_tensor = self.dist.all_reduce_sum(loss_tensor)
@@ -1228,29 +942,34 @@ class Trainer:
         dice_mean = (dice_tensor[0].item() / max(1.0, dice_tensor[1].item()))
         return {"loss": loss_mean, "dice": dice_mean}
 
-    # ---------- Public loops ----------
     def fit(self):
         if not self.cfg.do_train:
             return
         if self.dist.is_main:
             print("[INFO] Starting training…")
         for epoch in range(1, self.cfg.epochs + 1):
-            self._epoch = epoch  # for sampler
+            self._epoch = epoch
             tr = self._run_epoch(train=True)
-            va = self._run_epoch(train=False)
+            
+            # Optimization: Evaluate only every N epochs to save time
+            va_dice = 0.0
+            if epoch % self.cfg.eval_every == 0 or epoch == self.cfg.epochs:
+                va = self._run_epoch(train=False)
+                va_dice = va["dice"]
+                if self.dist.is_main:
+                    print(f"[E{epoch:03d}] loss={tr['loss']:.4f} | dice(tr)={tr['dice']:.4f} | dice(val)={va['dice']:.4f}")
+                    self._save_ckpt(self.last_path)
+                    if va["dice"] > self.best_val:
+                        self.best_val = va["dice"]
+                        self._save_ckpt(self.best_path)
+            else:
+                if self.dist.is_main:
+                    print(f"[E{epoch:03d}] loss={tr['loss']:.4f} | dice(tr)={tr['dice']:.4f} | (val skipped)")
+
             self.history["train_loss"].append(tr["loss"])
             self.history["train_dice"].append(tr["dice"])
-            self.history["val_dice"].append(va["dice"])
-
-            if self.dist.is_main:
-                print(
-                    f"[E{epoch:03d}] loss={tr['loss']:.4f} | dice(tr)={tr['dice']:.4f} | dice(val)={va['dice']:.4f}"
-                )
-                # Save last + best
-                self._save_ckpt(self.last_path)
-                if va["dice"] > self.best_val:
-                    self.best_val = va["dice"]
-                    self._save_ckpt(self.best_path)
+            if va_dice > 0: self.history["val_dice"].append(va_dice)
+            
             self.dist.barrier()
 
         if self.dist.is_main:
@@ -1262,7 +981,6 @@ class Trainer:
     def test(self) -> Dict[str, Any]:
         if not self.cfg.do_test:
             return {}
-        # Only rank-0 performs testing + file outputs
         if not self.dist.is_main:
             self.dist.barrier()
             return {}
@@ -1287,39 +1005,26 @@ class Trainer:
         summary = {"disc_sum": 0.0, "cup_sum": 0.0, "disc_n": 0, "cup_n": 0}
         with jl_path.open("w") as jf, torch.no_grad():
             for batch in self.dl_test:
-                metas = batch["meta"]  # Dict of lists from custom collate
+                metas = batch["meta"]
                 batch_tensors = {k: v for k, v in batch.items() if k != "meta"}
-                # Use to_device from shared utils
                 batch_tensors = tu.to_device(batch_tensors, self.device)
-                logits, _ = self._unwrap()(batch_tensors)  # (B,2,H,W) in polar
+                logits, _ = self._unwrap()(batch_tensors)
                 prob = torch.sigmoid(logits)
 
                 for i in range(prob.shape[0]):
-                    # Access metadata from dict-of-lists format
                     stem = metas["stem"][i]
                     image_path = metas["image_path"][i]
-                    
-                    # Get polar transform params for inverse (disc-centered)
                     polar_center = metas["polar_center"][i]
                     polar_radius = metas["polar_radius"][i]
 
-                    # Dice in polar domain
                     d_disc = tu.dice_coef_prob(prob[i, 0:1], batch_tensors["mask"][i, 0:1])
                     d_cup = tu.dice_coef_prob(prob[i, 1:2], batch_tensors["mask"][i, 1:2])
 
-                    # Threshold in polar
                     disc_pol = (prob[i, 0].cpu().numpy() >= 0.5).astype(np.uint8) * 255
                     cup_pol = (prob[i, 1].cpu().numpy() >= 0.5).astype(np.uint8) * 255
 
-                    # Convert back to Cartesian using disc-centered params
-                    disc_cart = polar_to_cartesian(
-                        disc_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz,
-                        center=polar_center, radius=polar_radius
-                    )
-                    cup_cart = polar_to_cartesian(
-                        cup_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz,
-                        center=polar_center, radius=polar_radius
-                    )
+                    disc_cart = polar_to_cartesian(disc_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz, center=polar_center, radius=polar_radius)
+                    cup_cart = polar_to_cartesian(cup_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz, center=polar_center, radius=polar_radius)
 
                     disc_cart = disc_cart.astype(np.uint8)
                     cup_cart = cup_cart.astype(np.uint8)
@@ -1330,15 +1035,9 @@ class Trainer:
                     PILImage.fromarray(cup_cart).save(str(save_cup))
 
                     rec = {
-                        "image": image_path,
-                        "stem": stem,
-                        "dice_disc": float(d_disc),
-                        "dice_cup": float(d_cup),
-                        "prompt": self.cfg.test_prompt,
-                        "polar_center": list(polar_center) if isinstance(polar_center, tuple) else polar_center,
-                        "polar_radius": float(polar_radius),
-                        "mask_disc_path": str(save_disc),
-                        "mask_cup_path": str(save_cup),
+                        "image": image_path, "stem": stem, "dice_disc": float(d_disc), "dice_cup": float(d_cup),
+                        "prompt": self.cfg.test_prompt, "polar_center": list(polar_center) if isinstance(polar_center, tuple) else polar_center,
+                        "polar_radius": float(polar_radius), "mask_disc_path": str(save_disc), "mask_cup_path": str(save_cup),
                     }
                     jf.write(json.dumps(rec) + "\n")
 
@@ -1349,17 +1048,12 @@ class Trainer:
 
         disc_mean = summary["disc_sum"] / max(1, summary["disc_n"])
         cup_mean = summary["cup_sum"] / max(1, summary["cup_n"])
-        overall = (summary["disc_sum"] + summary["cup_sum"]) / max(
-            1, summary["disc_n"] + summary["cup_n"]
-        )
+        overall = (summary["disc_sum"] + summary["cup_sum"]) / max(1, summary["disc_n"] + summary["cup_n"])
         test_summary = {
-            "disc_mean_dice": disc_mean,
-            "cup_mean_dice": cup_mean,
-            "overall_mean_dice": overall,
-            "counts": {"disc": summary["disc_n"], "cup": summary["cup_n"]},
+            "disc_mean_dice": disc_mean, "cup_mean_dice": cup_mean,
+            "overall_mean_dice": overall, "counts": {"disc": summary["disc_n"], "cup": summary["cup_n"]},
             "checkpoint": str(ckpt),
         }
-        # Append to metrics
         metrics_path = Path(self.cfg.out_dir) / f"{self.cfg.run_name}_metrics.json"
         if metrics_path.exists():
             m = json.loads(metrics_path.read_text())
@@ -1372,9 +1066,6 @@ class Trainer:
         return test_summary
 
 
-# =========================================================
-# Public programmatic API
-# =========================================================
 def run_finetune(cfg: TrainConfig) -> Dict[str, Any]:
     dist_cfg = DistConfig()
     dist = DistributedContext(dist_cfg)
@@ -1389,143 +1080,51 @@ def run_finetune(cfg: TrainConfig) -> Dict[str, Any]:
         dist.cleanup()
 
 
-# =========================================================
-# CLI
-# =========================================================
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Fine-tune Fundu-style MedSAM (multi-GPU ready) with adapters+CBAM, polar coords, joint OD/OC loss."
     )
-    # Data / IO
     p.add_argument("--data-root", type=Path, required=True, help="Root datasets scanned by ImageFactory.")
     p.add_argument("--yolo-ds", type=Path, required=True, help="YOLO dataset directory containing data.yaml.")
     p.add_argument("--out-dir", type=Path, required=True, help="Output directory for metrics/preds.")
     p.add_argument("--run-dir", type=Path, required=True, help="Run directory for checkpoints.")
     p.add_argument("--run-name", type=str, default="FunduSAMFinetune")
     p.add_argument("--exclude-ds", nargs="*", default=None, help="Datasets to exclude by substring.")
-
-    # Detector
     p.add_argument("--yolo-weights", type=Path, required=True, help="Path to trained YOLO weights.")
-    p.add_argument(
-        "--yolo-device",
-        type=str,
-        default=DEFAULT_YOLO_DEVICE,
-        help=f"YOLO device (default: {DEFAULT_YOLO_DEVICE})",
-    )
-    p.add_argument(
-        "--yolo-imgsz",
-        type=int,
-        default=DEFAULT_YOLO_IMGSZ,
-        help=f"YOLO inference size (default: {DEFAULT_YOLO_IMGSZ})",
-    )
-    p.add_argument(
-        "--yolo-conf",
-        type=float,
-        default=DEFAULT_YOLO_CONF,
-        help=f"YOLO confidence threshold (default: {DEFAULT_YOLO_CONF})",
-    )
-    p.add_argument(
-        "--yolo-iou",
-        type=float,
-        default=DEFAULT_YOLO_IOU,
-        help=f"YOLO NMS IoU threshold (default: {DEFAULT_YOLO_IOU})",
-    )
-    p.add_argument("--det-cache", type=Path, default=None, help="Optional JSONL cache path for detector boxes.")
-
-    # Model/opt
-    p.add_argument(
-        "--model",
-        type=str,
-        default=DEFAULT_MODEL,
-        help=f"SAM backbone type (default: {DEFAULT_MODEL})",
-    )
+    p.add_argument("--yolo-device", type=str, default=DEFAULT_YOLO_DEVICE)
+    p.add_argument("--yolo-imgsz", type=int, default=DEFAULT_YOLO_IMGSZ)
+    p.add_argument("--yolo-conf", type=float, default=DEFAULT_YOLO_CONF)
+    p.add_argument("--yolo-iou", type=float, default=DEFAULT_YOLO_IOU)
+    p.add_argument("--det-cache", type=Path, default=None)
+    p.add_argument("--model", type=str, default=DEFAULT_MODEL)
     p.add_argument("--ckpt", type=Path, required=True, help="MedSAM checkpoint.")
     p.add_argument("--unfreeze-encoders", action="store_true")
-    p.add_argument(
-        "--save-full",
-        action="store_true",
-        help="Deprecated: kept for CLI compatibility; new checkpoints always save full model.",
-    )
-    p.add_argument(
-        "--epochs",
-        type=int,
-        default=DEFAULT_EPOCHS,
-        help=f"Number of epochs (default: {DEFAULT_EPOCHS})",
-    )
-    p.add_argument(
-        "--batch",
-        type=int,
-        default=DEFAULT_BATCH,
-        help=f"Batch size (default: {DEFAULT_BATCH})",
-    )
-    p.add_argument(
-        "--imgsz",
-        type=int,
-        default=DEFAULT_IMGSZ,
-        help=f"Input resolution (default: {DEFAULT_IMGSZ})",
-    )
-    p.add_argument(
-        "--lr",
-        type=float,
-        default=DEFAULT_LR,
-        help=f"Learning rate (default: {DEFAULT_LR})",
-    )
-    p.add_argument(
-        "--wd",
-        type=float,
-        default=DEFAULT_WD,
-        help=f"Weight decay (default: {DEFAULT_WD})",
-    )
-    p.add_argument(
-        "--workers",
-        type=int,
-        default=DEFAULT_WORKERS,
-        help=f"Dataloader workers (default: {DEFAULT_WORKERS})",
-    )
+    p.add_argument("--save-full", action="store_true")
+    p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    p.add_argument("--batch", type=int, default=DEFAULT_BATCH)
+    p.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
+    p.add_argument("--lr", type=float, default=DEFAULT_LR)
+    p.add_argument("--wd", type=float, default=DEFAULT_WD)
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--amp", action="store_true")
     p.add_argument("--grad-acc-steps", type=int, default=1)
     p.add_argument("--bucket-cap-mb", type=int, default=25)
     p.add_argument("--find-unused-parameters", action="store_true")
     p.add_argument("--seed", type=int, default=SEED)
-
-    # Prompt/augmentation (Option B controls)
-    p.add_argument(
-        "--use-det-prob",
-        type=float,
-        default=DEFAULT_USE_DET_PROB,
-        help=f"Prob. of using DET box vs GT during train (default: {DEFAULT_USE_DET_PROB})",
-    )
-    p.add_argument(
-        "--pad-jitter",
-        type=float,
-        default=DEFAULT_PAD_JITTER,
-        help=f"Box padding jitter fraction (default: {DEFAULT_PAD_JITTER})",
-    )
-    p.add_argument(
-        "--box-jitter-tr",
-        type=float,
-        default=DEFAULT_BOX_TR,
-        help=f"Box translation jitter (default: {DEFAULT_BOX_TR})",
-    )
-    p.add_argument(
-        "--box-jitter-sc",
-        type=float,
-        default=DEFAULT_BOX_SC,
-        help=f"Box scale jitter (default: {DEFAULT_BOX_SC})",
-    )
-    p.add_argument(
-        "--polar-radius-padding",
-        type=float,
-        default=1.5,
-        help="Padding multiplier for polar transform radius around disc (default: 1.5)",
-    )
-
-    # Modes
+    p.add_argument("--use-det-prob", type=float, default=DEFAULT_USE_DET_PROB)
+    p.add_argument("--pad-jitter", type=float, default=DEFAULT_PAD_JITTER)
+    p.add_argument("--box-jitter-tr", type=float, default=DEFAULT_BOX_TR)
+    p.add_argument("--box-jitter-sc", type=float, default=DEFAULT_BOX_SC)
+    p.add_argument("--polar-radius-padding", type=float, default=1.5)
     p.add_argument("--train", action="store_true")
     p.add_argument("--test", action="store_true")
     p.add_argument("--test-prompt", choices=["det", "gt"], default="det")
     p.add_argument("--test-weights", type=Path, default=None)
     p.add_argument("--resume", type=Path, default=None)
+    # New Performance Flags
+    p.add_argument("--compile-model", action="store_true", help="Compile model with torch.compile (requires PyTorch 2.0+)")
+    p.add_argument("--eval-every", type=int, default=1, help="Run validation every N epochs")
+    p.add_argument("--grad-checkpointing", action="store_true", help="Enable gradient checkpointing for lower VRAM usage")
 
     return p.parse_args()
 
@@ -1533,43 +1132,16 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     cfg = TrainConfig(
-        data_root=args.data_root,
-        yolo_ds=args.yolo_ds,
-        out_dir=args.out_dir,
-        run_dir=args.run_dir,
-        run_name=args.run_name,
-        yolo_weights=args.yolo_weights,
-        exclude_datasets=args.exclude_ds,
-        yolo_device=args.yolo_device,
-        yolo_imgsz=args.yolo_imgsz,
-        yolo_conf=args.yolo_conf,
-        yolo_iou=args.yolo_iou,
-        det_cache=args.det_cache,
-        model=args.model,
-        ckpt=args.ckpt,
-        unfreeze_encoders=args.unfreeze_encoders,
-        save_full=args.save_full,
-        epochs=args.epochs,
-        batch=args.batch,
-        imgsz=args.imgsz,
-        lr=args.lr,
-        wd=args.wd,
-        workers=args.workers,
-        amp=args.amp or True,  # prefer AMP unless explicitly disabled downstream
-        grad_acc_steps=args.grad_acc_steps,
-        bucket_cap_mb=args.bucket_cap_mb,
-        find_unused_parameters=args.find_unused_parameters,
-        seed=args.seed,
-        use_det_prob=args.use_det_prob,
-        pad_jitter=args.pad_jitter,
-        box_jitter_tr=args.box_jitter_tr,
-        box_jitter_sc=args.box_jitter_sc,
-        polar_radius_padding=args.polar_radius_padding,
-        do_train=args.train,
-        do_test=args.test,
-        test_prompt=args.test_prompt,
-        test_weights=args.test_weights,
-        resume=args.resume,
+        data_root=args.data_root, yolo_ds=args.yolo_ds, out_dir=args.out_dir, run_dir=args.run_dir, run_name=args.run_name,
+        yolo_weights=args.yolo_weights, exclude_datasets=args.exclude_ds, yolo_device=args.yolo_device, yolo_imgsz=args.yolo_imgsz,
+        yolo_conf=args.yolo_conf, yolo_iou=args.yolo_iou, det_cache=args.det_cache, model=args.model, ckpt=args.ckpt,
+        unfreeze_encoders=args.unfreeze_encoders, save_full=args.save_full, epochs=args.epochs, batch=args.batch, imgsz=args.imgsz,
+        lr=args.lr, wd=args.wd, workers=args.workers, amp=args.amp or True, grad_acc_steps=args.grad_acc_steps,
+        bucket_cap_mb=args.bucket_cap_mb, find_unused_parameters=args.find_unused_parameters, seed=args.seed,
+        use_det_prob=args.use_det_prob, pad_jitter=args.pad_jitter, box_jitter_tr=args.box_jitter_tr, box_jitter_sc=args.box_jitter_sc,
+        polar_radius_padding=args.polar_radius_padding, do_train=args.train, do_test=args.test, test_prompt=args.test_prompt,
+        test_weights=args.test_weights, resume=args.resume,
+        compile_model=args.compile_model, eval_every=args.eval_every, grad_checkpointing=args.grad_checkpointing
     )
     res = run_finetune(cfg)
     if DistConfig().rank == 0:
