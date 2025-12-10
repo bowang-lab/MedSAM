@@ -715,8 +715,8 @@ class TrainConfig:
     test_weights: Optional[Path] = None
     resume: Optional[Path] = None
     compile_model: bool = False  # New config for torch.compile
-    eval_every: int = 1  # Eval every N epochs
-    grad_checkpointing: bool = False # Gradient checkpointing to save VRAM
+    eval_every: int = 5 # Eval every N epochs
+    grad_checkpointing: bool = True # Gradient checkpointing to save VRAM
 
 
 class Trainer:
