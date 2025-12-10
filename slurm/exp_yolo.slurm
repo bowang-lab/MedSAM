@@ -52,41 +52,82 @@ load_config_args() {
   shift  # Remove mode from args
   local override_args=("$@")
   
-  # Build override string for Python script
-  local override_str=""
-  for arg in "${override_args[@]}"; do
-    override_str="${override_str} ${arg}"
-  done
+  # Build command array for Python script (handles empty arrays correctly)
+  local cmd_args=("${LOAD_CONFIG_SCRIPT}" "${mode}" "${REPO_DIR}" "${YOLO_DEVICES}")
+  if [[ ${#override_args[@]} -gt 0 ]]; then
+    cmd_args+=("${override_args[@]}")
+  fi
   
   # Call Python script to load config and build args
+  # Capture stdout (JSON), let stderr pass through for debugging
   local json_output
-  json_output=$(python3 "${LOAD_CONFIG_SCRIPT}" "${mode}" "${REPO_DIR}" "${YOLO_DEVICES}" ${override_str})
-  
-  if [[ $? -ne 0 ]]; then
+  if ! json_output=$(python3 "${cmd_args[@]}" 2>&1); then
     echo "[ERROR] Failed to load config for mode ${mode}" >&2
     exit 2
   fi
   
-  # Extract args and paths from JSON using Python (always available)
-  readarray -t ARGS < <(python3 -c "import json, sys; data=json.load(sys.stdin); [print(x) for x in data['args']]" <<< "${json_output}")
+  if [[ -z "${json_output}" ]]; then
+    echo "[ERROR] Config loader produced no output" >&2
+    exit 2
+  fi
   
-  # Extract paths using Python
-  eval "$(python3 << 'PYTHON_EOF'
+  # Validate JSON before parsing (check if it starts with { and ends with })
+  if [[ ! "${json_output}" =~ ^\{.*\}$ ]]; then
+    echo "[ERROR] Invalid JSON output from config loader" >&2
+    echo "[ERROR] Output (first 300 chars): ${json_output:0:300}" >&2
+    exit 2
+  fi
+  
+  # Extract args and paths from JSON using Python (always available)
+  # Use a more robust JSON parser that handles errors
+  if ! readarray -t ARGS < <(python3 << 'PYTHON_EOF'
 import json
 import sys
 
-data = json.load(sys.stdin)
-paths = data.get('paths', {})
-
-# Output bash variable assignments
-for key, value in paths.items():
-    if value:
-        # Convert snake_case to UPPER_SNAKE_CASE
-        var_name = key.upper()
-        print(f'{var_name}="{value}"')
+try:
+    data = json.load(sys.stdin)
+    for x in data.get('args', []):
+        print(x)
+except (json.JSONDecodeError, KeyError) as e:
+    print(f"Error parsing JSON: {e}", file=sys.stderr)
+    sys.exit(1)
 PYTHON_EOF
-<<< "${json_output}"
-)"
+<<< "${json_output}" 2>&1); then
+    echo "[ERROR] Failed to parse args from JSON" >&2
+    exit 2
+  fi
+  
+  # Extract paths using Python (with error handling)
+  local path_vars
+  if ! path_vars=$(python3 << 'PYTHON_EOF'
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+    paths = data.get('paths', {})
+    
+    # Output bash variable assignments
+    for key, value in paths.items():
+        if value:
+            # Convert snake_case to UPPER_SNAKE_CASE
+            var_name = key.upper()
+            print(f'{var_name}="{value}"')
+except json.JSONDecodeError as e:
+    print(f"Error: JSON decode failed: {e}", file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(1)
+PYTHON_EOF
+<<< "${json_output}" 2>&1); then
+    echo "[WARN] Failed to extract paths from config, continuing with defaults" >&2
+  else
+    # Only eval if we got valid output
+    if [[ -n "${path_vars}" ]]; then
+      eval "${path_vars}"
+    fi
+  fi
 }
 
 ############################

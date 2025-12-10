@@ -4,9 +4,15 @@ Helper script to load and process YAML config files for exp_yolo.slurm
 Outputs bash array format for easy sourcing.
 """
 import sys
-import yaml
 import json
 from pathlib import Path
+
+# Import yaml with better error handling
+try:
+    import yaml
+except ImportError:
+    print("Error: PyYAML not installed. Install with: pip install pyyaml", file=sys.stderr)
+    sys.exit(1)
 
 def load_config(mode: int, repo_dir: str, **kwargs) -> dict:
     """Load config for a given mode and substitute template variables."""
@@ -184,6 +190,14 @@ if __name__ == "__main__":
             "paths": paths
         }
         print(json.dumps(output))
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except yaml.YAMLError as e:
+        print(f"Error: Invalid YAML in config file: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         sys.exit(1)

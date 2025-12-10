@@ -9,7 +9,6 @@ paths:
 
 actions:
   - --finetune-medsam
-  - --test-yolo
 
 training:
   epochs: 100
