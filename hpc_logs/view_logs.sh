@@ -8,7 +8,7 @@ shopt -s nullglob
 usage() {
   cat <<'EOF'
 Usage:
-  view_latest_logs.sh            # interactively view one of the 4 newest logs
+  view_latest_logs.sh            # interactively view one of the 8 newest logs
   view_latest_logs.sh --delete   # delete all *.out/*.err except the most recent 2
   view_latest_logs.sh -h|--help  # show this help
 EOF
@@ -63,8 +63,8 @@ fi
 
 # ---- Interactive view mode (default) ----
 
-# Show only the 4 newest (mixed .out/.err)
-files=("${all_files[@]:0:4}")
+# Show only the 8 newest (mixed .out/.err)
+files=("${all_files[@]:0:8}")
 
 # Color codes
 BOLD="\033[1m"
@@ -84,6 +84,8 @@ for file in "${files[@]}"; do
 
     if [ $i -le 2 ]; then
       echo -e "  [$i] ${BOLD}${GREEN}$file  —  $mod_time${RESET}"
+    elif [ $i -le 4 ]; then
+      echo -e "  [$i] ${GREEN}$file  —  $mod_time${RESET}"
     else
       echo "  [$i] $file  —  $mod_time"
     fi
