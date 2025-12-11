@@ -180,7 +180,8 @@ def build_image_index(data_root: Path, exclude: Optional[List[str]] = None) -> D
 
 
 def images_from_yolo_splits(
-    yolo_ds: Path, data_root: Path, exclude: Optional[List[str]] = None
+    yolo_ds: Path, data_root: Path, exclude: Optional[List[str]] = None,
+    is_main: bool = True  # Only print from main rank
 ) -> Tuple[List[IMG], List[IMG], List[IMG]]:
     mapping = tu.parse_data_yaml(yolo_ds / "data.yaml")
     train_imgs = tu.resolve_split_images(yolo_ds, mapping["train"])
@@ -203,9 +204,10 @@ def images_from_yolo_splits(
         return out
 
     tr, va, te = to_images(train_imgs), to_images(val_imgs), to_images(test_imgs)
-    if miss:
+    if miss and is_main:
         print(f"[WARN] {miss} YOLO-split images not found in ImageFactory index; skipped.")
-    print(f"[INFO] YOLO split sizes → train={len(tr)} val={len(va)} test={len(te)}")
+    if is_main:
+        print(f"[INFO] YOLO split sizes → train={len(tr)} val={len(va)} test={len(te)}")
     return tr, va, te
 
 
@@ -739,7 +741,8 @@ class Trainer:
         Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
 
         train_imgs, val_imgs, test_imgs = images_from_yolo_splits(
-            cfg.yolo_ds, cfg.data_root, exclude=cfg.exclude_datasets
+            cfg.yolo_ds, cfg.data_root, exclude=cfg.exclude_datasets,
+            is_main=self.dist.is_main
         )
 
         provider = None
@@ -1079,6 +1082,12 @@ def run_finetune(cfg: TrainConfig) -> Dict[str, Any]:
     dist = DistributedContext(dist_cfg)
     set_global_seed(cfg.seed + dist_cfg.rank)
     dist.setup()
+    
+    # Diagnostic: Print DDP info from main rank only
+    if dist.is_main:
+        print(f"[INFO] DDP initialized: world_size={dist_cfg.world_size}, rank={dist_cfg.rank}, local_rank={dist_cfg.local_rank}")
+        print(f"[INFO] Device: {dist.cfg.device()}")
+    
     try:
         trainer = Trainer(cfg, dist)
         trainer.fit()
