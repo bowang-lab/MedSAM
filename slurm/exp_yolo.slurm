@@ -117,7 +117,7 @@ ARG_2=(
     "--splits-parquet" "/scratch/st-ipor-1/cperez/MedSAM/src/image_data/splits_final.parquet"
     "--yolo-out-dir" "/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS_PARQUET"
     "--finetune-runs-root" "/scratch/st-ipor-1/cperez/MedSAM/runs"
-    "--epochs" "100"
+    "--epochs" "800"
     "--batch" "16"
     "--imgsz" "640"
     "--workers" "8"
@@ -159,11 +159,10 @@ ARG_4=(
 # --- MODE 5: Predictions Only ---
 ARG_5=(
     "--predict"
-    "--yolo-weights" "/scratch/st-ipor-1/cperez/MedSAM/runs/run13/Train/Train/weights/best.pt"
+    "--yolo-weights" "/scratch/st-ipor-1/cperez/MedSAM/runs/run15/Train/Train/weights/best.pt"
     "--medsam-ckpt" "/scratch/st-ipor-1/cperez/MedSAM/weights/medsam_vit_b.pth"
-    "--predict-parquet" "/scratch/st-ipor-1/cperez/MedSAM/src/image_data/images_dev.parquet"
-    "--predict-out-dir" "/scratch/st-ipor-1/cperez/MedSAM/PREDICT/experiment_predictions"
-    "--predict-splits" "test"
+    "--predict-parquet" "/home/cperez67/medsam/src/image_data/parquet/og_images/images_eyepacs.parquet"
+    "--predict-out-dir" "/scratch/st-ipor-1/cperez/MedSAM/PREDICT/EYEPACS_PREDICTIONS"
     "--predict-batch-size" "128"
     "--predict-sam-amp"
     "--yolo-device" "${CUDA_VISIBLE_DEVICES}"
