@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=160G
 #SBATCH --time=72:00:00
-#SBATCH --gpus=5
+#SBATCH --gpus=4
 #SBATCH --constraint=gpu_mem_32
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.err
