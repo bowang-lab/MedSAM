@@ -216,15 +216,14 @@ ARG_8=(
     "--yolo-weights" "/scratch/st-ipor-1/cperez/MedSAM/runs/YOLO_DEV_RUN/Train/Train/weights/best.pt"
     "--yolo-ds" "/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS"
     "--medsam-ckpt" "/scratch/st-ipor-1/cperez/MedSAM/weights/medsam_vit_b.pth"
-    # Base output dir (creates subfolders Fundu1, Fundu2...)
     "--yolo-out-dir" "/scratch/st-ipor-1/cperez/MedSAM/runs/Fundu"
     "--epochs" "100"
     "--batch" "4"
     "--imgsz" "1024"
     "--workers" "16"
     "--yolo-device" "${YOLO_DEVICES}"
-    "--grad-checkpointing"  # Saves VRAM
-    "--eval-every" "5"      # Speed up by validating less often
+    "--grad-checkpointing"
+    "--eval-every" "5"
 )
 
 ###############################################################################
