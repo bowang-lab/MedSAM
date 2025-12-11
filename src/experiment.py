@@ -90,7 +90,7 @@ HPC_ENV = EnvPaths(
     run_dir=HPC_REPO_DIR / "runs",
     cfg=HPC_REPO_DIR / "src/configs/train_custom.yaml",
     model=HPC_REPO_DIR / "weights/yolo12x.pt",
-    device="0",
+    device="0,1,2,3",
     medsam_ckpt=HPC_REPO_DIR / "weights/medsam_vit_b.pth",
 )
 HPC_RUN = RunConfig(
@@ -158,7 +158,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=None, help="Image size")
     parser.add_argument("--workers", type=int, default=None, help="Number of data workers")
 
-    # MedSAM Finetuning Performance Flags (ADDED)
+    # MedSAM Finetuning Performance Flags
     parser.add_argument("--grad-checkpointing", action="store_true", help="Enable gradient checkpointing (saves VRAM)")
     parser.add_argument("--eval-every", type=int, default=1, help="Run validation every N epochs")
     parser.add_argument("--compile-model", action="store_true", help="Compile model with torch.compile")
@@ -224,13 +224,12 @@ def main():
 
     # 2. Resolve Paths
     yolo_ds_root = args.yolo_ds or args.yolo_out_dir or env.out_dir
-    # For yolo_device, if a comma-separated list is provided (e.g., "0,1,2,3"), 
-    # extract the first device for YOLO inference (which runs on rank-0 only)
+    
     if args.yolo_device:
-        # Handle comma-separated device strings (take first device)
-        effective_device = args.yolo_device.split(",")[0].strip()
+        effective_device = args.yolo_device
     else:
         effective_device = env.device
+
     effective_medsam_ckpt = args.medsam_ckpt or env.medsam_ckpt
 
     i = 1
@@ -348,13 +347,10 @@ def main():
                 yolo_iou=cfg.iou,
                 ckpt=effective_medsam_ckpt,
                 epochs=cfg.epochs,
-                # For MedSAM, use batch size as-is (already set appropriately for multi-GPU)
-                # Only divide by 2 if batch is very large (>16) to save memory
-                batch=cfg.batch if cfg.batch <= 16 else max(1, cfg.batch // 2),
+                batch=max(1, cfg.batch // 2),
                 workers=cfg.workers,
                 do_train=True, do_test=True, test_prompt="det",
                 seed=SEED,
-                # Pass new performance args
                 grad_checkpointing=args.grad_checkpointing,
                 eval_every=args.eval_every,
                 compile_model=args.compile_model
