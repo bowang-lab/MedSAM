@@ -206,7 +206,7 @@ device = torch.device(args.device)
 
 class MedSAM(nn.Module):
     def __init__(
-        self,
+        self, 
         image_encoder,
         mask_decoder,
         prompt_encoder,
