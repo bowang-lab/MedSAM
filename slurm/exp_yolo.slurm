@@ -8,7 +8,7 @@
 #SBATCH --mem=160G
 #SBATCH --time=72:00:00
 #SBATCH --gpus=5
---constraint=gpu_mem_32
+#SBATCH --constraint=gpu_mem_32
 #SBATCH --output=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.out
 #SBATCH --error=/scratch/st-ipor-1/cperez/MedSAM/hpc_logs/%x-%j.err
 #SBATCH --mail-user=cperez67@student.ubc.ca
