@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
 # File: src/experiment.py
-"""
-Unified Experiment Script for MedSAM/YOLO Pipeline.
-
-Modes:
-  --create-ds       : Create YOLO dataset from raw folders or parquet
-  --train-yolo      : Train YOLO from scratch on dataset
-  --finetune-yolo   : Finetune YOLO from pretrained weights using processed parquet
-  --test-yolo       : Test YOLO model
-  --finetune-medsam : Finetune MedSAM using YOLO-detected prompts
-  --predict         : Run YOLO+MedSAM predictions on a dataset
-"""
 
 from __future__ import annotations
 
@@ -19,7 +8,6 @@ import dataclasses
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from src.model.yolo import (
     YOLORunner,
@@ -119,11 +107,8 @@ def ensure_yolo_dataset_from_splits_parquet(
         splits_parquet: Path,
         yolo_ds_root: Path,
         batch_size: int,
-        exclude_datasets: list[str] | None = None,  # <--- NEW ARGUMENT
+        exclude_datasets: list[str] | None = None,
 ) -> None:
-    """
-    Builds the YOLO dataset directory from a Parquet file.
-    """
     if (yolo_ds_root / "data.yaml").exists():
         print(f"[INFO] Using existing YOLO dataset at: {yolo_ds_root}")
         return
@@ -146,41 +131,18 @@ def ensure_yolo_dataset_from_splits_parquet(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Unified MedSAM/YOLO Experiment Runner",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Train YOLO from scratch on raw dataset folders
-  python -m src.experiment --train-yolo --test-yolo
-
-  # Finetune YOLO from pretrained weights using processed parquet
-  python -m src.experiment --finetune-yolo \\
-      --images-parquet path/to/processed.parquet \\
-      --init-weights path/to/pretrained.pt \\
-      --yolo-out-dir path/to/output_ds
-
-  # Run full pipeline with MedSAM finetuning
-  python -m src.experiment --train-yolo --test-yolo --finetune-medsam
-
-  # Run predictions on a dataset
-  python -m src.experiment --predict \\
-      --predict-parquet images.parquet \\
-      --yolo-weights best.pt \\
-      --predict-out-dir predictions/
-
-  # Full pipeline: train -> test -> predict
-  python -m src.experiment --train-yolo --test-yolo --predict
-        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
     # Environment
     parser.add_argument("--local", action="store_true", help="Use local paths")
 
     # Dataset Configuration
-    parser.add_argument("--yolo-ds", type=Path, default=None, help="Path to existing YOLO dataset (data.yaml folder)")
+    parser.add_argument("--yolo-ds", type=Path, default=None, help="Path to existing YOLO dataset")
     parser.add_argument("--yolo-out-dir", type=Path, default=None, help="Destination for new YOLO dataset")
-    parser.add_argument("--splits-parquet", type=Path, default=None, help="Source Parquet file with 'split' column")
+    parser.add_argument("--splits-parquet", type=Path, default=None, help="Source Parquet file")
     parser.add_argument("--splits-batch-size", type=int, default=2048)
-    parser.add_argument("--exclude-ds", nargs="*", default=None, help="Datasets to exclude (substring match)")
+    parser.add_argument("--exclude-ds", nargs="*", default=None, help="Datasets to exclude")
 
     # Split Ratios
     parser.add_argument("--train-ratio", type=float, default=DEFAULT_TRAIN_RATIO)
@@ -188,52 +150,43 @@ Examples:
     parser.add_argument("--test-ratio", type=float, default=DEFAULT_TEST_RATIO)
 
     # Model / Training
-    parser.add_argument("--yolo-weights", type=Path, default=None, help="Weights for testing/finetuning MedSAM")
-    parser.add_argument("--medsam-ckpt", type=Path, default=None,
-                        help="Path to MedSAM checkpoint (overrides environment default)")
+    parser.add_argument("--yolo-weights", type=Path, default=None, help="Weights for testing/finetuning")
+    parser.add_argument("--medsam-ckpt", type=Path, default=None, help="MedSAM checkpoint")
     parser.add_argument("--yolo-device", type=str, default=None, help="Override device")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch", type=int, default=None)
-    parser.add_argument("--imgsz", type=int, default=None, help="Image size for training")
+    parser.add_argument("--imgsz", type=int, default=None, help="Image size")
     parser.add_argument("--workers", type=int, default=None, help="Number of data workers")
 
+    # MedSAM Finetuning Performance Flags (ADDED)
+    parser.add_argument("--grad-checkpointing", action="store_true", help="Enable gradient checkpointing (saves VRAM)")
+    parser.add_argument("--eval-every", type=int, default=1, help="Run validation every N epochs")
+    parser.add_argument("--compile-model", action="store_true", help="Compile model with torch.compile")
+
     # YOLO Finetuning Specific Arguments
-    parser.add_argument("--init-weights", type=Path, default=None,
-                        help="Pretrained weights to finetune from (for --finetune-yolo)")
-    parser.add_argument("--images-parquet", type=Path, default=None,
-                        help="Processed parquet with splits/GT boxes (for --finetune-yolo)")
-    parser.add_argument("--skip-materialization", action="store_true",
-                        help="Use existing YOLO dataset if found (for --finetune-yolo)")
-    parser.add_argument("--finetune-runs-root", type=Path, default=None,
-                        help="Separate runs directory for finetuning (defaults to run_dir/finetune)")
+    parser.add_argument("--init-weights", type=Path, default=None)
+    parser.add_argument("--images-parquet", type=Path, default=None)
+    parser.add_argument("--skip-materialization", action="store_true")
+    parser.add_argument("--finetune-runs-root", type=Path, default=None)
 
     # Prediction Arguments
-    parser.add_argument("--predict-parquet", type=Path, default=None,
-                        help="Parquet file with images for prediction (for --predict)")
-    parser.add_argument("--predict-dir", type=Path, default=None,
-                        help="Directory with images for prediction (for --predict)")
-    parser.add_argument("--predict-out-dir", type=Path, default=None,
-                        help="Output directory for predictions (defaults to run_dir/predictions)")
-    parser.add_argument("--predict-conf", type=float, default=0.001,
-                        help="Confidence threshold for predictions")
-    parser.add_argument("--predict-batch-size", type=int, default=128,
-                        help="Batch size for predictions")
-    parser.add_argument("--predict-resume", action="store_true",
-                        help="Resume interrupted prediction run")
-    parser.add_argument("--predict-splits", type=str, default=None,
-                        help="Comma-separated splits to predict on (e.g., 'test,val')")
-    parser.add_argument("--predict-sam-amp", action="store_true", default=True,
-                        help="Enable AMP for MedSAM (default: True)")
-    parser.add_argument("--predict-no-sam-amp", action="store_true",
-                        help="Disable AMP for MedSAM")
+    parser.add_argument("--predict-parquet", type=Path, default=None)
+    parser.add_argument("--predict-dir", type=Path, default=None)
+    parser.add_argument("--predict-out-dir", type=Path, default=None)
+    parser.add_argument("--predict-conf", type=float, default=0.001)
+    parser.add_argument("--predict-batch-size", type=int, default=128)
+    parser.add_argument("--predict-resume", action="store_true")
+    parser.add_argument("--predict-splits", type=str, default=None)
+    parser.add_argument("--predict-sam-amp", action="store_true", default=True)
+    parser.add_argument("--predict-no-sam-amp", action="store_true")
 
     # Actions
-    parser.add_argument("--create-ds", action="store_true", help="Create YOLO dataset")
-    parser.add_argument("--train-yolo", action="store_true", help="Train YOLO from scratch")
-    parser.add_argument("--finetune-yolo", action="store_true", help="Finetune YOLO from pretrained weights")
-    parser.add_argument("--test-yolo", action="store_true", help="Test YOLO model")
-    parser.add_argument("--finetune-medsam", action="store_true", help="Finetune MedSAM")
-    parser.add_argument("--predict", action="store_true", help="Run YOLO+MedSAM predictions")
+    parser.add_argument("--create-ds", action="store_true")
+    parser.add_argument("--train-yolo", action="store_true")
+    parser.add_argument("--finetune-yolo", action="store_true")
+    parser.add_argument("--test-yolo", action="store_true")
+    parser.add_argument("--finetune-medsam", action="store_true")
+    parser.add_argument("--predict", action="store_true")
 
     return parser.parse_args()
 
@@ -279,11 +232,10 @@ def main():
     run_name = f"run{i}"
     run_root = env.run_dir / run_name
 
-    # Track weights produced by training/finetuning
     trained_weights = None
     finetuned_weights = None
 
-    # 3. Prepare Dataset (for standard training)
+    # 3. Prepare Dataset
     if do_create or do_train:
         if args.splits_parquet:
             print(f"[INFO] Building Dataset from Parquet: {args.splits_parquet}")
@@ -302,10 +254,8 @@ def main():
                 exclude_datasets=args.exclude_ds,
             )
             temp_runner.ensure_data(args.train_ratio, args.val_ratio, args.test_ratio)
-        else:
-            print(f"[INFO] Dataset already exists at {yolo_ds_root}")
 
-    # 4. Train YOLO from scratch
+    # 4. Train YOLO
     if do_train:
         print(f"[INFO] Training YOLO on {yolo_ds_root}")
         runner = YOLORunner(
@@ -319,23 +269,13 @@ def main():
         )
         trained_weights = runner.train()
 
-    # 5. Finetune YOLO from pretrained weights (semi-supervised style)
+    # 5. Finetune YOLO
     if do_finetune_yolo:
-        # Validate required arguments
-        if not args.images_parquet:
-            raise ValueError("--finetune-yolo requires --images-parquet (processed parquet with splits/GT)")
-        if not args.init_weights:
-            raise ValueError("--finetune-yolo requires --init-weights (pretrained weights to finetune)")
-        
-        # Use separate runs directory for finetuning if specified
         finetune_runs_root = args.finetune_runs_root or (env.run_dir / "finetune")
         finetune_ds_root = args.yolo_out_dir or yolo_ds_root
-        
+
         print(f"[INFO] Finetuning YOLO from {args.init_weights}")
-        print(f"[INFO] Using parquet: {args.images_parquet}")
-        print(f"[INFO] Output dataset: {finetune_ds_root}")
-        print(f"[INFO] Runs directory: {finetune_runs_root}")
-        
+
         finetuned_weights = finetune_yolo_from_parquet(
             images_parquet=args.images_parquet,
             out_yolo_ds=finetune_ds_root,
@@ -351,17 +291,12 @@ def main():
             skip_materialization=args.skip_materialization,
             run_name_base="ss",
         )
-        
-        # Update yolo_ds_root for subsequent steps
         yolo_ds_root = finetune_ds_root
 
     # 6. Test YOLO
     if do_test:
-        # Prefer finetuned weights, then trained weights, then CLI weights
         test_weights = finetuned_weights or trained_weights or args.yolo_weights
-        if not test_weights:
-            print("[WARN] Skipping test: no weights found.")
-        else:
+        if test_weights:
             print(f"[INFO] Testing YOLO with {test_weights}")
             runner = YOLORunner(
                 data_root=env.data_root, out_dir=yolo_ds_root, run_dir=env.run_dir,
@@ -374,14 +309,20 @@ def main():
 
     # 7. Finetune MedSAM
     if do_finetune_medsam:
-        # Prefer finetuned weights, then trained weights, then CLI weights
         fundu_weights = finetuned_weights or trained_weights or args.yolo_weights
         if not fundu_weights:
             print("[WARN] Skipping MedSAM finetune: no YOLO weights found.")
         else:
             print(f"[INFO] Finetuning MedSAM using prompts from {fundu_weights}")
 
-            fundu_root = run_root / "Fundu" if (trained_weights or finetuned_weights) else env.run_dir / "Fundu_Inference"
+            # Use args.yolo_out_dir if provided for explicit output location
+            if args.yolo_out_dir:
+                fundu_root = args.yolo_out_dir
+            elif trained_weights or finetuned_weights:
+                fundu_root = run_root / "Fundu"
+            else:
+                fundu_root = env.run_dir / "Fundu_Inference"
+
             fundu_root.mkdir(parents=True, exist_ok=True)
             j = 1
             while (fundu_root / f"Fundu{j}").exists(): j += 1
@@ -404,50 +345,40 @@ def main():
                 batch=max(1, cfg.batch // 2),
                 workers=cfg.workers,
                 do_train=True, do_test=True, test_prompt="det",
-                seed=SEED
+                seed=SEED,
+                # Pass new performance args
+                grad_checkpointing=args.grad_checkpointing,
+                eval_every=args.eval_every,
+                compile_model=args.compile_model
             )
             run_medsam_finetune(med_cfg)
 
     # 8. Run Predictions
     if do_predict:
-        # Determine which weights to use for predictions
         predict_weights = finetuned_weights or trained_weights or args.yolo_weights
-        if not predict_weights:
-            print("[WARN] Skipping predictions: no YOLO weights found.")
-        else:
-            # Determine input source for predictions
+        if predict_weights:
             predict_input_parquet = args.predict_parquet
             predict_input_dir = args.predict_dir
-            
-            # If no explicit prediction input, use the YOLO dataset's saved_images.parquet
+
             if not predict_input_parquet and not predict_input_dir:
                 yolo_ds_images_parquet = yolo_ds_root / "saved_images.parquet"
                 if yolo_ds_images_parquet.exists():
                     predict_input_parquet = yolo_ds_images_parquet
-                    print(f"[INFO] Using dataset parquet for predictions: {predict_input_parquet}")
-                else:
-                    print("[WARN] No prediction input specified and no saved_images.parquet found.")
-                    print("[WARN] Use --predict-parquet or --predict-dir to specify input.")
-            
+
             if predict_input_parquet or predict_input_dir:
-                # Determine output directory
                 predict_out = args.predict_out_dir
                 if not predict_out:
                     if trained_weights or finetuned_weights:
                         predict_out = run_root / "predictions"
                     else:
                         predict_out = env.run_dir / "predictions_standalone"
-                
-                # Determine AMP setting
+
                 sam_amp = True
                 if args.predict_no_sam_amp:
                     sam_amp = False
                 elif args.predict_sam_amp:
                     sam_amp = True
-                
-                print(f"[INFO] Running predictions with {predict_weights}")
-                print(f"[INFO] Output directory: {predict_out}")
-                
+
                 pred_config = PredictConfig(
                     out_dir=predict_out,
                     yolo_weights=predict_weights,
@@ -463,10 +394,7 @@ def main():
                     resume=args.predict_resume,
                     splits=args.predict_splits,
                 )
-                
-                summary = run_predictions(pred_config)
-                if summary:
-                    print(f"[INFO] Prediction summary: {summary.get('counts', {})}")
+                run_predictions(pred_config)
 
     print("[INFO] Experiment completed.")
 
