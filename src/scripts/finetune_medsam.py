@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.utils.checkpoint import checkpoint  # <--- CRITICAL FOR VRAM SAVINGS
 from tqdm import tqdm
 
 # Project imports
@@ -78,7 +79,6 @@ DEFAULT_USE_DET_PROB = 0.5
 DEFAULT_PAD_JITTER = 0.30
 DEFAULT_BOX_TR = 0.05
 DEFAULT_BOX_SC = 0.10
-
 
 # =========================================================
 # Small utils
@@ -174,7 +174,7 @@ def build_image_index(data_root: Path, exclude: Optional[List[str]] = None) -> D
 
 
 def images_from_yolo_splits(
-    yolo_ds: Path, data_root: Path, exclude: Optional[List[str]] = None
+        yolo_ds: Path, data_root: Path, exclude: Optional[List[str]] = None
 ) -> Tuple[List[IMG], List[IMG], List[IMG]]:
     mapping = tu.parse_data_yaml(yolo_ds / "data.yaml")
     train_imgs = tu.resolve_split_images(yolo_ds, mapping["train"])
@@ -207,10 +207,10 @@ def images_from_yolo_splits(
 # Detector → normalized boxes with disk cache (Option B core)
 # =========================================================
 def attach_detector_boxes_with_cache(
-    images: Iterable[IMG],
-    cache_path: Optional[Path],
-    dist: DistributedContext,
-    provider: Optional[YoloPredictor] = None,
+        images: Iterable[IMG],
+        cache_path: Optional[Path],
+        dist: DistributedContext,
+        provider: Optional[YoloPredictor] = None,
 ) -> None:
     images = list(images)
     mapping: Dict[str, Dict[str, Optional[Tuple[float, float, float, float]]]] = {}
@@ -232,13 +232,13 @@ def attach_detector_boxes_with_cache(
                     jf = open(os.devnull, "w")
 
                 chunk_size = provider.cfg.batch_size if provider else 32
-                
+
                 with jf:
                     for i in tqdm(range(0, len(images), chunk_size), desc="Generating Detector Prompts"):
-                        chunk = images[i : i + chunk_size]
+                        chunk = images[i: i + chunk_size]
                         paths = [Path(im.image_path) for im in chunk]
                         batch_preds = provider.top1_per_class_batch(paths)
-                        
+
                         for im, preds in zip(chunk, batch_preds):
                             rec = {"stem": Path(im.image_path).stem}
                             disc_res = preds.get(0, (None, None))
@@ -269,8 +269,8 @@ def attach_detector_boxes_with_cache(
 # Polar transform helpers (FunduSAM-style disc-centered)
 # =========================================================
 def cartesian_to_polar(
-    img: np.ndarray, out_h: int, out_w: int,
-    center: Optional[Tuple[float, float]] = None, radius: Optional[float] = None,
+        img: np.ndarray, out_h: int, out_w: int,
+        center: Optional[Tuple[float, float]] = None, radius: Optional[float] = None,
 ) -> np.ndarray:
     _ensure_cv2_available()
     h, w = img.shape[:2]
@@ -279,7 +279,7 @@ def cartesian_to_polar(
     if radius is None:
         cx, cy = center
         corners = [(0, 0), (w, 0), (0, h), (w, h)]
-        radius = max(np.sqrt((cx - x)**2 + (cy - y)**2) for x, y in corners)
+        radius = max(np.sqrt((cx - x) ** 2 + (cy - y) ** 2) for x, y in corners)
         radius = min(radius, max(w, h))
     flags = cv2.WARP_POLAR_LINEAR
     polar = cv2.warpPolar(img, (out_w, out_h), center, radius, flags)
@@ -288,8 +288,8 @@ def cartesian_to_polar(
 
 
 def polar_to_cartesian(
-    img_polar: np.ndarray, out_h: int, out_w: int,
-    center: Optional[Tuple[float, float]] = None, radius: Optional[float] = None,
+        img_polar: np.ndarray, out_h: int, out_w: int,
+        center: Optional[Tuple[float, float]] = None, radius: Optional[float] = None,
 ) -> np.ndarray:
     _ensure_cv2_available()
     if center is None:
@@ -297,7 +297,7 @@ def polar_to_cartesian(
     if radius is None:
         cx, cy = center
         corners = [(0, 0), (out_w, 0), (0, out_h), (out_w, out_h)]
-        radius = max(np.sqrt((cx - x)**2 + (cy - y)**2) for x, y in corners)
+        radius = max(np.sqrt((cx - x) ** 2 + (cy - y) ** 2) for x, y in corners)
         radius = min(radius, max(out_w, out_h))
     p = cv2.rotate(img_polar, cv2.ROTATE_90_COUNTERCLOCKWISE)
     flags = cv2.WARP_POLAR_LINEAR + cv2.WARP_INVERSE_MAP
@@ -306,7 +306,7 @@ def polar_to_cartesian(
 
 
 def compute_disc_center_and_radius(
-    disc_box_xyxy: np.ndarray, img_w: int, img_h: int, radius_padding: float = 1.5,
+        disc_box_xyxy: np.ndarray, img_w: int, img_h: int, radius_padding: float = 1.5,
 ) -> Tuple[Tuple[float, float], float]:
     x1, y1, x2, y2 = disc_box_xyxy
     cx = (x1 + x2) / 2.0
@@ -327,19 +327,19 @@ def make_joint_images(images: List[IMG]) -> List[IMG]:
     out: List[IMG] = []
     for im in images:
         if (
-            im.gt_disc_mask is not None
-            and getattr(im.gt_disc_mask, "path", None)
-            and im.gt_cup_mask is not None
-            and getattr(im.gt_cup_mask, "path", None)
+                im.gt_disc_mask is not None
+                and getattr(im.gt_disc_mask, "path", None)
+                and im.gt_cup_mask is not None
+                and getattr(im.gt_cup_mask, "path", None)
         ):
             out.append(im)
     return out
 
 
 def create_fundu_dataset(
-    images: List[IMG], img_size: int, train: bool, prompt_mode: str,
-    polar_radius_padding: float, use_det_prob: float = 0.0,
-    pad_jitter: float = 0.0, box_tr: float = 0.0, box_sc: float = 0.0,
+        images: List[IMG], img_size: int, train: bool, prompt_mode: str,
+        polar_radius_padding: float, use_det_prob: float = 0.0,
+        pad_jitter: float = 0.0, box_tr: float = 0.0, box_sc: float = 0.0,
 ) -> FunduSAMDataset:
     return FunduSAMDataset(
         images=images, img_size=img_size, train=train,
@@ -366,10 +366,10 @@ def fundu_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 class FunduSAMDataset(Dataset):
     def __init__(
-        self, images: List[IMG], img_size: int = DEFAULT_IMGSZ, train: bool = True,
-        use_det_prob: float = DEFAULT_USE_DET_PROB, pad_jitter: float = DEFAULT_PAD_JITTER,
-        box_tr: float = DEFAULT_BOX_TR, box_sc: float = DEFAULT_BOX_SC,
-        prompt_mode: str = "mix", polar_radius_padding: float = 1.5,
+            self, images: List[IMG], img_size: int = DEFAULT_IMGSZ, train: bool = True,
+            use_det_prob: float = DEFAULT_USE_DET_PROB, pad_jitter: float = DEFAULT_PAD_JITTER,
+            box_tr: float = DEFAULT_BOX_TR, box_sc: float = DEFAULT_BOX_SC,
+            prompt_mode: str = "mix", polar_radius_padding: float = 1.5,
     ):
         _ensure_cv2_available()
         self.images = images
@@ -436,9 +436,12 @@ class FunduSAMDataset(Dataset):
         disc_np = np.array(disc_cart, dtype=np.uint8)
         cup_np = np.array(cup_cart, dtype=np.uint8)
 
-        img_pol = cartesian_to_polar(img_np, out_h=self.img_size, out_w=self.img_size, center=polar_center, radius=polar_radius)
-        disc_pol = cartesian_to_polar(disc_np, out_h=self.img_size, out_w=self.img_size, center=polar_center, radius=polar_radius)
-        cup_pol = cartesian_to_polar(cup_np, out_h=self.img_size, out_w=self.img_size, center=polar_center, radius=polar_radius)
+        img_pol = cartesian_to_polar(img_np, out_h=self.img_size, out_w=self.img_size, center=polar_center,
+                                     radius=polar_radius)
+        disc_pol = cartesian_to_polar(disc_np, out_h=self.img_size, out_w=self.img_size, center=polar_center,
+                                      radius=polar_radius)
+        cup_pol = cartesian_to_polar(cup_np, out_h=self.img_size, out_w=self.img_size, center=polar_center,
+                                     radius=polar_radius)
 
         img_pol_pil = PILImage.fromarray(img_pol)
         x = tu.preprocess_for_sam(img_pol_pil)
@@ -461,7 +464,8 @@ class FunduSAMDataset(Dataset):
 # Loss & metrics
 # =========================================================
 class FunduJointLoss(nn.Module):
-    def __init__(self, w_disc: float = 1.0, w_cup: float = 2.0, w_contain: float = 1.0, bce_weight: float = 0.5, smooth: float = 1e-6):
+    def __init__(self, w_disc: float = 1.0, w_cup: float = 2.0, w_contain: float = 1.0, bce_weight: float = 0.5,
+                 smooth: float = 1e-6):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss()
         self.w_disc = w_disc
@@ -608,9 +612,9 @@ class FunduSegHead(nn.Module):
 
 class FunduSAMFinetuner(nn.Module):
     def __init__(
-        self, sam_type: str, checkpoint: Path, freeze_encoders: bool = True,
-        adapter_bottleneck: int = 64, num_classes: int = 2, adapt_all_blocks: bool = True,
-        last_n_adapted: int = 12, seg_width: int = 128, cbam_ratio: int = 16, cbam_kernel_size: int = 7,
+            self, sam_type: str, checkpoint: Path, freeze_encoders: bool = True,
+            adapter_bottleneck: int = 64, num_classes: int = 2, adapt_all_blocks: bool = True,
+            last_n_adapted: int = 12, seg_width: int = 128, cbam_ratio: int = 16, cbam_kernel_size: int = 7,
     ):
         super().__init__()
         _ensure_sam_available()
@@ -624,8 +628,10 @@ class FunduSAMFinetuner(nn.Module):
             blk0 = enc.blocks[0]
             mlp = getattr(blk0, "mlp", None)
             dim = None
-            if mlp and hasattr(mlp, "fc1"): dim = mlp.fc1.in_features
-            elif mlp and hasattr(mlp, "linear1"): dim = mlp.linear1.in_features
+            if mlp and hasattr(mlp, "fc1"):
+                dim = mlp.fc1.in_features
+            elif mlp and hasattr(mlp, "linear1"):
+                dim = mlp.linear1.in_features
             elif mlp:
                 for m in mlp.modules():
                     if isinstance(m, nn.Linear):
@@ -660,12 +666,37 @@ class FunduSAMFinetuner(nn.Module):
         for p in self.cbam.parameters(): p.requires_grad = True
         for p in self.seg_head.parameters(): p.requires_grad = True
 
+        # NEW: Flag to control manual checkpointing in forward
+        self.use_grad_checkpointing = False
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = batch["image"]
-        feat = self.image_encoder(x)
+
+        # Manual Gradient Checkpointing Logic
+        if self.use_grad_checkpointing:
+            # 1. Patch Embedding
+            x = self.image_encoder.patch_embed(x)
+            if self.image_encoder.pos_embed is not None:
+                x = x + self.image_encoder.pos_embed
+
+            # 2. Blocks with Checkpointing
+            # Note: checkpoint() requires the input to have requires_grad=True for the graph to connect
+            # Since 'x' comes from dataset (no grad), we can just set it true temporarily or rely on previous layer
+            # However, typically patch_embed weights have grad enabled (if not frozen), or we just let it pass.
+            # If encoder is frozen but adapters are not, checkpointing still saves activation memory.
+            for blk in self.image_encoder.blocks:
+                # use_reentrant=False is generally recommended for newer PyTorch
+                x = checkpoint(blk, x, use_reentrant=False)
+
+            # 3. Neck
+            feat = self.image_encoder.neck(x.permute(0, 3, 1, 2))
+        else:
+            feat = self.image_encoder(x)
+
         feat = self.cbam(feat)
         logits_low = self.seg_head(feat)
-        logits = F.interpolate(logits_low, size=(x.shape[2], x.shape[3]), mode="bilinear", align_corners=False)
+        logits = F.interpolate(logits_low, size=(batch["image"].shape[2], batch["image"].shape[3]), mode="bilinear",
+                               align_corners=False)
         return logits, None
 
 
@@ -715,8 +746,8 @@ class TrainConfig:
     test_weights: Optional[Path] = None
     resume: Optional[Path] = None
     compile_model: bool = False  # New config for torch.compile
-    eval_every: int = 1 # Eval every N epochs
-    grad_checkpointing: bool = False # Gradient checkpointing to save VRAM
+    eval_every: int = 1  # Eval every N epochs
+    grad_checkpointing: bool = False  # Gradient checkpointing to save VRAM
 
 
 class Trainer:
@@ -815,9 +846,13 @@ class Trainer:
 
         # Optimization: Gradient Checkpointing (Saves VRAM, allows larger batch size)
         if cfg.grad_checkpointing:
-            self.model.image_encoder.set_grad_checkpointing(True) # SAM ViT specific method if available, else standard hook needed
-            # Fallback if specific method absent:
-            # self.model.image_encoder = torch.utils.checkpoint.checkpoint_wrapper(self.model.image_encoder) 
+            # Enable the manual checkpointing path we added
+            if isinstance(self.model, FunduSAMFinetuner):
+                self.model.use_grad_checkpointing = True
+                if self.dist.is_main:
+                    print("[INFO] Gradient checkpointing enabled (manual wrapping).")
+            # If wrapped in DDP, usually one accesses .module, but since we wrap later,
+            # this direct access is correct here.
 
         # Optimization: PyTorch 2.0 Compile
         if cfg.compile_model and hasattr(torch, "compile"):
@@ -920,9 +955,9 @@ class Trainer:
                         else:
                             opt.step()
                         opt.zero_grad(set_to_none=True)
-            
+
             if self.dist.is_main and train:
-                 iterator.set_postfix(loss=float(loss.detach()))
+                iterator.set_postfix(loss=float(loss.detach()))
 
             with torch.no_grad():
                 prob = torch.sigmoid(logits)
@@ -950,14 +985,15 @@ class Trainer:
         for epoch in range(1, self.cfg.epochs + 1):
             self._epoch = epoch
             tr = self._run_epoch(train=True)
-            
+
             # Optimization: Evaluate only every N epochs to save time
             va_dice = 0.0
             if epoch % self.cfg.eval_every == 0 or epoch == self.cfg.epochs:
                 va = self._run_epoch(train=False)
                 va_dice = va["dice"]
                 if self.dist.is_main:
-                    print(f"[E{epoch:03d}] loss={tr['loss']:.4f} | dice(tr)={tr['dice']:.4f} | dice(val)={va['dice']:.4f}")
+                    print(
+                        f"[E{epoch:03d}] loss={tr['loss']:.4f} | dice(tr)={tr['dice']:.4f} | dice(val)={va['dice']:.4f}")
                     self._save_ckpt(self.last_path)
                     if va["dice"] > self.best_val:
                         self.best_val = va["dice"]
@@ -969,7 +1005,7 @@ class Trainer:
             self.history["train_loss"].append(tr["loss"])
             self.history["train_dice"].append(tr["dice"])
             if va_dice > 0: self.history["val_dice"].append(va_dice)
-            
+
             self.dist.barrier()
 
         if self.dist.is_main:
@@ -1023,8 +1059,10 @@ class Trainer:
                     disc_pol = (prob[i, 0].cpu().numpy() >= 0.5).astype(np.uint8) * 255
                     cup_pol = (prob[i, 1].cpu().numpy() >= 0.5).astype(np.uint8) * 255
 
-                    disc_cart = polar_to_cartesian(disc_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz, center=polar_center, radius=polar_radius)
-                    cup_cart = polar_to_cartesian(cup_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz, center=polar_center, radius=polar_radius)
+                    disc_cart = polar_to_cartesian(disc_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz,
+                                                   center=polar_center, radius=polar_radius)
+                    cup_cart = polar_to_cartesian(cup_pol, out_h=self.cfg.imgsz, out_w=self.cfg.imgsz,
+                                                  center=polar_center, radius=polar_radius)
 
                     disc_cart = disc_cart.astype(np.uint8)
                     cup_cart = cup_cart.astype(np.uint8)
@@ -1036,8 +1074,10 @@ class Trainer:
 
                     rec = {
                         "image": image_path, "stem": stem, "dice_disc": float(d_disc), "dice_cup": float(d_cup),
-                        "prompt": self.cfg.test_prompt, "polar_center": list(polar_center) if isinstance(polar_center, tuple) else polar_center,
-                        "polar_radius": float(polar_radius), "mask_disc_path": str(save_disc), "mask_cup_path": str(save_cup),
+                        "prompt": self.cfg.test_prompt,
+                        "polar_center": list(polar_center) if isinstance(polar_center, tuple) else polar_center,
+                        "polar_radius": float(polar_radius), "mask_disc_path": str(save_disc),
+                        "mask_cup_path": str(save_cup),
                     }
                     jf.write(json.dumps(rec) + "\n")
 
@@ -1122,9 +1162,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-weights", type=Path, default=None)
     p.add_argument("--resume", type=Path, default=None)
     # New Performance Flags
-    p.add_argument("--compile-model", action="store_true", help="Compile model with torch.compile (requires PyTorch 2.0+)")
+    p.add_argument("--compile-model", action="store_true",
+                   help="Compile model with torch.compile (requires PyTorch 2.0+)")
     p.add_argument("--eval-every", type=int, default=1, help="Run validation every N epochs")
-    p.add_argument("--grad-checkpointing", action="store_true", help="Enable gradient checkpointing for lower VRAM usage")
+    p.add_argument("--grad-checkpointing", action="store_true",
+                   help="Enable gradient checkpointing for lower VRAM usage")
 
     return p.parse_args()
 
@@ -1132,14 +1174,19 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     cfg = TrainConfig(
-        data_root=args.data_root, yolo_ds=args.yolo_ds, out_dir=args.out_dir, run_dir=args.run_dir, run_name=args.run_name,
-        yolo_weights=args.yolo_weights, exclude_datasets=args.exclude_ds, yolo_device=args.yolo_device, yolo_imgsz=args.yolo_imgsz,
+        data_root=args.data_root, yolo_ds=args.yolo_ds, out_dir=args.out_dir, run_dir=args.run_dir,
+        run_name=args.run_name,
+        yolo_weights=args.yolo_weights, exclude_datasets=args.exclude_ds, yolo_device=args.yolo_device,
+        yolo_imgsz=args.yolo_imgsz,
         yolo_conf=args.yolo_conf, yolo_iou=args.yolo_iou, det_cache=args.det_cache, model=args.model, ckpt=args.ckpt,
-        unfreeze_encoders=args.unfreeze_encoders, save_full=args.save_full, epochs=args.epochs, batch=args.batch, imgsz=args.imgsz,
+        unfreeze_encoders=args.unfreeze_encoders, save_full=args.save_full, epochs=args.epochs, batch=args.batch,
+        imgsz=args.imgsz,
         lr=args.lr, wd=args.wd, workers=args.workers, amp=args.amp or True, grad_acc_steps=args.grad_acc_steps,
         bucket_cap_mb=args.bucket_cap_mb, find_unused_parameters=args.find_unused_parameters, seed=args.seed,
-        use_det_prob=args.use_det_prob, pad_jitter=args.pad_jitter, box_jitter_tr=args.box_jitter_tr, box_jitter_sc=args.box_jitter_sc,
-        polar_radius_padding=args.polar_radius_padding, do_train=args.train, do_test=args.test, test_prompt=args.test_prompt,
+        use_det_prob=args.use_det_prob, pad_jitter=args.pad_jitter, box_jitter_tr=args.box_jitter_tr,
+        box_jitter_sc=args.box_jitter_sc,
+        polar_radius_padding=args.polar_radius_padding, do_train=args.train, do_test=args.test,
+        test_prompt=args.test_prompt,
         test_weights=args.test_weights, resume=args.resume,
         compile_model=args.compile_model, eval_every=args.eval_every, grad_checkpointing=args.grad_checkpointing
     )
