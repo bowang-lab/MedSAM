@@ -3,8 +3,8 @@
 #SBATCH --account=st-ipor-1-gpu
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --ntasks=4
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=160G
 #SBATCH --time=72:00:00
 #SBATCH --gpus=4
@@ -220,7 +220,7 @@ ARG_8=(
     "--epochs" "100"
     "--batch" "4"
     "--imgsz" "1024"
-    "--workers" "16"
+    "--workers" "4"
     "--yolo-device" "${YOLO_DEVICES}"
     "--grad-checkpointing"
     "--eval-every" "5"
