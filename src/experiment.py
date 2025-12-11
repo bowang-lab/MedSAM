@@ -224,7 +224,13 @@ def main():
 
     # 2. Resolve Paths
     yolo_ds_root = args.yolo_ds or args.yolo_out_dir or env.out_dir
-    effective_device = args.yolo_device or env.device
+    # For yolo_device, if a comma-separated list is provided (e.g., "0,1,2,3"), 
+    # extract the first device for YOLO inference (which runs on rank-0 only)
+    if args.yolo_device:
+        # Handle comma-separated device strings (take first device)
+        effective_device = args.yolo_device.split(",")[0].strip()
+    else:
+        effective_device = env.device
     effective_medsam_ckpt = args.medsam_ckpt or env.medsam_ckpt
 
     i = 1
@@ -342,7 +348,9 @@ def main():
                 yolo_iou=cfg.iou,
                 ckpt=effective_medsam_ckpt,
                 epochs=cfg.epochs,
-                batch=max(1, cfg.batch // 2),
+                # For MedSAM, use batch size as-is (already set appropriately for multi-GPU)
+                # Only divide by 2 if batch is very large (>16) to save memory
+                batch=cfg.batch if cfg.batch <= 16 else max(1, cfg.batch // 2),
                 workers=cfg.workers,
                 do_train=True, do_test=True, test_prompt="det",
                 seed=SEED,
