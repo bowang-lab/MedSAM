@@ -52,7 +52,7 @@ def _ensure_cv2_available():
 
 # Global defaults
 DEFAULT_MODEL = "vit_b"
-DEFAULT_IMGSZ = 1024
+DEFAULT_IMGSZ = 640
 DEFAULT_EPOCHS = 50
 DEFAULT_BATCH = 8
 DEFAULT_WORKERS = 8
