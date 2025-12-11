@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
 # src/scripts/finetune_medsam.py
-# Fundu-style fine-tuning for MedSAM with:
-# - SAM image encoder + adapters (last few blocks, lighter bottleneck)
-# - Spatial & channel CBAM
-# - Polar-coordinate training for OD/OC
-# - Joint OD/OC loss with containment term
-# - Multi-GPU (DDP) support and ImageFactory/YOLO-backed splits
-# - Detector-guided prompts (Option B): GT/DET box mixing with cache
 
 from __future__ import annotations
 
@@ -26,15 +19,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from torch.utils.checkpoint import checkpoint  # <--- CRITICAL FOR VRAM SAVINGS
+from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
-# Project imports
 from src.imgpipe.image_factory import ImageFactory
 from src.imgpipe.image import Image as IMG
 from src.imgpipe.normalized_box import NormalizedBox
 from src.imgpipe.enums import Structure, LabelType
-import src.training_utils as tu  # Shared training utilities
+import src.training_utils as tu
 from src.model.predictor import YoloPredictor, YoloPredictorConfig, _ultralytics_device_str
 
 try:
@@ -58,9 +50,7 @@ def _ensure_cv2_available():
         )
 
 
-# =========================================================
-# Global defaults (single source for numeric hyperparams)
-# =========================================================
+# Global defaults
 DEFAULT_MODEL = "vit_b"
 DEFAULT_IMGSZ = 1024
 DEFAULT_EPOCHS = 50
@@ -80,9 +70,6 @@ DEFAULT_PAD_JITTER = 0.30
 DEFAULT_BOX_TR = 0.05
 DEFAULT_BOX_SC = 0.10
 
-# =========================================================
-# Small utils
-# =========================================================
 from src.utils import set_global_seed
 
 
@@ -95,13 +82,9 @@ def _ensure_sam_available():
 
 
 def _to_device(x: Any, device: torch.device) -> Any:
-    """Local wrapper calling shared util."""
     return tu.to_device(x, device)
 
 
-# =========================================================
-# Distributed context
-# =========================================================
 @dataclass
 class DistConfig:
     backend: str = "nccl"
@@ -111,24 +94,16 @@ class DistConfig:
     local_rank: int = 0
 
     def __post_init__(self):
-        """
-        Auto-detect distributed environment variables.
-        Supports both torchrun (RANK, LOCAL_RANK) and SLURM (SLURM_PROCID, SLURM_LOCALID).
-        """
-        # 1. Try standard torch.distributed env vars
-        if "WORLD_SIZE" in os.environ:
+        # Auto-detect SLURM vs torchrun
+        if "SLURM_NTASKS" in os.environ:
+            self.world_size = int(os.environ["SLURM_NTASKS"])
+            self.rank = int(os.environ["SLURM_PROCID"])
+            self.local_rank = int(os.environ.get("SLURM_LOCALID", "0"))
+        elif "WORLD_SIZE" in os.environ:
             self.world_size = int(os.environ["WORLD_SIZE"])
             self.rank = int(os.environ["RANK"])
             self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
-        # 2. Fallback to SLURM variables if not set
-        elif "SLURM_NTASKS" in os.environ:
-            self.world_size = int(os.environ["SLURM_NTASKS"])
-            self.rank = int(os.environ["SLURM_PROCID"])
-            self.local_rank = int(os.environ.get("SLURM_LOCALID", "0"))
-
-        # Force set the device index for this process
-        # This prevents multiple processes from accidentally allocating on GPU 0
         if self.distributed and torch.cuda.is_available():
             torch.cuda.set_device(self.local_rank)
 
@@ -138,7 +113,6 @@ class DistConfig:
 
     def device(self) -> torch.device:
         if torch.cuda.is_available():
-            # Always return the device index corresponding to local_rank
             return torch.device(f"cuda:{self.local_rank}")
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
@@ -152,12 +126,9 @@ class DistributedContext:
 
     def setup(self):
         if self.cfg.distributed:
-            # Re-confirm device set
             if torch.cuda.is_available():
                 torch.cuda.set_device(self.cfg.local_rank)
 
-            # Initialize process group
-            # Note: For SLURM, MASTER_ADDR and MASTER_PORT must be set in the shell script
             torch.distributed.init_process_group(
                 backend=self.cfg.backend,
                 init_method=self.cfg.init_method,
@@ -186,9 +157,6 @@ class DistributedContext:
         return tensor
 
 
-# =========================================================
-# Build Image objects and map to splits
-# =========================================================
 def build_image_index(data_root: Path, exclude: Optional[List[str]] = None) -> Dict[str, IMG]:
     fac = ImageFactory(root=data_root, auto_scan=True)
     fac.filter_empty_masks()
@@ -231,9 +199,6 @@ def images_from_yolo_splits(
     return tr, va, te
 
 
-# =========================================================
-# Detector → normalized boxes with disk cache (Option B core)
-# =========================================================
 def attach_detector_boxes_with_cache(
         images: Iterable[IMG],
         cache_path: Optional[Path],
@@ -293,9 +258,6 @@ def attach_detector_boxes_with_cache(
             im.set_box(Structure.CUP, LabelType.PRED, NormalizedBox(*m["cup"]))
 
 
-# =========================================================
-# Polar transform helpers (FunduSAM-style disc-centered)
-# =========================================================
 def cartesian_to_polar(
         img: np.ndarray, out_h: int, out_w: int,
         center: Optional[Tuple[float, float]] = None, radius: Optional[float] = None,
@@ -348,9 +310,6 @@ def compute_disc_center_and_radius(
     return (cx, cy), radius
 
 
-# =========================================================
-# Fundu-style joint OD/OC dataset with polar coordinates
-# =========================================================
 def make_joint_images(images: List[IMG]) -> List[IMG]:
     out: List[IMG] = []
     for im in images:
@@ -488,9 +447,6 @@ class FunduSAMDataset(Dataset):
         return {"image": x, "mask": y, "box": b, "meta": meta}
 
 
-# =========================================================
-# Loss & metrics
-# =========================================================
 class FunduJointLoss(nn.Module):
     def __init__(self, w_disc: float = 1.0, w_cup: float = 2.0, w_contain: float = 1.0, bce_weight: float = 0.5,
                  smooth: float = 1e-6):
@@ -529,9 +485,6 @@ class FunduJointLoss(nn.Module):
         return self.w_disc * L_disc + self.w_cup * L_cup + self.w_contain * L_contain
 
 
-# =========================================================
-# Adapters + CBAM + FunduSAM Finetuner with lighter head
-# =========================================================
 class Adapter(nn.Module):
     def __init__(self, dim: int, bottleneck: int = 32):
         super().__init__()
@@ -694,13 +647,12 @@ class FunduSAMFinetuner(nn.Module):
         for p in self.cbam.parameters(): p.requires_grad = True
         for p in self.seg_head.parameters(): p.requires_grad = True
 
-        # Flag to control manual checkpointing in forward
         self.use_grad_checkpointing = False
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = batch["image"]
 
-        # Manual Gradient Checkpointing Logic
+        # Manual Gradient Checkpointing Implementation
         if self.use_grad_checkpointing:
             # 1. Patch Embedding
             x = self.image_encoder.patch_embed(x)
@@ -708,8 +660,8 @@ class FunduSAMFinetuner(nn.Module):
                 x = x + self.image_encoder.pos_embed
 
             # 2. Blocks with Checkpointing
-            # use_reentrant=False is generally recommended for newer PyTorch
             for blk in self.image_encoder.blocks:
+                # use_reentrant=False is the modern safe way to use checkpointing
                 x = checkpoint(blk, x, use_reentrant=False)
 
             # 3. Neck
@@ -727,9 +679,6 @@ class FunduSAMFinetuner(nn.Module):
 MedSAMFinetuner = FunduSAMFinetuner
 
 
-# =========================================================
-# TrainConfig and Trainer
-# =========================================================
 @dataclass
 class TrainConfig:
     data_root: Path
@@ -769,9 +718,9 @@ class TrainConfig:
     test_prompt: str = "det"
     test_weights: Optional[Path] = None
     resume: Optional[Path] = None
-    compile_model: bool = False  # New config for torch.compile
-    eval_every: int = 1  # Eval every N epochs
-    grad_checkpointing: bool = False  # Gradient checkpointing to save VRAM
+    compile_model: bool = False
+    eval_every: int = 1
+    grad_checkpointing: bool = False
 
 
 class Trainer:
@@ -793,7 +742,6 @@ class Trainer:
         provider = None
         if self.dist.is_main:
             yolo_device_str = _ultralytics_device_str(str(self.device))
-            # Use a sensible batch size for inference
             provider = YoloPredictor(
                 YoloPredictorConfig(
                     weights=cfg.yolo_weights,
@@ -846,7 +794,6 @@ class Trainer:
             if dist.cfg.distributed else None
         )
 
-        # Performance Optimization: persistent_workers & prefetch_factor
         self.dl_train = DataLoader(
             self.ds_train, batch_size=cfg.batch, shuffle=(self.sampler_train is None),
             num_workers=cfg.workers, pin_memory=True, drop_last=False,
@@ -868,21 +815,16 @@ class Trainer:
             sam_type=cfg.model, checkpoint=cfg.ckpt, freeze_encoders=not cfg.unfreeze_encoders,
         ).to(self.device)
 
-        # Optimization: Gradient Checkpointing (Saves VRAM, allows larger batch size)
+        # Gradient Checkpointing Activation
         if cfg.grad_checkpointing:
-            # Enable manual checkpointing by setting flag
             if isinstance(self.model, FunduSAMFinetuner):
                 self.model.use_grad_checkpointing = True
                 if self.dist.is_main:
                     print("[INFO] Gradient checkpointing enabled (manual wrapping).")
-            # If wrapped in DDP, standard practice is to rely on module property or re-wrap logic
-            # But we instantiate DDP below, so direct access works here.
 
-        # Optimization: PyTorch 2.0 Compile
         if cfg.compile_model and hasattr(torch, "compile"):
             if self.dist.is_main:
                 print("[INFO] Compiling model with torch.compile...")
-            # We compile the heavy encoder
             self.model.image_encoder = torch.compile(self.model.image_encoder)
 
         if dist.cfg.distributed:
@@ -1010,7 +952,6 @@ class Trainer:
             self._epoch = epoch
             tr = self._run_epoch(train=True)
 
-            # Optimization: Evaluate only every N epochs to save time
             va_dice = 0.0
             if epoch % self.cfg.eval_every == 0 or epoch == self.cfg.epochs:
                 va = self._run_epoch(train=False)

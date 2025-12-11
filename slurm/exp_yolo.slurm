@@ -3,7 +3,7 @@
 #SBATCH --account=st-ipor-1-gpu
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
-#SBATCH --ntasks=4
+#SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=160G
 #SBATCH --time=72:00:00
@@ -35,12 +35,11 @@ mkdir -p "${REPO_DIR}/hpc_logs"
 ###############################################################################
 # 2. Device Configuration
 ###############################################################################
-if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  YOLO_DEVICES="${CUDA_VISIBLE_DEVICES}"
-else
-  YOLO_DEVICES="0,1,2,3"
+# Ensure we see all GPUs if not set by SLURM
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES="0,1,2,3"
 fi
-echo "[INFO] YOLO_DEVICES=${YOLO_DEVICES}"
+echo "[INFO] YOLO_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 ###############################################################################
 # 3. CLI Parsing & Validation
@@ -107,7 +106,7 @@ ARG_1=(
     "--batch" "16"
     "--imgsz" "640"
     "--workers" "8"
-    "--yolo-device" "${YOLO_DEVICES}"
+    "--yolo-device" "${CUDA_VISIBLE_DEVICES}"
 )
 
 # --- MODE 2: Training from Parquet Splits ---
@@ -122,7 +121,7 @@ ARG_2=(
     "--batch" "16"
     "--imgsz" "640"
     "--workers" "8"
-    "--yolo-device" "${YOLO_DEVICES}"
+    "--yolo-device" "${CUDA_VISIBLE_DEVICES}"
 )
 
 # --- MODE 3: Semi-Supervised YOLO Finetuning ---
@@ -137,7 +136,7 @@ ARG_3=(
     "--imgsz" "640"
     "--workers" "8"
     "--skip-materialization"
-    "--yolo-device" "${YOLO_DEVICES}"
+    "--yolo-device" "${CUDA_VISIBLE_DEVICES}"
 )
 
 # --- MODE 4: Full Pipeline (Semi-Supervised + MedSAM) ---
@@ -154,7 +153,7 @@ ARG_4=(
     "--imgsz" "640"
     "--workers" "8"
     "--skip-materialization"
-    "--yolo-device" "${YOLO_DEVICES}"
+    "--yolo-device" "${CUDA_VISIBLE_DEVICES}"
 )
 
 # --- MODE 5: Predictions Only ---
@@ -167,7 +166,7 @@ ARG_5=(
     "--predict-splits" "test"
     "--predict-batch-size" "128"
     "--predict-sam-amp"
-    "--yolo-device" "${YOLO_DEVICES}"
+    "--yolo-device" "${CUDA_VISIBLE_DEVICES}"
 )
 
 # --- MODE 6: Training + Predictions Pipeline ---
@@ -187,7 +186,7 @@ ARG_6=(
     "--predict-splits" "test"
     "--predict-batch-size" "128"
     "--predict-sam-amp"
-    "--yolo-device" "${YOLO_DEVICES}"
+    "--yolo-device" "${CUDA_VISIBLE_DEVICES}"
 )
 
 # --- MODE 7: Semi-Supervised + Predictions Pipeline ---
@@ -208,7 +207,7 @@ ARG_7=(
     "--predict-splits" "test"
     "--predict-batch-size" "128"
     "--predict-sam-amp"
-    "--yolo-device" "${YOLO_DEVICES}"
+    "--yolo-device" "${CUDA_VISIBLE_DEVICES}"
 )
 
 # --- MODE 8: MedSAM Finetuning Only ---
@@ -217,12 +216,15 @@ ARG_8=(
     "--yolo-weights" "/scratch/st-ipor-1/cperez/MedSAM/runs/YOLO_DEV_RUN/Train/Train/weights/best.pt"
     "--yolo-ds" "/scratch/st-ipor-1/cperez/MedSAM/DS/YOLO_DS"
     "--medsam-ckpt" "/scratch/st-ipor-1/cperez/MedSAM/weights/medsam_vit_b.pth"
+    # Base output dir (creates subfolders Fundu1, Fundu2...)
     "--yolo-out-dir" "/scratch/st-ipor-1/cperez/MedSAM/runs/Fundu"
     "--epochs" "100"
+    # Batch size 4 global (1 per GPU)
     "--batch" "4"
     "--imgsz" "1024"
+    # Workers per GPU task (we have 4 CPUs per task)
     "--workers" "4"
-    "--yolo-device" "${YOLO_DEVICES}"
+    "--yolo-device" "${CUDA_VISIBLE_DEVICES}"
     "--grad-checkpointing"
     "--eval-every" "5"
 )
@@ -251,14 +253,15 @@ esac
 CMD_ARGS+=("$@")
 
 echo "========================================================================"
-echo "[INFO] Executing Python Command:"
-echo "python -m src.experiment ${CMD_ARGS[*]}"
+echo "[INFO] Executing Python Command with srun:"
+echo "srun python -m src.experiment ${CMD_ARGS[*]}"
 echo "========================================================================"
 
-# Optimizing memory allocator for large models to reduce fragmentation
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-srun --gpu-bind=closest --cpu-bind=cores -u \
-  python -m src.experiment "${CMD_ARGS[@]}"
+# Using srun --export=ALL is important to propagate MASTER_ADDR/PORT
+srun --export=ALL \
+     --gpu-bind=closest \
+     --cpu-bind=cores \
+     -u \
+     python -m src.experiment "${CMD_ARGS[@]}"
 
 echo "[INFO] Job Finished Successfully"

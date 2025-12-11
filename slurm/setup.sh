@@ -7,6 +7,7 @@ setup_env() {
   : "${REPO_DIR:?REPO_DIR must be set before calling setup_env}"
 
   # ---- Conda env ----
+  # Adjust this path if your environment location changes
   ENV_PREFIX="/arc/project/st-ipor-1/carlosp/envs/medsam"
   source "$HOME/miniconda3/etc/profile.d/conda.sh"
   conda activate "$ENV_PREFIX"
@@ -42,7 +43,17 @@ setup_env() {
   export PYTHONUNBUFFERED=1
 
   # ---- CUDA allocator options (helps fragmentation) ----
-  export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:64"
+  # Only set default if not already provided by caller
+  if [[ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ]]; then
+      export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:64"
+  fi
+
+  # ---- DDP Master Setup (Critical for srun) ----
+  if [[ -n "${SLURM_JOB_NODELIST:-}" ]]; then
+      export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+      export MASTER_PORT=29500
+      export WORLD_SIZE=${SLURM_NTASKS:-1}
+  fi
 
   # ---- NCCL notes ----
   # For your current launch style (srun spawning independent workers, no DDP comm),
@@ -54,8 +65,8 @@ setup_env() {
   # ---- GPU visibility ----
   # With --gpus-per-task=1, Slurm usually sets CUDA_VISIBLE_DEVICES per task.
   # Only set it if Slurm explicitly provides SLURM_JOB_GPUS and CUDA_VISIBLE_DEVICES is unset.
-if [[ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ]]; then
-      export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:64"
+  if [[ -z "${CUDA_VISIBLE_DEVICES:-}" && -n "${SLURM_JOB_GPUS:-}" ]]; then
+    export CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS}"
   fi
 
   echo "=== setup_env summary ==="
@@ -70,5 +81,6 @@ if [[ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ]]; then
   echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
   echo "OMP_NUM_THREADS=${OMP_NUM_THREADS}"
   echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
+  echo "MASTER_ADDR=${MASTER_ADDR:-unset}"
   echo "========================="
 }
