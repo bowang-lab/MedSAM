@@ -54,8 +54,8 @@ setup_env() {
   # ---- GPU visibility ----
   # With --gpus-per-task=1, Slurm usually sets CUDA_VISIBLE_DEVICES per task.
   # Only set it if Slurm explicitly provides SLURM_JOB_GPUS and CUDA_VISIBLE_DEVICES is unset.
-  if [[ -z "${CUDA_VISIBLE_DEVICES:-}" && -n "${SLURM_JOB_GPUS:-}" ]]; then
-    export CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS}"
+if [[ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ]]; then
+      export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:64"
   fi
 
   echo "=== setup_env summary ==="

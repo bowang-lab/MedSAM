@@ -106,9 +106,31 @@ def _to_device(x: Any, device: torch.device) -> Any:
 class DistConfig:
     backend: str = "nccl"
     init_method: str = "env://"
-    world_size: int = int(os.environ.get("WORLD_SIZE", "1"))
-    rank: int = int(os.environ.get("RANK", "0"))
-    local_rank: int = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size: int = 1
+    rank: int = 0
+    local_rank: int = 0
+
+    def __post_init__(self):
+        """
+        Auto-detect distributed environment variables.
+        Supports both torchrun (RANK, LOCAL_RANK) and SLURM (SLURM_PROCID, SLURM_LOCALID).
+        """
+        # 1. Try standard torch.distributed env vars
+        if "WORLD_SIZE" in os.environ:
+            self.world_size = int(os.environ["WORLD_SIZE"])
+            self.rank = int(os.environ["RANK"])
+            self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+        # 2. Fallback to SLURM variables if not set
+        elif "SLURM_NTASKS" in os.environ:
+            self.world_size = int(os.environ["SLURM_NTASKS"])
+            self.rank = int(os.environ["SLURM_PROCID"])
+            self.local_rank = int(os.environ.get("SLURM_LOCALID", "0"))
+
+        # Force set the device index for this process
+        # This prevents multiple processes from accidentally allocating on GPU 0
+        if self.distributed and torch.cuda.is_available():
+            torch.cuda.set_device(self.local_rank)
 
     @property
     def distributed(self) -> bool:
@@ -116,7 +138,8 @@ class DistConfig:
 
     def device(self) -> torch.device:
         if torch.cuda.is_available():
-            return torch.device(f"cuda:{self.local_rank}" if self.distributed else "cuda:0")
+            # Always return the device index corresponding to local_rank
+            return torch.device(f"cuda:{self.local_rank}")
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
@@ -129,7 +152,12 @@ class DistributedContext:
 
     def setup(self):
         if self.cfg.distributed:
-            torch.cuda.set_device(self.cfg.local_rank)
+            # Re-confirm device set
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.cfg.local_rank)
+
+            # Initialize process group
+            # Note: For SLURM, MASTER_ADDR and MASTER_PORT must be set in the shell script
             torch.distributed.init_process_group(
                 backend=self.cfg.backend,
                 init_method=self.cfg.init_method,
@@ -666,7 +694,7 @@ class FunduSAMFinetuner(nn.Module):
         for p in self.cbam.parameters(): p.requires_grad = True
         for p in self.seg_head.parameters(): p.requires_grad = True
 
-        # NEW: Flag to control manual checkpointing in forward
+        # Flag to control manual checkpointing in forward
         self.use_grad_checkpointing = False
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -680,12 +708,8 @@ class FunduSAMFinetuner(nn.Module):
                 x = x + self.image_encoder.pos_embed
 
             # 2. Blocks with Checkpointing
-            # Note: checkpoint() requires the input to have requires_grad=True for the graph to connect
-            # Since 'x' comes from dataset (no grad), we can just set it true temporarily or rely on previous layer
-            # However, typically patch_embed weights have grad enabled (if not frozen), or we just let it pass.
-            # If encoder is frozen but adapters are not, checkpointing still saves activation memory.
+            # use_reentrant=False is generally recommended for newer PyTorch
             for blk in self.image_encoder.blocks:
-                # use_reentrant=False is generally recommended for newer PyTorch
                 x = checkpoint(blk, x, use_reentrant=False)
 
             # 3. Neck
@@ -846,13 +870,13 @@ class Trainer:
 
         # Optimization: Gradient Checkpointing (Saves VRAM, allows larger batch size)
         if cfg.grad_checkpointing:
-            # Enable the manual checkpointing path we added
+            # Enable manual checkpointing by setting flag
             if isinstance(self.model, FunduSAMFinetuner):
                 self.model.use_grad_checkpointing = True
                 if self.dist.is_main:
                     print("[INFO] Gradient checkpointing enabled (manual wrapping).")
-            # If wrapped in DDP, usually one accesses .module, but since we wrap later,
-            # this direct access is correct here.
+            # If wrapped in DDP, standard practice is to rely on module property or re-wrap logic
+            # But we instantiate DDP below, so direct access works here.
 
         # Optimization: PyTorch 2.0 Compile
         if cfg.compile_model and hasattr(torch, "compile"):
