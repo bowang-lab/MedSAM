@@ -75,7 +75,7 @@ class NpyDataset(Dataset):
 
     def __getitem__(self, index):
         img_name = os.path.basename(self.gt_path_files[index])
-        assert img_name == os.path.basename(self.gt_path_files[index]), 'img gt name error' + self.gt_path_files[index] + self.npy_files[index]
+        assert img_name == os.path.basename(self.gt_path_files[index]), 'img gt name error: img=' + join(self.img_path, img_name) + ' gt=' + self.gt_path_files[index]
         img_3c = np.load(join(self.img_path, img_name), 'r', allow_pickle=True) # (H, W, 3)
         resize_img_cv2 = cv2.resize(
             img_3c,
