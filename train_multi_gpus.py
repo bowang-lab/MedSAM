@@ -82,7 +82,7 @@ class NpyDataset(Dataset):
             self.gt_path_files[index], "r", allow_pickle=True
         )  # multiple labels [0, 1,4,5...], (256,256)
         assert img_name == os.path.basename(self.gt_path_files[index]), (
-            "img gt name error" + self.gt_path_files[index] + self.npy_files[index]
+            "img gt name error: img=" + join(self.img_path, img_name) + " gt=" + self.gt_path_files[index]
         )
         label_ids = np.unique(gt)[1:]
         gt2D = np.uint8(

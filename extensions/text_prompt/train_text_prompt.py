@@ -139,7 +139,7 @@ class NpyDataset(Dataset):
 
     def __getitem__(self, index):
         img_name = basename(self.gt_path_files[index])
-        assert img_name == basename(self.gt_path_files[index]), 'img gt name error' + self.gt_path_files[index] + self.npy_files[index]
+        assert img_name == basename(self.gt_path_files[index]), 'img gt name error: img=' + join(self.img_path, img_name) + ' gt=' + self.gt_path_files[index]
         img_1024 = np.load(join(self.img_path, img_name), 'r', allow_pickle=True) # (H, W, 3)
         # convert the shape to (3, H, W)
         img_1024 = np.transpose(img_1024, (2, 0, 1)) # (3, 256, 256)
